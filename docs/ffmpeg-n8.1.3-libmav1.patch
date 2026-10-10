@@ -1,153 +1,214 @@
-ok (nothing to add)
-configure              |   4 ++
- libavcodec/Makefile    |   1 +
- libavcodec/allcodecs.c |   1 +
- libavcodec/libmav1.c   | 139 +++++++++++++++++++++++++++++++++++++++++++++++++
- 4 files changed, 145 insertions(+)
-
---- Changes ---
-
-configure
-  @@ -269,6 +269,7 @@ External library support:
-  +  --enable-libmav1         enable AV1 encoding via mav1 (Metal) [no]
-     --enable-librist         enable RIST via librist [no]
-     --enable-librsvg         enable SVG rasterization via librsvg [no]
-     --enable-librubberband   enable rubberband needed for rubberband filter [no]
-  @@ -2077,6 +2078,7 @@ EXTERNAL_LIBRARY_LIST="
-  +    libmav1
-       librist
-       librsvg
-       librtmp
-  @@ -3805,6 +3807,7 @@ libopus_decoder_deps="libopus"
-  +libmav1_encoder_deps="libmav1"
-   librsvg_decoder_deps="librsvg"
-   libshine_encoder_deps="libshine"
-   libshine_encoder_select="audio_frame_queue mpegaudioheader"
-  @@ -7369,6 +7372,7 @@ enabled libpulse          && require_pkg_config libpulse libpulse pulse/pulseaud
-  +enabled libmav1           && require libmav1 mav1.h mav1_create -lmav1 -framework Metal -framework Foundation
-   enabled librav1e          && require_pkg_config librav1e "rav1e >= 0.5.0" rav1e.h rav1e_context_new
-   enabled librist           && require_pkg_config librist "librist >= 0.2.7" librist/librist.h rist_receiver_create
-   enabled librsvg           && require_pkg_config librsvg librsvg-2.0 librsvg-2.0/librsvg/rsvg.h rsvg_handle_new_from_data
-  +4 -0
-
-libavcodec/Makefile
-  @@ -1203,6 +1203,7 @@ OBJS-$(CONFIG_LIBOPUS_DECODER)            += libopusdec.o libopus.o     \
-  +OBJS-$(CONFIG_LIBMAV1_ENCODER)            += libmav1.o
-   OBJS-$(CONFIG_LIBRSVG_DECODER)            += librsvgdec.o
-   OBJS-$(CONFIG_LIBSHINE_ENCODER)           += libshine.o
-   OBJS-$(CONFIG_LIBSPEEX_DECODER)           += libspeexdec.o
-  +1 -0
-
-libavcodec/allcodecs.c
-  @@ -813,6 +813,7 @@ extern const FFCodec ff_libopenjpeg_encoder;
-  +extern const FFCodec ff_libmav1_encoder;
-   extern const FFCodec ff_librsvg_decoder;
-   extern const FFCodec ff_libshine_encoder;
-   extern const FFCodec ff_libspeex_encoder;
-  +1 -0
-
-libavcodec/libmav1.c
-  @@ -0,0 +1,139 @@
-  +/*
-  + * AV1 encoding through mav1 (Metal GPU / CPU kernels)
-  + *
-  + * This file is part of FFmpeg.
-  + *
-  + * FFmpeg is free software; you can redistribute it and/or
-  + * modify it under the terms of the GNU Lesser General Public
-  + * License as published by the Free Software Foundation; either
-  + * version 2.1 of the License, or (at your option) any later version.
-  + */
-  +
-  +#include <mav1.h>
-  +
-  +#include "libavutil/mem.h"
-  +#include "libavutil/opt.h"
-  +#include "libavutil/pixdesc.h"
-  +#include "avcodec.h"
-  +#include "codec_internal.h"
-  +#include "encode.h"
-  +
-  +typedef struct LibMav1Context {
-  +    const AVClass *class;
-  +    Mav1Encoder *enc;
-  +    int metal;
-  +    int qindex;
-  +    int loop_filter;
-  +    int cdef;
-  +    int tx_search;
-  +    int me_range;
-  +} LibMav1Context;
-  +
-  +static av_cold int libmav1_init(AVCodecContext *avctx)
-  +{
-  +    LibMav1Context *ctx = avctx->priv_data;
-  +    Mav1Config cfg;
-  +    char err[256];
-  +
-  +    mav1_default_config(&cfg, avctx->width, avctx->height);
-  +    cfg.use_metal   = ctx->metal;
-  +    cfg.qindex      = ctx->qindex;
-  +    cfg.loop_filter = ctx->loop_filter;
-  +    cfg.cdef        = ctx->cdef;
-  +    cfg.tx_search   = ctx->tx_search;
-  +    cfg.me_range    = ctx->me_range;
-  +    cfg.keyint      = avctx->gop_size > 0 ? avctx->gop_size : 0;
-  +
-  +    ctx->enc = mav1_create(&cfg, err, sizeof(err));
-  +    if (!ctx->enc) {
-  +        av_log(avctx, AV_LOG_ERROR, "mav1_create failed: %s\n", err);
-  +        return AVERROR_EXTERNAL;
-  +    }
-  +    av_log(avctx, AV_LOG_VERBOSE, "mav1 backend: %s\n", mav1_backend_name(ctx->enc));
-  +
-  +    if (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) {
-  +        uint8_t hdr[64];
-  +        size_t n = mav1_sequence_header(ctx->enc, hdr);
-  +        avctx->extradata = av_mallocz(n + AV_INPUT_BUFFER_PADDING_SIZE);
-  +        if (!avctx->extradata)
-  +            return AVERROR(ENOMEM);
-  +        memcpy(avctx->extradata, hdr, n);
-  +        avctx->extradata_size = n;
-  +    }
-  +    return 0;
-  +}
-  +
-  +static int libmav1_encode(AVCodecContext *avctx, AVPacket *pkt,
-  +                          const AVFrame *frame, int *got_packet)
-  +{
-  +    LibMav1Context *ctx = avctx->priv_data;
-  +    const uint8_t *planes[3] = { frame->data[0], frame->data[1], frame->data[2] };
-  +    int strides[3] = { frame->linesize[0], frame->linesize[1], frame->linesize[2] };
-  +    uint8_t *out;
-  +    size_t size;
-  +    int ret;
-  +
-  +    if (mav1_encode(ctx->enc, planes, strides, &out, &size))
-  +        return AVERROR_EXTERNAL;
-  +    ret = ff_get_encode_buffer(avctx, pkt, size, 0);
-  +    if (ret < 0) {
-  +        free(out);
-  +        return ret;
-  +    }
-  +    memcpy(pkt->data, out, size);
-  +    free(out);
-  +    if (mav1_last_stats(ctx->enc)->frame_type == 0)
-  +        pkt->flags |= AV_PKT_FLAG_KEY;
-  +    pkt->pts = pkt->dts = frame->pts;
-  +    *got_packet = 1;
-  +    return 0;
-  +}
-  +
-  +static av_cold int libmav1_close(AVCodecContext *avctx)
-  +{
-  +    LibMav1Context *ctx = avctx->priv_data;
-  +    mav1_destroy(ctx->enc);
-  +    ctx->enc = NULL;
-  +    return 0;
-  +}
-  +
-  +#define OFFSET(x) offsetof(LibMav1Context, x)
-  ... (39 lines truncated)
-  +139 -0
-[full diff: rtk git diff --no-compact]
+diff --git a/configure b/configure
+index 86a2437..0e2d29a 100755
+--- a/configure
++++ b/configure
+@@ -269,6 +269,7 @@ External library support:
+   --enable-libquirc        enable QR decoding via libquirc [no]
+   --enable-librabbitmq     enable RabbitMQ library [no]
+   --enable-librav1e        enable AV1 encoding via rav1e [no]
++  --enable-libmav1         enable AV1 encoding via mav1 (Metal) [no]
+   --enable-librist         enable RIST via librist [no]
+   --enable-librsvg         enable SVG rasterization via librsvg [no]
+   --enable-librubberband   enable rubberband needed for rubberband filter [no]
+@@ -2077,6 +2078,7 @@ EXTERNAL_LIBRARY_LIST="
+     libquirc
+     librabbitmq
+     librav1e
++    libmav1
+     librist
+     librsvg
+     librtmp
+@@ -3805,6 +3807,7 @@ libopus_decoder_deps="libopus"
+ libopus_encoder_deps="libopus"
+ libopus_encoder_select="audio_frame_queue"
+ librav1e_encoder_deps="librav1e"
++libmav1_encoder_deps="libmav1"
+ librsvg_decoder_deps="librsvg"
+ libshine_encoder_deps="libshine"
+ libshine_encoder_select="audio_frame_queue mpegaudioheader"
+@@ -7369,6 +7372,7 @@ enabled libpulse          && require_pkg_config libpulse libpulse pulse/pulseaud
+ enabled libqrencode       && require_pkg_config libqrencode libqrencode qrencode.h QRcode_encodeString
+ enabled libquirc          && require libquirc quirc.h quirc_decode -lquirc
+ enabled librabbitmq       && require_pkg_config librabbitmq "librabbitmq >= 0.7.1" amqp.h amqp_new_connection
++enabled libmav1           && require libmav1 mav1.h mav1_create -lmav1 -framework Metal -framework Foundation
+ enabled librav1e          && require_pkg_config librav1e "rav1e >= 0.5.0" rav1e.h rav1e_context_new
+ enabled librist           && require_pkg_config librist "librist >= 0.2.7" librist/librist.h rist_receiver_create
+ enabled librsvg           && require_pkg_config librsvg librsvg-2.0 librsvg-2.0/librsvg/rsvg.h rsvg_handle_new_from_data
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+index 1410bd8..3c2f2d0 100644
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -1203,6 +1203,7 @@ OBJS-$(CONFIG_LIBOPUS_DECODER)            += libopusdec.o libopus.o     \
+ OBJS-$(CONFIG_LIBOPUS_ENCODER)            += libopusenc.o libopus.o     \
+                                              vorbis_data.o
+ OBJS-$(CONFIG_LIBRAV1E_ENCODER)           += librav1e.o
++OBJS-$(CONFIG_LIBMAV1_ENCODER)            += libmav1.o
+ OBJS-$(CONFIG_LIBRSVG_DECODER)            += librsvgdec.o
+ OBJS-$(CONFIG_LIBSHINE_ENCODER)           += libshine.o
+ OBJS-$(CONFIG_LIBSPEEX_DECODER)           += libspeexdec.o
+diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
+index 695214f..003819e 100644
+--- a/libavcodec/allcodecs.c
++++ b/libavcodec/allcodecs.c
+@@ -813,6 +813,7 @@ extern const FFCodec ff_libopenjpeg_encoder;
+ extern const FFCodec ff_libopus_encoder;
+ extern const FFCodec ff_libopus_decoder;
+ extern const FFCodec ff_librav1e_encoder;
++extern const FFCodec ff_libmav1_encoder;
+ extern const FFCodec ff_librsvg_decoder;
+ extern const FFCodec ff_libshine_encoder;
+ extern const FFCodec ff_libspeex_encoder;
+diff --git a/libavcodec/libmav1.c b/libavcodec/libmav1.c
+new file mode 100644
+index 0000000..853fe86
+--- /dev/null
++++ b/libavcodec/libmav1.c
+@@ -0,0 +1,148 @@
++/*
++ * AV1 encoding through mav1 (Metal GPU / CPU kernels)
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include <mav1.h>
++
++#include "libavutil/mem.h"
++#include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
++#include "avcodec.h"
++#include "codec_internal.h"
++#include "encode.h"
++
++typedef struct LibMav1Context {
++    const AVClass *class;
++    Mav1Encoder *enc;
++    int metal;
++    int qindex;
++    int loop_filter;
++    int cdef;
++    int tx_search;
++    int tx_depth;
++    int restoration;
++    int switchable_interp;
++    int me_range;
++} LibMav1Context;
++
++static av_cold int libmav1_init(AVCodecContext *avctx)
++{
++    LibMav1Context *ctx = avctx->priv_data;
++    Mav1Config cfg;
++    char err[256];
++
++    mav1_default_config(&cfg, avctx->width, avctx->height);
++    cfg.use_metal   = ctx->metal;
++    cfg.qindex      = ctx->qindex;
++    cfg.loop_filter = ctx->loop_filter;
++    cfg.cdef        = ctx->cdef;
++    cfg.tx_search   = ctx->tx_search;
++    cfg.tx_depth    = ctx->tx_depth;
++    cfg.restoration = ctx->restoration;
++    cfg.switchable_interp = ctx->switchable_interp;
++    cfg.me_range    = ctx->me_range;
++    cfg.keyint      = avctx->gop_size > 0 ? avctx->gop_size : 0;
++
++    ctx->enc = mav1_create(&cfg, err, sizeof(err));
++    if (!ctx->enc) {
++        av_log(avctx, AV_LOG_ERROR, "mav1_create failed: %s\n", err);
++        return AVERROR_EXTERNAL;
++    }
++    av_log(avctx, AV_LOG_VERBOSE, "mav1 backend: %s\n", mav1_backend_name(ctx->enc));
++
++    if (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) {
++        uint8_t hdr[64];
++        size_t n = mav1_sequence_header(ctx->enc, hdr);
++        avctx->extradata = av_mallocz(n + AV_INPUT_BUFFER_PADDING_SIZE);
++        if (!avctx->extradata)
++            return AVERROR(ENOMEM);
++        memcpy(avctx->extradata, hdr, n);
++        avctx->extradata_size = n;
++    }
++    return 0;
++}
++
++static int libmav1_encode(AVCodecContext *avctx, AVPacket *pkt,
++                          const AVFrame *frame, int *got_packet)
++{
++    LibMav1Context *ctx = avctx->priv_data;
++    const uint8_t *planes[3] = { frame->data[0], frame->data[1], frame->data[2] };
++    int strides[3] = { frame->linesize[0], frame->linesize[1], frame->linesize[2] };
++    uint8_t *out;
++    size_t size;
++    int ret;
++
++    if (mav1_encode(ctx->enc, planes, strides, &out, &size))
++        return AVERROR_EXTERNAL;
++    ret = ff_get_encode_buffer(avctx, pkt, size, 0);
++    if (ret < 0) {
++        free(out);
++        return ret;
++    }
++    memcpy(pkt->data, out, size);
++    free(out);
++    if (mav1_last_stats(ctx->enc)->frame_type == 0)
++        pkt->flags |= AV_PKT_FLAG_KEY;
++    pkt->pts = pkt->dts = frame->pts;
++    *got_packet = 1;
++    return 0;
++}
++
++static av_cold int libmav1_close(AVCodecContext *avctx)
++{
++    LibMav1Context *ctx = avctx->priv_data;
++    mav1_destroy(ctx->enc);
++    ctx->enc = NULL;
++    return 0;
++}
++
++#define OFFSET(x) offsetof(LibMav1Context, x)
++#define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
++static const AVOption options[] = {
++    { "metal",     "Use the Metal GPU backend (0 = CPU kernels)", OFFSET(metal),       AV_OPT_TYPE_BOOL, { .i64 = 1 },   0, 1,   VE },
++    { "dualfilter", "Per-block dual interpolation filter choice", OFFSET(switchable_interp), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, VE },
++    { "lr",        "Loop restoration (Wiener / self-guided)",     OFFSET(restoration), AV_OPT_TYPE_BOOL, { .i64 = 1 },   0, 1,   VE },
++    { "txdepth",   "Intra transform split search (TX_MODE_SELECT)", OFFSET(tx_depth), AV_OPT_TYPE_BOOL, { .i64 = 1 },   0, 1,   VE },
++    { "qindex",    "AV1 base_q_idx (0 = lossless)",               OFFSET(qindex),      AV_OPT_TYPE_INT,  { .i64 = 100 }, 0, 255, VE },
++    { "lf",        "Deblocking loop filter",                      OFFSET(loop_filter), AV_OPT_TYPE_BOOL, { .i64 = 1 },   0, 1,   VE },
++    { "cdef",      "CDEF",                                        OFFSET(cdef),        AV_OPT_TYPE_BOOL, { .i64 = 1 },   0, 1,   VE },
++    { "txsearch",  "Transform type search",                       OFFSET(tx_search),   AV_OPT_TYPE_BOOL, { .i64 = 1 },   0, 1,   VE },
++    { "me_range",  "Full-pel motion search range",                OFFSET(me_range),    AV_OPT_TYPE_INT,  { .i64 = 32 },  0, 256, VE },
++    { NULL },
++};
++
++static const AVClass libmav1_class = {
++    .class_name = "libmav1",
++    .item_name  = av_default_item_name,
++    .option     = options,
++    .version    = LIBAVUTIL_VERSION_INT,
++};
++
++static const FFCodecDefault libmav1_defaults[] = {
++    { "g", "0" },
++    { NULL },
++};
++
++const FFCodec ff_libmav1_encoder = {
++    .p.name         = "libmav1",
++    CODEC_LONG_NAME("mav1 AV1 (Metal)"),
++    .p.type         = AVMEDIA_TYPE_VIDEO,
++    .p.id           = AV_CODEC_ID_AV1,
++    .init           = libmav1_init,
++    FF_CODEC_ENCODE_CB(libmav1_encode),
++    .close          = libmav1_close,
++    .priv_data_size = sizeof(LibMav1Context),
++    .p.priv_class   = &libmav1_class,
++    .defaults       = libmav1_defaults,
++    CODEC_PIXFMTS(AV_PIX_FMT_YUV420P),
++    .p.capabilities = AV_CODEC_CAP_DR1,
++    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
++    .p.wrapper_name = "libmav1",
++};

@@ -40,7 +40,7 @@ Full list: `ref/aom/test/test_vectors.cc` (176 entries).
 |---|---|---|
 | Entropy coder | `build/test_entropy` | Spec decoder transcription |
 | Transforms | `build/test_txfm` | Spec inverse transform |
-| Bit-exact regression (2 clips × 5 q × 5 frames, I and P frames, with and without filters) | `tools/regress.sh build/mav1enc [--no-lf --no-cdef]` | dav1d, aomdec (libaom), Metal vs CPU byte compare |
+| Bit-exact regression (2 clips × 6 q incl. lossless × 5 frames, I and P frames; run in parallel) | `tools/regress.sh build/mav1enc [--lr-test] [--no-lf --no-cdef ...]` | dav1d, aomdec (libaom), Metal vs CPU byte compare |
 | FFmpeg integration | `ffmpeg -c:v libmav1` into ivf, mkv, mp4 and webm; `-metal 0/1` | Packets identical to `mav1enc`; decoded output equals encoder recon |
 | Speed and quality | `tools/bench.py` | Metal vs CPU, plus libaom, SVT-AV1 and rav1e |
 
@@ -50,15 +50,17 @@ Full list: `ref/aom/test/test_vectors.cc` (176 entries).
 | OBUs: temporal delimiter, sequence header, frame OBU | ✅ |
 | Profile 0, 8-bit 4:2:0, any size from 16x16 up | ✅ |
 | Key frames and inter frames (single reference, LAST) | ✅ |
-| Partition: 64x64 superblocks, NONE/SPLIT down to 8x8 | ✅ (the encoder chooses this subset; HORZ/VERT/4-way partitions are not emitted) |
-| Intra: all 13 modes, angle deltas | ✅ (filter-intra, CfL and palette not emitted) |
-| Inter: NEARESTMV, NEARMV (drl), GLOBALMV, NEWMV; find_mv_stack 7.10.2; MV coding | ✅ (compound, OBMC, warped, interintra and switchable filters not emitted) |
-| Motion search (full-pel plus 1/2 and 1/4 pel) | ✅ |
-| Transforms: all sizes up to 64, all 16 types, tx-type RD search | ✅ (TX_MODE_LARGEST, no tx split) |
-| Quantization and dequantization, all q 1..255 | ✅ (lossless q=0, qmatrix and delta-q not emitted) |
+| Partition: 64x64 superblocks, all 10 partition types (NONE, HORZ, VERT, SPLIT, HORZ_A/B, VERT_A/B, HORZ_4, VERT_4) | ✅ |
+| Intra: all 13 modes, angle deltas, chroma-from-luma (CfL) | ✅ (filter-intra, intra edge filter and palette not emitted) |
+| Inter: NEARESTMV, NEARMV (drl), GLOBALMV, NEWMV; find_mv_stack 7.10.2; MV coding | ✅ (compound, OBMC, warped and interintra not emitted) |
+| Switchable dual interpolation filters (per block, 3x3 search) | ✅ |
+| Motion search (full-pel plus 1/2 and 1/4 pel; GPU: SIMD-group parallel, bit-identical to CPU) | ✅ |
+| Transforms: all sizes up to 64, all 16 types, tx-type RD search; TX_MODE_SELECT (intra tx_depth search, txfm_split for inter) | ✅ (inter var-tx split not emitted) |
+| Quantization and dequantization, all q 0..255; lossless (q=0: WHT, 4x4, CodedLossless header) | ✅ (qmatrix and delta-q not emitted) |
 | Coefficient coding (all contexts), CDF adaptation | ✅ |
-| Deblocking loop filter 7.14 | ✅ |
+| Deblocking loop filter 7.14 (including transform-split edges) | ✅ |
 | CDEF 7.15 with per-SB selection over 4 strength sets | ✅ |
-| Loop restoration, superres, film grain, segmentation, tiles >1, 10/12-bit, 4:4:4 | ❌ not emitted (optional coding tools) |
+| Loop restoration 7.17: Wiener and self-guided, 64x64 units, least-squares parameter search, RD per unit | ✅ (`--lr-test` forces both filters for syntax coverage) |
+| Superres, film grain, segmentation, tiles >1, 10/12-bit, 4:4:4, 128x128 SB, palette, intrabc, compound, multiple references | ❌ not emitted |
 
 Every bitstream mav1 emits is verified bit-exact against two independent decoders.
