@@ -34,9 +34,17 @@ static void cpu_motion_search(Backend *b, struct Mav1Encoder *e) {
 void cpu_backend_analyze(Backend *b, struct Mav1Encoder *e) {
   (void)b;
   const FrameParams *fp = ENC_PARAMS(e);
+  long *costs = (long *)e->acosts.base;
+  BlockInfo *infos = (BlockInfo *)e->ainfos.base;
   dispatch_apply((size_t)e->num_sbs, DISPATCH_APPLY_AUTO, ^(size_t i) {
-    analyze_sb(fp, (int)i, e->src.base, e->ref.base, (const int32_t *)e->mvfield.base, ENC_BLOCKS(e), ENC_SBS(e),
-               (int32_t *)e->scratch.base + i * SCRATCH_INTS);
+    for (int level = 3; level >= 0; level--) {
+      int ns = level_slots(fp, level);
+      for (int node = 0; node < (1 << (2 * level)); node++)
+        for (int slot = 0; slot < ns; slot++)
+          analyze_item(fp, (int)i, level, node, slot, e->src.base, e->ref.base, (const int32_t *)e->mvfield.base,
+                       costs, infos, (int32_t *)e->scratch.base + i * SCRATCH_INTS);
+    }
+    analyze_sb_table(fp, (int)i, costs, infos, ENC_BLOCKS(e), ENC_SBS(e));
   });
 }
 

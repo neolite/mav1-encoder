@@ -106,6 +106,17 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
   ok |= buf_alloc(&e->coefs, sizeof(int32_t) * COEFS_PER_SB * e->num_sbs);
   ok |= buf_alloc(&e->mats, sizeof(int32_t) * FWD_SLOT_SIZE * FWD_NUM_SLOTS);
   ok |= buf_alloc(&e->mvfield, sizeof(int32_t) * 2 * NUM_NODES * e->num_sbs);
+  ok |= buf_alloc(&e->acosts, sizeof(long) * A_ITEMS * (size_t)e->num_sbs);
+  ok |= buf_alloc(&e->ainfos, sizeof(BlockInfo) * A_ITEMS * (size_t)e->num_sbs);
+  {
+    /* pass-1 GPU scratch: the largest level dispatch (threads x slot size) */
+    size_t mx = 0;
+    for (int l = 0; l < 4; l++) {
+      size_t t = (size_t)e->num_sbs * (1u << (2 * l)) * (l == 3 ? 1 : l == 2 ? 5 : A_SLOTS) * analysis_slot_ints(l);
+      if (t > mx) mx = t;
+    }
+    ok |= buf_alloc(&e->ascratch, sizeof(int32_t) * mx);
+  }
   ok |= buf_alloc(&e->mescratch, sizeof(int32_t) * ME_SB_INTS * (size_t)e->num_sbs);
   ok |= buf_alloc(&e->scratch, sizeof(int32_t) * SCRATCH_INTS * (size_t)e->num_sbs);
   ok |= buf_alloc(&e->lfmask, (size_t)e->mi_rows * e->mi_cols);
@@ -150,6 +161,9 @@ void mav1_destroy(Mav1Encoder *e) {
   buf_free(&e->mvfield);
   buf_free(&e->scratch);
   buf_free(&e->mescratch);
+  buf_free(&e->acosts);
+  buf_free(&e->ainfos);
+  buf_free(&e->ascratch);
   free(e->mi);
   free(e->cdef_idx);
   free(e->cdef_choice);

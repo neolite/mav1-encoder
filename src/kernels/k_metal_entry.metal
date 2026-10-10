@@ -111,13 +111,18 @@ kernel void mav1_analyze(device const FrameParams *fp [[buffer(0)]],
                          device const uint8_t *src [[buffer(1)]],
                          device const uint8_t *ref [[buffer(2)]],
                          device const int32_t *mvField [[buffer(3)]],
-                         device BlockInfo *blocks [[buffer(4)]],
-                         device SbInfo *sbs [[buffer(5)]],
+                         device long *costs [[buffer(4)]],
+                         device BlockInfo *infos [[buffer(5)]],
                          device int32_t *scratch [[buffer(6)]],
+                         constant int &level [[buffer(7)]],
                          uint gid [[thread_position_in_grid]]) {
-  int n = fp->sb_cols * fp->sb_rows;
-  if ((int)gid >= n) return;
-  analyze_sb(fp, (int)gid, src, ref, mvField, blocks, sbs, scratch + (long)gid * SCRATCH_INTS);
+  /* pass 1: one thread per (superblock, node of the level, slot) */
+  int ns = level_slots(fp, level), nn = 1 << (2 * level);
+  int total = fp->sb_cols * fp->sb_rows * nn * ns;
+  if ((int)gid >= total) return;
+  int sb = (int)gid / (nn * ns), rem = (int)gid % (nn * ns);
+  analyze_item(fp, sb, level, rem / ns, rem % ns, src, ref, mvField, costs, infos,
+               scratch + (long)gid * analysis_slot_ints(level));
 }
 
 kernel void mav1_recon(device const FrameParams *fp [[buffer(0)]],

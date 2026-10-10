@@ -393,4 +393,198 @@ INLINE void analyze_sb(DEV const FrameParams *fp, int sbIdx, DEV const uint8_t *
   sb->sb_col = sbCol;
 }
 
+
+/* ------------------------------------------------------------------------ */
+/* Two-pass analysis. Pass 1 evaluates every candidate block independently  */
+/* (one GPU thread each) into a per-SB table; pass 2 runs the bottom-up     */
+/* partition decision on the table.                                         */
+/*                                                                          */
+/* Table slot of node `node`, slot s: 0 NONE, 1-2 HORZ, 3-4 VERT,           */
+/* 5-8 HORZ_4, 9-12 VERT_4. The rectangles of HORZ_A/B and VERT_A/B are the */
+/* HORZ/VERT ones; their squares are the children's NONE blocks.            */
+#define A_SLOTS 13
+#define A_ITEMS (NUM_NODES * A_SLOTS)
+
+INLINE void slot_part(int slot, THR int *p, THR int *k) {
+  if (slot == 0) { *p = PARTITION_NONE; *k = 0; }
+  else if (slot < 3) { *p = PARTITION_HORZ; *k = slot - 1; }
+  else if (slot < 5) { *p = PARTITION_VERT; *k = slot - 3; }
+  else if (slot < 9) { *p = PARTITION_HORZ_4; *k = slot - 5; }
+  else { *p = PARTITION_VERT_4; *k = slot - 9; }
+}
+
+/* Partition p is searched at this node (the conditions of analyze_sb). */
+INLINE int part_allowed(DEV const FrameParams *fp, int level, int p, int hasRows, int hasCols) {
+  if (p == PARTITION_SPLIT) return 0;
+  if (level == 3 && p != PARTITION_NONE) return 0;
+  if (fp->fast && p > PARTITION_SPLIT) return 0;
+  if (level == 2 && (p == PARTITION_HORZ_4 || p == PARTITION_VERT_4)) return 0;
+  if (!(hasRows && hasCols))
+    return (p == PARTITION_HORZ && hasCols && !hasRows) || (p == PARTITION_VERT && hasRows && !hasCols);
+  return 1;
+}
+
+/* Slots per node at a level (the dispatch size of pass 1). */
+INLINE int level_slots(DEV const FrameParams *fp, int level) {
+  if (level == 3) return 1;
+  if (level == 2 || fp->fast) return 5;
+  return A_SLOTS;
+}
+
+INLINE int analysis_slot_ints(int level) {
+  int w = 64 >> level;
+  return (w * w + 3) / 4 + (w + 7) * w;
+}
+
+/* Pass 1: item (level, node i, slot) of superblock sbIdx. */
+INLINE void analyze_item(DEV const FrameParams *fp, int sbIdx, int level, int i, int slot, DEV const uint8_t *src,
+                         DEV const uint8_t *ref, DEV const int32_t *mvField, DEV long *costs, DEV BlockInfo *infos,
+                         DEV int32_t *scratch) {
+  int sbRow = sbIdx / fp->sb_cols, sbCol = sbIdx % fp->sb_cols;
+  int n = 1 << level, size4 = 16 >> level, halfSz = size4 >> 1;
+  int node = NODE_BASE(level) + i;
+  int r = sbRow * 16 + (i / n) * size4, c = sbCol * 16 + (i % n) * size4;
+  long idx = (long)sbIdx * A_ITEMS + node * A_SLOTS + slot;
+  costs[idx] = -1;
+  if (r >= fp->mi_rows || c >= fp->mi_cols) return;
+  int hasRows = (r + halfSz) < fp->mi_rows, hasCols = (c + halfSz) < fp->mi_cols;
+  int p, k;
+  slot_part(slot, &p, &k);
+  if (!part_allowed(fp, level, p, hasRows, hasCols)) return;
+  if (k >= part_count(fp, p, r, c, halfSz)) return;
+  int dr, dc;
+  int bs = part_block(p, level_bsize(level), k, halfSz, &dr, &dc);
+  BlockInfo b;
+  costs[idx] = eval_block(fp, src, ref, mvField, node, r + dr, c + dc, bs, scratch, 64 >> level, &b);
+  infos[idx] = b;
+}
+
+/* Table slot of block k of partition p (-1: the child square's NONE). */
+INLINE int part_slot(int p, int k) {
+  switch (p) {
+    case PARTITION_NONE: return 0;
+    case PARTITION_HORZ: return 1 + k;
+    case PARTITION_VERT: return 3 + k;
+    case PARTITION_HORZ_4: return 5 + k;
+    case PARTITION_VERT_4: return 9 + k;
+    case PARTITION_HORZ_A: return k < 2 ? -1 : 2;
+    case PARTITION_HORZ_B: return k == 0 ? 1 : -1;
+    case PARTITION_VERT_A: return k < 2 ? -1 : 4;
+    default: return k == 0 ? 3 : -1; /* VERT_B */
+  }
+}
+
+/* Pass 2: partition decision and block emission from the table. */
+INLINE void analyze_sb_table(DEV const FrameParams *fp, int sbIdx, DEV const long *costs,
+                             DEV const BlockInfo *infos, DEV BlockInfo *blocks, DEV SbInfo *sbs) {
+  int sbRow = sbIdx / fp->sb_cols, sbCol = sbIdx % fp->sb_cols;
+  long cost[NUM_NODES];
+  long noneCost[NUM_NODES];
+  int lam = fp->ac_q[0] / 16;
+  DEV SbInfo *sb = &sbs[sbIdx];
+  DEV const long *tc = costs + (long)sbIdx * A_ITEMS;
+  DEV const BlockInfo *ti = infos + (long)sbIdx * A_ITEMS;
+
+  for (int level = 3; level >= 0; level--) {
+    int n = 1 << level;
+    int size4 = 16 >> level;
+    int bSize = level_bsize(level);
+    for (int i = 0; i < n * n; i++) {
+      int node = NODE_BASE(level) + i;
+      int r = sbRow * 16 + (i / n) * size4, c = sbCol * 16 + (i % n) * size4;
+      noneCost[node] = -1;
+      if (r >= fp->mi_rows || c >= fp->mi_cols) {
+        cost[node] = 0;
+        sb->part[node] = -1;
+        continue;
+      }
+      int halfSz = size4 >> 1;
+      int hasRows = (r + halfSz) < fp->mi_rows, hasCols = (c + halfSz) < fp->mi_cols;
+      int cn = n * 2, ci = (i / n) * 2 * cn + (i % n) * 2, cb = NODE_BASE(level + 1);
+      long bestC = -1;
+      int bestP = PARTITION_SPLIT;
+      if (level < 3) {
+        bestC = cost[cb + ci] + cost[cb + ci + 1] + cost[cb + ci + cn] + cost[cb + ci + cn + 1] +
+                (long)lam * 16 / 8;
+      }
+      for (int p = PARTITION_NONE; p <= PARTITION_VERT_4; p++) {
+        if (!part_allowed(fp, level, p, hasRows, hasCols)) continue;
+        long pc = 0;
+        int nb = part_count(fp, p, r, c, halfSz);
+        for (int k = 0; k < nb && pc >= 0; k++) {
+          int s = part_slot(p, k);
+          if (s < 0) {
+            int dr, dc;
+            part_block(p, bSize, k, halfSz, &dr, &dc);
+            long cc = noneCost[cb + ci + (dr ? cn : 0) + (dc ? 1 : 0)];
+            pc = cc < 0 ? -1 : pc + cc;
+          } else {
+            long cc = tc[node * A_SLOTS + s];
+            pc = cc < 0 ? -1 : pc + cc;
+          }
+        }
+        if (pc < 0) continue;
+        pc += (long)lam * (p == PARTITION_NONE ? 8 : 24) / 8;
+        if (p == PARTITION_NONE) noneCost[node] = pc;
+        if (bestC < 0 || pc <= bestC) {
+          bestC = pc;
+          bestP = p;
+        }
+      }
+      cost[node] = bestC;
+      sb->part[node] = bestP;
+    }
+  }
+
+  int count = 0;
+  int coefOff = sbIdx * COEFS_PER_SB;
+  for (int z = 0; z < 64; z++) {
+    int zx = 0, zy = 0;
+    for (int b = 0; b < 3; b++) {
+      zx |= ((z >> (2 * b)) & 1) << b;
+      zy |= ((z >> (2 * b + 1)) & 1) << b;
+    }
+    for (int level = 0; level <= 3; level++) {
+      int shift = 3 - level;
+      int n = 1 << level;
+      int node = NODE_BASE(level) + (zy >> shift) * n + (zx >> shift);
+      int p = sb->part[node];
+      if (p < 0) break;
+      if (p == PARTITION_SPLIT) continue;
+      if ((zx & ((1 << shift) - 1)) == 0 && (zy & ((1 << shift) - 1)) == 0) {
+        int size4 = 16 >> level, halfMi = size4 >> 1;
+        int r = sbRow * 16 + (zy >> shift) * size4, c = sbCol * 16 + (zx >> shift) * size4;
+        int nb = part_count(fp, p, r, c, halfMi);
+        int cn = n * 2, ci = ((zy >> shift)) * 2 * cn + (zx >> shift) * 2, cb = NODE_BASE(level + 1);
+        for (int k = 0; k < nb; k++) {
+          int s = part_slot(p, k);
+          BlockInfo b;
+          if (s < 0) {
+            int dr, dc;
+            part_block(p, level_bsize(level), k, halfMi, &dr, &dc);
+            b = ti[(cb + ci + (dr ? cn : 0) + (dc ? 1 : 0)) * A_SLOTS];
+          } else {
+            b = ti[node * A_SLOTS + s];
+          }
+          int w = Block_Width(b.bsize), h = Block_Height(b.bsize);
+          b.coef_off[0] = coefOff;
+          coefOff += w * h;
+          b.coef_off[1] = coefOff;
+          coefOff += (w >> 1) * (h >> 1);
+          b.coef_off[2] = coefOff;
+          coefOff += (w >> 1) * (h >> 1);
+          b.eob[0] = b.eob[1] = b.eob[2] = 0;
+          blocks[sbIdx * MAX_BLOCKS_PER_SB + count] = b;
+          count++;
+        }
+      }
+      break;
+    }
+  }
+  sb->first_block = sbIdx * MAX_BLOCKS_PER_SB;
+  sb->num_blocks = count;
+  sb->sb_row = sbRow;
+  sb->sb_col = sbCol;
+}
+
 #endif

@@ -7,7 +7,7 @@ BUILD   := build
 
 CORE := src/encoder.c src/obu.c src/tile_writer.c src/cdfs.c src/entenc.c src/bitwriter.c \
         src/fwd_matrices.c src/mvpred.c src/backend_cpu.c src/loopfilter_cpu.c src/lr_search.c
-KERNELS := $(wildcard src/kernels/*.h) src/spec_tables.h src/spec_enums.h
+KERNELS := $(wildcard src/kernels/*.h src/kernels/*.metal) src/spec_tables.h src/spec_enums.h
 HDRS := $(wildcard src/*.h) $(KERNELS)
 
 CORE_OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(CORE))

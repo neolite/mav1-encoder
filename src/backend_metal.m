@@ -4,10 +4,14 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 
 #include "backend.h"
 #include "enc_internal.h"
 #include "kernels_src.h"
+#include "kernels/k_analysis.h"
+#include <dispatch/dispatch.h>
 
 @interface Mav1MetalState : NSObject
 @property(nonatomic, strong) id<MTLDevice> device;
@@ -78,11 +82,35 @@ static void mtl_analyze(Backend *b, struct Mav1Encoder *e) {
     [enc setBuffer:wrap(s, &e->src) offset:0 atIndex:1];
     [enc setBuffer:wrap(s, &e->ref) offset:0 atIndex:2];
     [enc setBuffer:wrap(s, &e->mvfield) offset:0 atIndex:3];
-    [enc setBuffer:wrap(s, &e->blocks) offset:0 atIndex:4];
-    [enc setBuffer:wrap(s, &e->sbs) offset:0 atIndex:5];
-    [enc setBuffer:wrap(s, &e->scratch) offset:0 atIndex:6];
-    NSUInteger tg = MIN((NSUInteger)32, s.analyze.maxTotalThreadsPerThreadgroup);
-    [enc dispatchThreads:MTLSizeMake(e->num_sbs, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    [enc setBuffer:wrap(s, &e->acosts) offset:0 atIndex:4];
+    [enc setBuffer:wrap(s, &e->ainfos) offset:0 atIndex:5];
+    [enc setBuffer:wrap(s, &e->ascratch) offset:0 atIndex:6];
+    NSUInteger tg = MIN((NSUInteger)64, s.analyze.maxTotalThreadsPerThreadgroup);
+    const FrameParams *fp = ENC_PARAMS(e);
+    /* levels are independent; they share the scratch buffer, so they run as
+     * consecutive (serial) dispatches */
+    for (int level = 3; level >= 0; level--) {
+      [enc setBytes:&level length:sizeof level atIndex:7];
+      NSUInteger n = (NSUInteger)e->num_sbs * (1u << (2 * level)) * level_slots(fp, level);
+      [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+      [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    }
+  });
+  /* pass 2 (partition decision on the table) on the CPU cores */
+  const FrameParams *fp = ENC_PARAMS(e);
+  if (getenv("MAV1_DBG")) {
+    long *gc = malloc(sizeof(long) * A_ITEMS * e->num_sbs);
+    memcpy(gc, e->acosts.base, sizeof(long) * A_ITEMS * e->num_sbs);
+    cpu_backend_analyze(b, e);
+    long *cc = (long *)e->acosts.base;
+    int bad = 0;
+    for (long i = 0; i < (long)A_ITEMS * e->num_sbs && bad < 5; i++)
+      if (gc[i] != cc[i]) { fprintf(stderr, "item %ld (sb %ld node %ld slot %ld): gpu %ld cpu %ld\n", i, i / A_ITEMS, (i % A_ITEMS) / A_SLOTS, i % A_SLOTS, gc[i], cc[i]); bad++; }
+    free(gc);
+  }
+  dispatch_apply((size_t)e->num_sbs, DISPATCH_APPLY_AUTO, ^(size_t i) {
+    analyze_sb_table(fp, (int)i, (const long *)e->acosts.base, (const BlockInfo *)e->ainfos.base, ENC_BLOCKS(e),
+                     ENC_SBS(e));
   });
 }
 
@@ -199,7 +227,7 @@ Backend *backend_metal_create(struct Mav1Encoder *e, char *err, size_t errlen) {
     MetalBackend *m = calloc(1, sizeof(*m));
     m->base.name = "metal";
     m->base.motion_search = mtl_motion_search;
-    m->base.analyze = getenv("MAV1_GPU_ANALYZE") ? mtl_analyze : cpu_backend_analyze; /* GPU version: one thread per SB, slower until candidate-parallel */
+    m->base.analyze = getenv("MAV1_CPU_ANALYZE") ? cpu_backend_analyze : mtl_analyze;
     /* Hybrid: GPU for the massively parallel stages (motion search,
    * analysis, filters), CPU for the wavefront reconstruction. MAV1_GPU_RECON=1
    * keeps the GPU wavefront (for the backend comparison tests). */
