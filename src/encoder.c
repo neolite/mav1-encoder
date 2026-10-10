@@ -861,6 +861,10 @@ static uint8_t *alt_code(Mav1Encoder *e, const uint8_t *frame, int disp, int isK
     h->skip_mode_allowed = h->reference_select;
   }
   /* the engine coding the frame (the driver itself without engines) */
+  static double tl0;
+  int tl = getenv("MAV1_TL") != NULL;
+  if (tl && !tl0) tl0 = now();
+  if (tl) fprintf(stderr, "%7.1f drv  d%d k%d wait\n", (now() - tl0) * 1e3, disp, kind);
   int ei = e->eng_next;
   Mav1Encoder *E = e->eng[0] ? e->eng[ei] : e;
   if (e->eng[0]) {
@@ -902,9 +906,12 @@ static uint8_t *alt_code(Mav1Encoder *e, const uint8_t *frame, int disp, int isK
   typedef struct { Mav1Encoder *s; WCtx *c; Mav1FrameStats st; } Job;
   Job *job = calloc(1, sizeof *job);
   dispatch_semaphore_t coreDone = e->eng[0] ? dispatch_semaphore_create(0) : NULL;
+  if (tl) fprintf(stderr, "%7.1f drv  d%d setup done\n", (now() - tl0) * 1e3, disp);
   void (^core)(void) = ^{
+    if (tl) fprintf(stderr, "%7.1f e%d   d%d core start\n", (now() - tl0) * 1e3, ei, disp);
     memset(&E->last, 0, sizeof E->last);
     run_frame_core(E, isKey);
+    if (tl) fprintf(stderr, "%7.1f e%d   d%d core end\n", (now() - tl0) * 1e3, ei, disp);
     job->st = E->last;
     job->s = E->wq ? snap_take(E, &job->c) : E;
     for (int k = 0; k < 8; k++)
@@ -947,6 +954,7 @@ static uint8_t *alt_code(Mav1Encoder *e, const uint8_t *frame, int disp, int isK
     stats_add(&t->st, &st2);
     if (job->c) dispatch_semaphore_signal((dispatch_semaphore_t)job->c->free);
     free(job);
+    if (tl) fprintf(stderr, "%7.1f wq   d%d written\n", (now() - tl0) * 1e3, disp);
   });
   return recon;
 }

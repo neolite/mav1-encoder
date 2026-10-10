@@ -1122,3 +1122,160 @@ kernel void mav1_analyze_l3o(device const FrameParams *fp [[buffer(0)]],
   costs[idx] = cost;
   infos[idx] = b;
 }
+
+/* ------------------------------------------------------------------------ */
+/* Motion search of the large nodes (levels 0 / 1) with a whole threadgroup */
+/* (tpg threads, a multiple of 32) per node and reference; the same         */
+/* candidates, costs and (cost, index) first minima as mav1_me.            */
+
+/* (cost, k) lexicographic minimum over the threadgroup. */
+INLINE int2 tg_argmin(int c, int k, uint tid, uint tpg, threadgroup int2 *red) {
+  int g = simd_min(c);
+  int kk = simd_min(c == g ? k : INT_MAX);
+  if ((tid & 31) == 0) red[tid >> 5] = int2(g, kk);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  int2 b = red[0];
+  for (uint s = 1; s < (tpg >> 5); s++) {
+    int2 v = red[s];
+    if (v.x < b.x || (v.x == b.x && v.y < b.y)) b = v;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return b;
+}
+
+INLINE int tg_sum(int v, uint tid, uint tpg, threadgroup int2 *red) {
+  int s = simd_sum(v);
+  if ((tid & 31) == 0) red[tid >> 5] = int2(s, 0);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  int t = 0;
+  for (uint k = 0; k < (tpg >> 5); k++) t += red[k].x;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return t;
+}
+
+kernel void mav1_me_tg(device const FrameParams *fp [[buffer(0)]],
+                       device const uint8_t *src [[buffer(1)]],
+                       device const uint8_t *ref [[buffer(2)]],
+                       device int32_t *mvField [[buffer(3)]],
+                       device int32_t *scratch [[buffer(4)]],
+                       constant int &level [[buffer(5)]],
+                       device const uint8_t *gold [[buffer(6)]],
+                       device int32_t *mvFieldGold [[buffer(7)]],
+                       device const uint8_t *hp [[buffer(8)]],
+                       constant int2 &band [[buffer(9)]],
+                       device const uint8_t *hpGold [[buffer(10)]],
+                       device const uint8_t *ds [[buffer(11)]],
+                       uint tgi [[threadgroup_position_in_grid]],
+                       uint tid [[thread_index_in_threadgroup]],
+                       uint tpg [[threads_per_threadgroup]]) {
+  threadgroup int2 red[32];
+  int nn = 1 << (2 * level), nodes = band.y * nn;
+  int g = (int)tgi;
+  if (g >= nodes) {
+    if (!fp->golden || g >= 2 * nodes) return;
+    g -= nodes;
+    ref = gold;
+    mvField = mvFieldGold;
+    hp = hpGold;
+  }
+  DEV const uint8_t *dr = qp_dec(fp, hp);
+  int sbIdx = band.x + g / nn, i = g % nn;
+  MeNode m = me_node(fp, sbIdx, level, i, mvField);
+  device int32_t *out = mvField + (sbIdx * NUM_NODES + NODE_BASE(level) + i) * 2;
+  if (!m.valid) {
+    if (tid == 0) out[0] = out[1] = 0;
+    return;
+  }
+  if (m.copy) {
+    if (tid == 0) { out[0] = m.pr; out[1] = m.pc; }
+    return;
+  }
+  int dy = 0, dx = 0;
+  for (int stage = 0; stage < m.stages; stage++) {
+    if (stage > 0) me_refine_stage(fp, &m, dy, dx);
+    /* each candidate's rows split over R adjacent threads */
+    int dec = (fp->turbo & T_ME_DEC) && m.step == ME_COARSE_STEP;
+    int rows = dec ? m.w >> 2 : m.w, R = dec ? 2 : 8;
+    int best = INT_MAX, bestK = INT_MAX;
+    for (int it0 = 0; it0 < m.count * R; it0 += (int)tpg) {
+      int it = it0 + (int)tid, k = it / R, part = it % R, sad = 0, cy = 0, cx = 0;
+      if (k < m.count) {
+        me_candidate(&m, k, &cy, &cx);
+        int i0 = part * rows / R, i1 = (part + 1) * rows / R;
+        if (dec) {
+          int W = dec_w(fp), H = dec_h(fp), n = rows, x0 = m.x >> 2, y0 = m.y >> 2, oy = cy >> 2, ox = cx >> 2;
+          for (int ii = i0; ii < i1; ii++) {
+            int sy = k_min(y0 + ii, H - 1), ry = Clip3(0, H - 1, y0 + ii + oy);
+            for (int j = 0; j < n; j++)
+              sad += k_abs((int)ds[sy * W + k_min(x0 + j, W - 1)] - (int)dr[ry * W + Clip3(0, W - 1, x0 + j + ox)]);
+          }
+          sad *= 16;
+        } else {
+          DEV const uint8_t *sp = src + fp->offset[0], *rp = ref + fp->offset[0];
+          int stride = fp->stride[0], W = fp->frame_w, H = fp->frame_h, x = m.x, y = m.y, w = m.w;
+          if (x + cx >= 0 && x + cx + w <= W && y + cy >= 0 && y + cy + w <= H) {
+            uint4 acc = 0;
+            for (int ii = i0; ii < i1; ii++) {
+              DEV const packed_uchar4 *s4 = (DEV const packed_uchar4 *)(sp + (y + ii) * stride + x);
+              DEV const packed_uchar4 *r4 = (DEV const packed_uchar4 *)(rp + (y + ii + cy) * stride + x + cx);
+              for (int j = 0; j < (w >> 2); j++) acc += uint4(absdiff(uchar4(s4[j]), uchar4(r4[j])));
+            }
+            sad = (int)(acc.x + acc.y + acc.z + acc.w);
+          } else {
+            for (int ii = i0; ii < i1; ii++) {
+              int ry = Clip3(0, H - 1, y + ii + cy);
+              for (int j = 0; j < w; j++)
+                sad += k_abs((int)sp[(y + ii) * stride + x + j] - (int)rp[ry * stride + Clip3(0, W - 1, x + j + cx)]);
+            }
+          }
+        }
+      }
+      for (int o = 1; o < R; o <<= 1) sad += simd_shuffle_xor(sad, (ushort)o);
+      if (k < m.count && part == 0) {
+        int bits = 2 + 2 * FloorLog2(k_abs(cy) * 8 + 1) + 2 * FloorLog2(k_abs(cx) * 8 + 1);
+        int c = sad + fp->ac_q[0] * bits / 64;
+        if (c < best) {
+          best = c;
+          bestK = k;
+        }
+      }
+    }
+    int2 b = tg_argmin(best, bestK, tid, tpg, red);
+    me_candidate(&m, b.y, &dy, &dx);
+  }
+  if (me_take_parent(fp, level, &m, dy, dx)) {
+    if (tid == 0) { out[0] = m.pr; out[1] = m.pc; }
+    return;
+  }
+  int mvr = m.stages ? dy * 8 : m.pr, mvc = m.stages ? dx * 8 : m.pc, bestS = 0;
+  int nUnits = (m.w >> 2) * (m.w >> 2);
+  for (int step = 4; step >= 2; step >>= 1) {
+    int bc = INT_MAX, bk = 0;
+    for (int k = 0; k < ME_LANES; k++) {
+      int c;
+      if (k == 0 && step == 2) {
+        c = bestS;
+      } else {
+        int r0 = 0, c0 = 0;
+        if (k > 0) me_neighbour(k - 1, step, &r0, &c0);
+        int s = 0;
+        for (int u = (int)tid; u < nUnits; u += (int)tpg)
+          s += (fp->turbo & T_ME_HPEL) ? me_unit_satd_hp(fp, src, ref, hp, &m, mvr + r0, mvc + c0, u)
+                                       : me_unit_satd(fp, src, ref, &m, mvr + r0, mvc + c0, u);
+        c = tg_sum(s, tid, tpg, red);
+      }
+      if (c < bc) { bc = c; bk = k; }
+    }
+    bestS = bc;
+    if (bk > 0) {
+      int r0, c0;
+      me_neighbour(bk - 1, step, &r0, &c0);
+      mvr += r0;
+      mvc += c0;
+    }
+  }
+  if (tid == 0) {
+    out[0] = mvr;
+    out[1] = mvc;
+  }
+}
