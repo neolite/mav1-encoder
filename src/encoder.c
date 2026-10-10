@@ -50,6 +50,7 @@ void mav1_default_config(Mav1Config *cfg, int width, int height) {
   cfg->tx_depth = 1;
   cfg->restoration = 1;
   cfg->switchable_interp = 1;
+  cfg->intra_edge_filter = 1;
   cfg->loop_filter = 1;
   cfg->cdef = 1;
   cfg->me_range = 32;
@@ -182,6 +183,42 @@ static void load_source(Mav1Encoder *e, const uint8_t *const planes[3], const in
   }
 }
 
+/* get_filter_type( plane ) (7.11.2.8) for every intra block, stored in
+ * BlockInfo.interp_filter bits 4 (luma) and 5 (chroma). Blocks are >= 8x8,
+ * so AvailUChroma / AvailLChroma equal AvailU / AvailL. */
+static int smooth_mode(int m) { return m == SMOOTH_PRED || m == SMOOTH_V_PRED || m == SMOOTH_H_PRED; }
+
+static void edge_filter_types(Mav1Encoder *e) {
+  const FrameParams *fp = ENC_PARAMS(e);
+  int cols = e->mi_cols, rows = e->mi_rows;
+  uint8_t *ys = calloc((size_t)rows * cols, 1), *uvs = calloc((size_t)rows * cols, 1);
+  BlockInfo *blocks = ENC_BLOCKS(e);
+  const SbInfo *sbs = ENC_SBS(e);
+  for (int s = 0; s < e->num_sbs; s++)
+    for (int i = 0; i < sbs[s].num_blocks; i++) {
+      const BlockInfo *b = &blocks[sbs[s].first_block + i];
+      int ysm = smooth_mode(b->y_mode) && !b->is_inter, uvsm = !b->is_inter && smooth_mode(b->uv_mode);
+      for (int r = b->mi_row; r < b->mi_row + Num_4x4_Blocks_High[b->bsize] && r < rows; r++)
+        for (int c = b->mi_col; c < b->mi_col + Num_4x4_Blocks_Wide[b->bsize] && c < cols; c++) {
+          ys[r * cols + c] = (uint8_t)ysm;
+          uvs[r * cols + c] = (uint8_t)uvsm;
+        }
+    }
+  for (int s = 0; s < e->num_sbs; s++)
+    for (int i = 0; i < sbs[s].num_blocks; i++) {
+      BlockInfo *b = &blocks[sbs[s].first_block + i];
+      int r = b->mi_row, c = b->mi_col;
+      int availU = r > 0, availL = c > tile_col_start(fp, c);
+      int fy = (availU && ys[(r - 1) * cols + c]) || (availL && ys[r * cols + c - 1]);
+      /* chroma: above (r - 1, c + 1) as MiCol is even; left (r + 1, c - 1) as MiRow is even */
+      int fuv = (availU && uvs[(r - 1) * cols + k_min(c + 1, cols - 1)]) ||
+                (availL && uvs[k_min(r + 1, rows - 1) * cols + c - 1]);
+      b->interp_filter = (b->interp_filter & 15) | fy << 4 | fuv << 5;
+    }
+  free(ys);
+  free(uvs);
+}
+
 static void setup_params(Mav1Encoder *e, int isKey) {
   FrameParams *fp = ENC_PARAMS(e);
   memset(fp, 0, sizeof(*fp));
@@ -203,7 +240,7 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   }
   fp->frame_is_intra = isKey;
   fp->reduced_tx_set = 0;
-  fp->enable_intra_edge_filter = 0;
+  fp->enable_intra_edge_filter = e->cfg.intra_edge_filter;
   fp->tx_search = e->cfg.tx_search;
   fp->lossless = q == 0;
   fp->tx_mode_select = q != 0 && e->cfg.tx_depth;
@@ -335,6 +372,7 @@ int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int stride
   if (!isKey) e->be->motion_search(e->be, e);
   if (getenv("MAV1_TIMING")) fprintf(stderr, "me %.1fms\n", (now() - t0) * 1000);
   e->be->analyze(e->be, e);
+  if (e->cfg.intra_edge_filter) edge_filter_types(e);
   double t1 = now();
   e->be->recon(e->be, e);
   double t2 = now();

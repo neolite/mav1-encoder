@@ -220,8 +220,8 @@ INLINE long code_plane(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const ui
         a.log2H = Tx_Height_Log2[txSz];
         a.maxX = ((fp->mi_cols * 4) >> subX) - 1;
         a.maxY = ((fp->mi_rows * 4) >> subY) - 1;
-        a.edgeFilter = 0;
-        a.filterType = 0;
+        a.edgeFilter = fp->enable_intra_edge_filter;
+        a.filterType = (b->interp_filter >> (plane == 0 ? 4 : 5)) & 1;
         predict_intra(px, stride, startX, startY, a, px + startY * stride + startX, stride);
         if (isCfl) {
           DEV int32_t *dc = scratch + S_TMP;
@@ -280,7 +280,7 @@ INLINE void recon_block(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const u
   int MiRow = b->mi_row, MiCol = b->mi_col;
   int maxLumaW = 0, maxLumaH = 0;
   b->tx_depth = 0;
-  b->interp_filter = 0;
+  b->interp_filter &= 0x30; /* keep the intra edge filter types */
   if (b->is_inter && fp->switchable_interp) {
     /* dual filter search on the luma prediction: 3 vertical x 3 horizontal */
     int w = Block_Width(bs), h = Block_Height(bs);

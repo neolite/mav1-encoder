@@ -51,7 +51,7 @@ Full list: `ref/aom/test/test_vectors.cc` (176 entries).
 | Profile 0, 8-bit 4:2:0, any size from 16x16 up | ✅ |
 | Key frames and inter frames (single reference, LAST) | ✅ |
 | Partition: 64x64 superblocks, all 10 partition types (NONE, HORZ, VERT, SPLIT, HORZ_A/B, VERT_A/B, HORZ_4, VERT_4) | ✅ |
-| Intra: all 13 modes, angle deltas, chroma-from-luma (CfL) | ✅ (filter-intra, intra edge filter and palette not emitted) |
+| Intra: all 13 modes, angle deltas, chroma-from-luma (CfL), intra edge filter and upsampling | ✅ (filter-intra and palette not emitted) | |
 | Inter: NEARESTMV, NEARMV (drl), GLOBALMV, NEWMV; find_mv_stack 7.10.2; MV coding | ✅ (compound, OBMC, warped and interintra not emitted) |
 | Switchable dual interpolation filters (per block, 3x3 search) | ✅ |
 | Motion search (full-pel plus 1/2 and 1/4 pel; GPU: SIMD-group parallel, bit-identical to CPU) | ✅ |

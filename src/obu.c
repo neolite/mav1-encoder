@@ -45,7 +45,7 @@ static void seq_header_payload(const struct Mav1Encoder *e, BitWriter *w) {
   bw_f(w, 1, 0);   /* frame_id_numbers_present_flag */
   bw_f(w, 1, 0);   /* use_128x128_superblock */
   bw_f(w, 1, 0);   /* enable_filter_intra */
-  bw_f(w, 1, 0);   /* enable_intra_edge_filter */
+  bw_f(w, 1, e->cfg.intra_edge_filter); /* enable_intra_edge_filter */
   bw_f(w, 1, 0);   /* enable_interintra_compound */
   bw_f(w, 1, 0);   /* enable_masked_compound */
   bw_f(w, 1, 0);   /* enable_warped_motion */

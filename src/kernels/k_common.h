@@ -94,7 +94,8 @@ typedef struct {
   int32_t cfl_alpha_u, cfl_alpha_v;     /* CflAlphaU/V when uv_mode == UV_CFL_PRED */
   int32_t tx_depth;                     /* intra tx_depth (TX_MODE_SELECT) */
   int32_t tx_types_lo, tx_types_hi;     /* luma TxType of each transform, 4 bits each (raster) */
-  int32_t interp_filter;                /* interp_filter[0] | interp_filter[1] << 2 */
+  int32_t interp_filter;                /* interp_filter[0] | interp_filter[1] << 2;
+                                         * bit 4/5: get_filter_type( ) for luma/chroma */
 } BlockInfo;
 
 /* Per-superblock index range into the block list. */
