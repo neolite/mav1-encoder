@@ -79,7 +79,7 @@ INLINE void cdef_filter(DEV const FrameParams *fp, DEV const uint8_t *cur, DEV u
             int d = t == 0 ? dir : ((dir + (t == 1 ? -2 : 2)) & 7);
             int yy = y0 + i + sign * Cdef_Directions[d][k][0];
             int xx = x0 + j + sign * Cdef_Directions[d][k][1];
-            int candR = (yy << sub) >> MI_SIZE_LOG2, candC = (xx << sub) >> MI_SIZE_LOG2;
+            int candR = (yy * (1 << sub)) >> MI_SIZE_LOG2, candC = (xx * (1 << sub)) >> MI_SIZE_LOG2;
             if (!(candC >= 0 && candC < fp->mi_cols && candR >= 0 && candR < fp->mi_rows)) continue;
             int p = src[yy * stride + xx];
             if (t == 0)

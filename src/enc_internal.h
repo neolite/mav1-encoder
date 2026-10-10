@@ -35,6 +35,7 @@ typedef struct {
   int lf_sharpness;
   int cdef_damping, cdef_bits;
   int cdef_y_pri[8], cdef_y_sec[8], cdef_uv_pri[8], cdef_uv_sec[8];
+  int lr_type[3];           /* FrameRestorationType (RESTORE_NONE or RESTORE_SWITCHABLE) */
 } FrameHdr;
 
 typedef struct {
@@ -51,6 +52,7 @@ struct Mav1Encoder {
 
   /* Shared (CPU/GPU) buffers. */
   Buf src, rec, ref, params, blocks, sbs, coefs, mats, mvfield, scratch, lfmask, cdefbuf;
+  Buf dbk, lrout, lrunits;  /* deblocked copy, LR output, LrUnit per unit */
 
   MiInfo *mi;               /* mi_rows * mi_cols */
   int8_t *cdef_idx;         /* per 64x64 superblock, -1 when not coded */
@@ -73,6 +75,10 @@ struct Mav1Encoder {
 
 /* tile_writer.c: entropy codes the whole frame as one tile. */
 size_t write_tile(struct Mav1Encoder *e, uint8_t **out);
+
+/* lr_search.c */
+void lr_select(struct Mav1Encoder *e);
+int lr_unit_params(EntEnc *ec, int plane, const void *unit, int refW[2][3], int refX[2]);
 
 /* obu.c */
 size_t write_sequence_header(const struct Mav1Encoder *e, uint8_t *out);

@@ -12,6 +12,7 @@
 #include "mvpred.h"
 #include "kernels/k_analysis.h"
 #include "kernels/k_recon.h"
+#include "kernels/k_lr.h"
 
 typedef struct {
   struct Mav1Encoder *e;
@@ -19,6 +20,7 @@ typedef struct {
   CdfContext cdf;
   uint8_t *aboveLevel[3], *aboveDc[3], *leftLevel[3], *leftDc[3];
   int qctx;
+  int refLrWiener[3][2][3], refSgrXqd[3][2];
 } Tile;
 
 static MiInfo *mi_at(const struct Mav1Encoder *e, int r, int c) { return &e->mi[r * e->mi_cols + c]; }
@@ -425,6 +427,33 @@ static void write_block(Tile *t, const BlockInfo *b) {
 }
 
 /* ------------------------------------------------------------------------ */
+/* Loop restoration units (5.11.57 read_lr)                                  */
+
+static void write_lr(Tile *t, int r, int c) {
+  struct Mav1Encoder *e = t->e;
+  const FrameParams *fp = ENC_PARAMS(e);
+  const LrUnit *units = (const LrUnit *)e->lrunits.base;
+  int w = 16, h = 16; /* Num_4x4_Blocks_Wide/High[BLOCK_64X64] */
+  for (int plane = 0; plane < 3; plane++) {
+    if (e->hdr.lr_type[plane] == RESTORE_NONE) continue;
+    int sub = plane > 0;
+    int unitSize = fp->lr_unit_size[plane];
+    int unitRows = fp->lr_unit_rows[plane], unitCols = fp->lr_unit_cols[plane];
+    int unitRowStart = (r * (MI_SIZE >> sub) + unitSize - 1) / unitSize;
+    int unitRowEnd = k_min(unitRows, ((r + h) * (MI_SIZE >> sub) + unitSize - 1) / unitSize);
+    int unitColStart = (c * (MI_SIZE >> sub) + unitSize - 1) / unitSize;
+    int unitColEnd = k_min(unitCols, ((c + w) * (MI_SIZE >> sub) + unitSize - 1) / unitSize);
+    for (int ur = unitRowStart; ur < unitRowEnd; ur++)
+      for (int uc = unitColStart; uc < unitColEnd; uc++) {
+        const LrUnit *u = &units[fp->lr_unit_off[plane] + ur * unitCols + uc];
+        /* FrameRestorationType is RESTORE_SWITCHABLE: restoration_type */
+        ec_symbol(&t->ec, u->type, t->cdf.restoration_type, RESTORE_SWITCHABLE);
+        lr_unit_params(&t->ec, plane, u, t->refLrWiener[plane], t->refSgrXqd[plane]);
+      }
+  }
+}
+
+/* ------------------------------------------------------------------------ */
 /* Partition (5.11.4)                                                        */
 
 static uint16_t *partition_cdf(Tile *t, int bsl, int ctx) {
@@ -505,6 +534,11 @@ size_t write_tile(struct Mav1Encoder *e, uint8_t **out) {
   memset(e->mi, 0, sizeof(MiInfo) * e->mi_rows * e->mi_cols);
   for (int i = 0; i < e->num_sbs; i++) e->cdef_idx[i] = -1;
   mvpred_frame_start(e);
+  for (int p = 0; p < 3; p++)
+    for (int pass = 0; pass < 2; pass++) {
+      t.refSgrXqd[p][pass] = Sgrproj_Xqd_Mid[pass];
+      for (int i = 0; i < WIENER_COEFFS; i++) t.refLrWiener[p][pass][i] = Wiener_Taps_Mid[i];
+    }
 
   const BlockInfo *blocks = ENC_BLOCKS(e);
   const SbInfo *sbs = ENC_SBS(e);
@@ -516,6 +550,7 @@ size_t write_tile(struct Mav1Encoder *e, uint8_t **out) {
     for (int sc = 0; sc < e->sb_cols; sc++) {
       const SbInfo *sb = &sbs[sr * e->sb_cols + sc];
       int k = 0;
+      write_lr(&t, sr * 16, sc * 16);
       write_partition(&t, sr * 16, sc * 16, BLOCK_64X64, blocks + sb->first_block, &k, sb->num_blocks);
       if (k != sb->num_blocks) abort();
     }

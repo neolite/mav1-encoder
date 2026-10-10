@@ -12,6 +12,7 @@
 #include "kernels/k_me.h"
 #include "kernels/k_lf.h"
 #include "kernels/k_cdef.h"
+#include "kernels/k_lr.h"
 
 typedef struct {
   Backend base;
@@ -75,6 +76,17 @@ static void cpu_filter(Backend *b, struct Mav1Encoder *e) {
   }
 }
 
+static void cpu_restore(Backend *b, struct Mav1Encoder *e) {
+  (void)b;
+  const FrameParams *fp = ENC_PARAMS(e);
+  int rows4 = (e->h + 3) >> 2, cols4 = (e->w + 3) >> 2, n = rows4 * cols4;
+  dispatch_apply((size_t)(3 * n), DISPATCH_APPLY_AUTO, ^(size_t g) {
+    int plane = (int)g / n, i = (int)g % n;
+    lr_block(fp, plane, i / cols4, i % cols4, e->rec.base, e->dbk.base, e->lrout.base,
+             (const LrUnit *)e->lrunits.base);
+  });
+}
+
 static void cpu_destroy(Backend *b) { free(b); }
 
 Backend *backend_cpu_create(struct Mav1Encoder *e) {
@@ -85,6 +97,7 @@ Backend *backend_cpu_create(struct Mav1Encoder *e) {
   c->base.analyze = cpu_analyze;
   c->base.recon = cpu_recon;
   c->base.filter = cpu_filter;
+  c->base.restore = cpu_restore;
   c->base.destroy = cpu_destroy;
   return &c->base;
 }

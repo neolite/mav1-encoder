@@ -4,6 +4,7 @@
 #include "k_me.h"
 #include "k_lf.h"
 #include "k_cdef.h"
+#include "k_lr.h"
 
 kernel void mav1_lf(device const FrameParams *fp [[buffer(0)]],
                     device uint8_t *rec [[buffer(1)]],
@@ -15,6 +16,19 @@ kernel void mav1_lf(device const FrameParams *fp [[buffer(0)]],
   int plane = (int)gid / lines, line = (int)gid % lines;
   if (plane > 0 && (line & 1)) return;
   lf_line(fp, rec, info, plane, pass, line);
+}
+
+kernel void mav1_lr(device const FrameParams *fp [[buffer(0)]],
+                    device const uint8_t *cdef [[buffer(1)]],
+                    device const uint8_t *dbk [[buffer(2)]],
+                    device uint8_t *out [[buffer(3)]],
+                    device const LrUnit *units [[buffer(4)]],
+                    uint gid [[thread_position_in_grid]]) {
+  int rows4 = (fp->frame_h + 3) >> 2, cols4 = (fp->frame_w + 3) >> 2;
+  int n = rows4 * cols4;
+  if ((int)gid >= 3 * n) return;
+  int plane = (int)gid / n, i = (int)gid % n;
+  lr_block(fp, plane, i / cols4, i % cols4, cdef, dbk, out, units);
 }
 
 kernel void mav1_cdef(device const FrameParams *fp [[buffer(0)]],

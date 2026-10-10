@@ -15,6 +15,8 @@ typedef struct Backend {
   /* Deblocks `rec` in place, then writes CDEF output for every parameter
    * set k into cdefbuf + k * frame_bytes. */
   void (*filter)(struct Backend *, struct Mav1Encoder *);
+  /* Loop restoration of `rec` (CDEF output) using `dbk` into `lrout`. */
+  void (*restore)(struct Backend *, struct Mav1Encoder *);
   void (*destroy)(struct Backend *);
 } Backend;
 

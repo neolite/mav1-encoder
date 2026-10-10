@@ -45,6 +45,7 @@ typedef struct {
   uint16_t tx_32x32[TX_SIZE_CONTEXTS][MAX_TX_DEPTH + 2];
   uint16_t tx_64x64[TX_SIZE_CONTEXTS][MAX_TX_DEPTH + 2];
   uint16_t txfm_split[TXFM_PARTITION_CONTEXTS][3];
+  uint16_t use_wiener[3], use_sgrproj[3], restoration_type[RESTORE_SWITCHABLE + 1];
   /* coefficients (already indexed by the quantizer context) */
   uint16_t txb_skip[TX_SIZES][TXB_SKIP_CONTEXTS][3];
   uint16_t eob_pt_16[PLANE_TYPES][2][6];

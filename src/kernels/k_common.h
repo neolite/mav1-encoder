@@ -64,6 +64,8 @@ typedef struct {
   int32_t lf_sharpness;
   int32_t cdef_damping, cdef_bits;
   int32_t cdef_y_pri[8], cdef_y_sec[8], cdef_uv_pri[8], cdef_uv_sec[8];
+  /* loop restoration: FrameRestorationType and the unit grid of each plane */
+  int32_t lr_type[3], lr_unit_size[3], lr_unit_rows[3], lr_unit_cols[3], lr_unit_off[3];
 } FrameParams;
 
 /* One coded block, in decode order. Filled by the CPU mode decision, then

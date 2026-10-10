@@ -8,6 +8,7 @@
 
 #include "backend.h"
 #include "enc_internal.h"
+#include "kernels/k_lr.h"
 #include "fwd_matrices.h"
 #include "kernels/k_analysis.h"
 #include "kernels/k_fwd.h"
@@ -46,6 +47,7 @@ void mav1_default_config(Mav1Config *cfg, int width, int height) {
   cfg->keyint = 0;
   cfg->tx_search = 1;
   cfg->tx_depth = 1;
+  cfg->restoration = 1;
   cfg->loop_filter = 1;
   cfg->cdef = 1;
   cfg->me_range = 32;
@@ -88,6 +90,9 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
   ok |= buf_alloc(&e->mvfield, sizeof(int32_t) * 2 * NUM_NODES * e->num_sbs);
   ok |= buf_alloc(&e->scratch, sizeof(int32_t) * SCRATCH_INTS * (size_t)e->num_sbs);
   ok |= buf_alloc(&e->lfmask, (size_t)e->mi_rows * e->mi_cols);
+  ok |= buf_alloc(&e->dbk, e->frame_bytes);
+  ok |= buf_alloc(&e->lrout, e->frame_bytes);
+  ok |= buf_alloc(&e->lrunits, sizeof(LrUnit) * 3 * (size_t)(e->sb_rows + 1) * (e->sb_cols + 1));
   e->num_cdef_presets = e->cfg.cdef ? 4 : 0;
   ok |= buf_alloc(&e->cdefbuf, e->frame_bytes * (e->num_cdef_presets ? e->num_cdef_presets : 1));
   if (ok) {
@@ -130,6 +135,9 @@ void mav1_destroy(Mav1Encoder *e) {
   free(e->cdef_choice);
   buf_free(&e->lfmask);
   buf_free(&e->cdefbuf);
+  buf_free(&e->dbk);
+  buf_free(&e->lrout);
+  buf_free(&e->lrunits);
   free(e);
 }
 
@@ -206,6 +214,18 @@ static void setup_params(Mav1Encoder *e, int isKey) {
     h->cdef_uv_pri[i] = fp->cdef_uv_pri[i] = presets[i][2];
     h->cdef_uv_sec[i] = fp->cdef_uv_sec[i] = presets[i][3];
   }
+  /* Loop restoration units: 64x64 (lr_unit_shift = 0, lr_uv_shift = 0). */
+  int off = 0;
+  for (int p = 0; p < 3; p++) {
+    int sub = p > 0, size = RESTORATION_TILESIZE_MAX >> 2;
+    int pw = (e->w + sub) >> sub, ph = (e->h + sub) >> sub;
+    fp->lr_type[p] = h->lr_type[p] = RESTORE_NONE;
+    fp->lr_unit_size[p] = size;
+    fp->lr_unit_rows[p] = k_max((ph + (size >> 1)) / size, 1); /* count_units_in_frame */
+    fp->lr_unit_cols[p] = k_max((pw + (size >> 1)) / size, 1);
+    fp->lr_unit_off[p] = off;
+    off += fp->lr_unit_rows[p] * fp->lr_unit_cols[p];
+  }
 }
 
 /* Per-mi block size and skip flag for the loop filters. */
@@ -261,7 +281,7 @@ static void cdef_select(Mav1Encoder *e) {
 }
 
 const char *const mav1_tool_names[16] = {"intra", "inter", "cfl", "angle_delta", "tx_non_dct", "skip",
-                                          "rect_part", "compound", "obmc", "", "", "", "", "", "", ""};
+                                          "rect_part", "compound", "obmc", "lr_wiener_units", "lr_sgr_units", "", "", "", "", ""};
 
 static void count_tools(Mav1FrameStats *st, const BlockInfo *b) {
   st->tool_use[0] += !b->is_inter;
@@ -297,7 +317,17 @@ int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int stride
   double t2 = now();
   build_filter_info(e);
   e->be->filter(e->be, e);
+  int useLr = e->cfg.restoration && e->cfg.qindex > 0; /* AllLossless disables it */
+  if (useLr) memcpy(e->dbk.base, e->rec.base, e->frame_bytes); /* UpscaledCurrFrame */
   if (e->cfg.cdef && e->cfg.qindex > 0) cdef_select(e);
+  if (useLr) {
+    lr_select(e);
+    memcpy(e->lrout.base, e->rec.base, e->frame_bytes);
+    e->be->restore(e->be, e);
+    Buf t = e->rec;
+    e->rec = e->lrout;
+    e->lrout = t;
+  }
   double t3 = now();
 
   uint8_t *tile = NULL;

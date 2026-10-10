@@ -58,7 +58,7 @@ static void seq_header_payload(const struct Mav1Encoder *e, BitWriter *w) {
   bw_f(w, 3, ORDER_HINT_BITS - 1);
   bw_f(w, 1, 0);   /* enable_superres */
   bw_f(w, 1, e->cfg.cdef ? 1 : 0);
-  bw_f(w, 1, 0);   /* enable_restoration */
+  bw_f(w, 1, e->cfg.restoration ? 1 : 0); /* enable_restoration */
   /* color_config */
   bw_f(w, 1, 0);   /* high_bitdepth */
   bw_f(w, 1, 0);   /* mono_chrome */
@@ -162,6 +162,22 @@ static void frame_header(const struct Mav1Encoder *e, BitWriter *w) {
       bw_f(w, 2, h->cdef_y_sec[i] == 4 ? 3 : h->cdef_y_sec[i]);
       bw_f(w, 4, h->cdef_uv_pri[i]);
       bw_f(w, 2, h->cdef_uv_sec[i] == 4 ? 3 : h->cdef_uv_sec[i]);
+    }
+  }
+  /* lr_params (AllLossless == CodedLossless without superres) */
+  if (e->cfg.restoration && !codedLossless) {
+    int usesLr = 0, usesChromaLr = 0;
+    for (int i = 0; i < 3; i++) {
+      /* lr_type: Remap_Lr_Type[1] = RESTORE_SWITCHABLE */
+      bw_f(w, 2, h->lr_type[i] == RESTORE_SWITCHABLE ? 1 : 0);
+      if (h->lr_type[i] != RESTORE_NONE) {
+        usesLr = 1;
+        if (i > 0) usesChromaLr = 1;
+      }
+    }
+    if (usesLr) {
+      bw_f(w, 1, 0); /* lr_unit_shift: 64x64 units */
+      if (usesChromaLr) bw_f(w, 1, 0); /* lr_uv_shift */
     }
   }
   if (!codedLossless) bw_f(w, 1, e->cfg.tx_depth != 0); /* tx_mode_select: TX_MODE_SELECT or TX_MODE_LARGEST */

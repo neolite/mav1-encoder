@@ -157,13 +157,14 @@ INLINE int code_tx_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV 
 
 INLINE int tx_type_get(DEV const BlockInfo *b, int idx) {
   if (idx >= 16) return DCT_DCT;
-  return idx < 8 ? (b->tx_types_lo >> (4 * idx)) & 15 : (b->tx_types_hi >> (4 * (idx - 8))) & 15;
+  return (int)(((uint32_t)(idx < 8 ? b->tx_types_lo : b->tx_types_hi) >> (4 * (idx & 7))) & 15u);
 }
 
 INLINE void tx_type_set(DEV BlockInfo *b, int idx, int t) {
   if (idx >= 16) return;
-  if (idx < 8) b->tx_types_lo = (b->tx_types_lo & ~(15 << (4 * idx))) | (t << (4 * idx));
-  else b->tx_types_hi = (b->tx_types_hi & ~(15 << (4 * (idx - 8)))) | (t << (4 * (idx - 8)));
+  int sh = 4 * (idx & 7);
+  if (idx < 8) b->tx_types_lo = (int32_t)(((uint32_t)b->tx_types_lo & ~(15u << sh)) | ((uint32_t)t << sh));
+  else b->tx_types_hi = (int32_t)(((uint32_t)b->tx_types_hi & ~(15u << sh)) | ((uint32_t)t << sh));
 }
 
 /* Predicts (intra), transforms and reconstructs every transform block of

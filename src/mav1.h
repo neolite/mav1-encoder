@@ -26,6 +26,8 @@ typedef struct {
   int tx_depth;        /* TX_MODE_SELECT: intra transform split (tx_depth) RD search */
   int loop_filter;     /* deblocking filter */
   int cdef;            /* constrained directional enhancement filter */
+  int restoration;     /* loop restoration (Wiener / self-guided) */
+  int lr_test;         /* testing: force Wiener / self-guided on alternate units, ignoring rate */
   int me_range;        /* full-pel motion search range */
   int threads;         /* CPU backend worker threads (0: auto) */
 } Mav1Config;
