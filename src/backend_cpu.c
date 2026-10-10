@@ -50,7 +50,7 @@ static void cpu_motion_search(Backend *b, struct Mav1Encoder *e) {
       me_node_serial(fp, sb, level, i, e->src.base, r ? e->gold.base : e->ref.base,
                      qp + r * qp_entry_bytes(fp), srcDec, qp_dec(fp, qp + r * qp_entry_bytes(fp)),
                      (int32_t *)(r ? e->mvgold.base : e->mvfield.base),
-                     (int32_t *)e->scratch.base + (size_t)sb * SCRATCH_INTS + r * (SCRATCH_INTS / 2));
+                     (int32_t *)e->scratch.base + (size_t)sb * SCRATCH_INTS + r * (SCRATCH_INTS / 2), r);
     });
   }
 }

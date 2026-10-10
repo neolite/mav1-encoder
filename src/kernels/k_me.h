@@ -83,6 +83,10 @@ typedef struct {
 #define T_ME_REF2 512  /* 64x64 full-pel refinement +-2 around the coarse winner (instead of +-3) */
 #define T_ME_DEC 32    /* 64x64 coarse grid (step 4) on 4x4-decimated planes */
 #define T_ME_CROSS 8192 /* sub-pel steps try the 4 axial neighbours only */
+#define T_ME_G3COPY 16384 /* leaf frames: 8x8 nodes of the second reference take the 16x16 parent's vector */
+INLINE int me_gold_copy(DEV const FrameParams *fp, int level) {
+  return level == 3 && (fp->turbo & T_ME_G3COPY) && fp->leaf && !fp->frame_is_intra;
+}
 
 /* Plane buffer of the turbo motion search: ME_QP_ENTRIES entries, each the
  * 16 quarter-pel planes of one reference followed by its 4x4-decimated
@@ -323,8 +327,9 @@ INLINE int me_unit_satd_hp(DEV const FrameParams *fp, DEV const uint8_t *src, DE
 /* Serial search of one node (CPU backend). */
 INLINE void me_node_serial(DEV const FrameParams *fp, int sbIdx, int level, int i, DEV const uint8_t *src,
                            DEV const uint8_t *ref, DEV const uint8_t *hp, DEV const uint8_t *ds, DEV const uint8_t *dr,
-                           DEV int32_t *mvField, DEV int32_t *scratch) {
+                           DEV int32_t *mvField, DEV int32_t *scratch, int isGold) {
   MeNode m = me_node(fp, sbIdx, level, i, mvField);
+  if (isGold && me_gold_copy(fp, level)) m.copy = 1;
   DEV int32_t *out = mvField + (sbIdx * NUM_NODES + NODE_BASE(level) + i) * 2;
   if (!m.valid) {
     out[0] = out[1] = 0;

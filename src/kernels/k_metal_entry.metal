@@ -124,10 +124,11 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
   /* groups [0, nodes): LAST, [nodes, 2 * nodes): GOLDEN */
   /* superblocks [band.x, band.x + band.y) */
   int nn = 1 << (2 * level), nodes = band.y * nn;
-  int g = (int)tg;
+  int g = (int)tg, isGold = 0;
   if (g >= nodes) {
     if (!fp->golden || g >= 2 * nodes) return;
     g -= nodes;
+    isGold = 1;
     ref = gold;
     mvField = mvFieldGold;
     hp = hpGold;
@@ -138,6 +139,7 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
   /* depth-pruned node (analysis of the levels above done): its vector is unused */
   if (prune && depth_pruned(fp, costs, sbIdx, level, i)) return;
   MeNode m = me_node(fp, sbIdx, level, i, mvField);
+  if (isGold && me_gold_copy(fp, level)) m.copy = 1;
   if (!m.valid) {
     if (lane == 0) out[0] = out[1] = 0;
     return;
@@ -1176,10 +1178,11 @@ kernel void mav1_me_tg(device const FrameParams *fp [[buffer(0)]],
                        uint tpg [[threads_per_threadgroup]]) {
   threadgroup int2 red[32];
   int nn = 1 << (2 * level), nodes = band.y * nn;
-  int g = (int)tgi;
+  int g = (int)tgi, isGold = 0;
   if (g >= nodes) {
     if (!fp->golden || g >= 2 * nodes) return;
     g -= nodes;
+    isGold = 1;
     ref = gold;
     mvField = mvFieldGold;
     hp = hpGold;
@@ -1190,6 +1193,7 @@ kernel void mav1_me_tg(device const FrameParams *fp [[buffer(0)]],
   /* depth-pruned node (analysis of the levels above done): its vector is unused */
   if (prune && depth_pruned(fp, costs, sbIdx, level, i)) return;
   MeNode m = me_node(fp, sbIdx, level, i, mvField);
+  if (isGold && me_gold_copy(fp, level)) m.copy = 1;
   if (!m.valid) {
     if (tid == 0) out[0] = out[1] = 0;
     return;
