@@ -17,7 +17,7 @@
 @interface Mav1MetalState : NSObject
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
-@property(nonatomic, strong) id<MTLComputePipelineState> analyze, analyzeCoop, recon, me, hpel, lf, cdef, lr;
+@property(nonatomic, strong) id<MTLComputePipelineState> analyze, analyzeCoop, analyzeL3, recon, me, hpel, lf, cdef, lr;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, id<MTLBuffer>> *buffers;
 @end
 @implementation Mav1MetalState
@@ -151,7 +151,11 @@ static void enc_ana(Mav1MetalState *s, id<MTLComputeCommandEncoder> enc, struct 
   [enc setBytes:&level length:sizeof level atIndex:7];
   const FrameParams *fp = ENC_PARAMS(e);
   NSUInteger n = (NSUInteger)nsb * (1u << (2 * level)) * level_slots(fp, level);
-  if (level <= 2) {
+  if (level == 3 && (fp->turbo & T_INTRA) && fp->fast && !fp->frame_is_intra && !getenv("MAV1_NOL3O")) {
+    /* 8x8: one SIMD group per 16x16 node, 8 lanes per block */
+    [enc setComputePipelineState:s.analyzeL3];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)nsb * 16, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+  } else if (level <= 2) {
     /* blocks >= 16x16: one SIMD group per candidate block */
     [enc setComputePipelineState:s.analyzeCoop];
     [enc dispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
@@ -379,16 +383,23 @@ Backend *backend_metal_create(struct Mav1Encoder *e, char *err, size_t errlen) {
       s.analyze = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_analyze"] error:&nerr];
       s.analyzeCoop = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_analyze_coop"] error:&nerr];
       s.recon = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_recon"] error:&nerr];
+      s.analyzeL3 = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_analyze_l3o"] error:&nerr];
       s.me = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_me"] error:&nerr];
       s.hpel = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_hpel"] error:&nerr];
       s.lf = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_lf"] error:&nerr];
       s.cdef = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_cdef"] error:&nerr];
       s.lr = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_lr"] error:&nerr];
-      if (!s.analyze || !s.analyzeCoop || !s.recon || !s.me || !s.hpel || !s.lf || !s.cdef || !s.lr) {
+      if (!s.analyze || !s.analyzeCoop || !s.analyzeL3 || !s.recon || !s.me || !s.hpel || !s.lf || !s.cdef || !s.lr) {
         snprintf(perr, sizeof perr, "pipeline creation failed: %s", nerr.localizedDescription.UTF8String);
         return;
       }
       proto = s;
+      if (getenv("MAV1_PSO"))
+        fprintf(stderr, "maxThreads: analyze %lu coop %lu recon %lu me %lu hpel %lu lf %lu cdef %lu\n",
+                (unsigned long)s.analyze.maxTotalThreadsPerThreadgroup, (unsigned long)s.analyzeCoop.maxTotalThreadsPerThreadgroup,
+                (unsigned long)s.recon.maxTotalThreadsPerThreadgroup, (unsigned long)s.me.maxTotalThreadsPerThreadgroup,
+                (unsigned long)s.hpel.maxTotalThreadsPerThreadgroup, (unsigned long)s.lf.maxTotalThreadsPerThreadgroup,
+                (unsigned long)s.cdef.maxTotalThreadsPerThreadgroup);
     });
     if (!proto) {
       snprintf(err, errlen, "%s", perr);
@@ -398,6 +409,7 @@ Backend *backend_metal_create(struct Mav1Encoder *e, char *err, size_t errlen) {
     s.device = proto.device;
     s.analyze = proto.analyze;
     s.analyzeCoop = proto.analyzeCoop;
+    s.analyzeL3 = proto.analyzeL3;
     s.recon = proto.recon;
     s.me = proto.me;
     s.hpel = proto.hpel;

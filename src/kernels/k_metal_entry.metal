@@ -330,10 +330,13 @@ INLINE void coop_inter3(DEV const FrameParams *fp, DEV const uint8_t *src, DEV c
                         DEV const uint8_t *ref2, int x, int y, int w, int h, int mvr, int mvc, int mvr2, int mvc2,
                         uint lane, THR long *s) {
   int a0 = 0, a1 = 0, a2 = 0;
-  for (int p = 0; p < 3; p++) {
-    int sub = p > 0, bw = w >> sub, bh = h >> sub, bx = x >> sub, by = y >> sub, nu = bw >> 2, n = nu * (bh >> 2);
+  /* (plane, unit) items of all planes in one sweep */
+  int n0 = (w >> 2) * (h >> 2), nc = n0 >> 2;
+  for (int wi = (int)lane; wi < n0 + 2 * nc; wi += 32) {
+    int p = wi < n0 ? 0 : (wi < n0 + nc ? 1 : 2), u = p == 0 ? wi : wi - n0 - (p - 1) * nc;
+    int sub = p > 0, bw = w >> sub, bh = h >> sub, bx = x >> sub, by = y >> sub, nu = bw >> 2;
     int stride = fp->stride[p];
-    for (int u = (int)lane; u < n; u += 32) {
+    {
       int pr[16], pr2[16];
       coop_pred_unit(fp, ref, p, bx, by, bw, bh, mvr, mvc, u, pr);
       coop_pred_unit(fp, ref2, p, bx, by, bw, bh, mvr2, mvc2, u, pr2);
@@ -366,7 +369,7 @@ INLINE int coop_inter_satd(DEV const FrameParams *fp, DEV const uint8_t *src, DE
 /* Edges of predict_intra( ) as the analysis calls it (haveLeft = x > 0,
  * haveAbove = y > 0, no above-right / below-left, no edge filter). */
 INLINE void coop_edges(DEV const FrameParams *fp, DEV const uint8_t *px, int stride, int planeIdx, int x, int y,
-                       int w, int h, threadgroup int *A, threadgroup int *L, uint lane) {
+                       int w, int h, threadgroup uint8_t *A, threadgroup uint8_t *L, uint lane) {
   int sub = planeIdx > 0;
   int maxX = ((fp->mi_cols * 4) >> sub) - 1, maxY = ((fp->mi_rows * 4) >> sub) - 1;
   int haveLeft = x > 0, haveAbove = y > 0;
@@ -393,7 +396,7 @@ INLINE void coop_edges(DEV const FrameParams *fp, DEV const uint8_t *px, int str
 
 /* One predicted sample (i, j) of predict_intra( ) without edge upsampling. */
 INLINE int coop_intra_px(int mode, int pAngle, int dx, int dy, int dcAvg, int i, int j, int w, int h, int log2W,
-                         int log2H, threadgroup const int *A, threadgroup const int *L) {
+                         int log2H, threadgroup const uint8_t *A, threadgroup const uint8_t *L) {
   if (intra_is_directional(mode)) {
     if (pAngle < 90) {
       int idx = (i + 1) * dx;
@@ -440,52 +443,140 @@ INLINE int coop_intra_px(int mode, int pAngle, int dx, int dy, int dcAvg, int i,
   return pTop <= pTopLeft ? A[j] : A[-1];
 }
 
-/* intra_satd( ) with the work spread over the lanes (edges prebuilt). */
-INLINE int coop_intra_satd(DEV const uint8_t *px, int stride, int x, int y, int log2W, int log2H, int mode,
-                           int delta, threadgroup const int *A, threadgroup const int *L, uint lane) {
-  int w = 1 << log2W, h = 1 << log2H;
-  int haveLeft = x > 0, haveAbove = y > 0;
-  int pAngle = 0, dx = 0, dy = 0, dcAvg = 0;
+/* Prediction parameters of coop_intra_px for mode (+ delta). */
+INLINE void coop_intra_params(int mode, int delta, int haveLeft, int haveAbove, int w, int h, int log2W, int log2H,
+                              threadgroup const uint8_t *A, threadgroup const uint8_t *L, THR int *pAngle, THR int *dx,
+                              THR int *dy, THR int *dcAvg) {
+  *pAngle = *dx = *dy = *dcAvg = 0;
   if (intra_is_directional(mode)) {
-    pAngle = Mode_To_Angle[mode] + delta * ANGLE_STEP;
-    if (pAngle < 90) dx = Dr_Intra_Derivative[pAngle];
-    else if (pAngle > 90 && pAngle < 180) dx = Dr_Intra_Derivative[180 - pAngle];
-    if (pAngle > 90 && pAngle < 180) dy = Dr_Intra_Derivative[pAngle - 90];
-    else if (pAngle > 180) dy = Dr_Intra_Derivative[270 - pAngle];
+    int pa = Mode_To_Angle[mode] + delta * ANGLE_STEP;
+    *pAngle = pa;
+    if (pa < 90) *dx = Dr_Intra_Derivative[pa];
+    else if (pa > 90 && pa < 180) *dx = Dr_Intra_Derivative[180 - pa];
+    if (pa > 90 && pa < 180) *dy = Dr_Intra_Derivative[pa - 90];
+    else if (pa > 180) *dy = Dr_Intra_Derivative[270 - pa];
   } else if (mode == DC_PRED) {
     int sum = 0;
     if (haveLeft && haveAbove) {
       for (int k = 0; k < h; k++) sum += L[k];
       for (int k = 0; k < w; k++) sum += A[k];
-      dcAvg = (sum + ((w + h) >> 1)) / (w + h);
+      *dcAvg = (sum + ((w + h) >> 1)) / (w + h);
     } else if (haveLeft) {
       for (int k = 0; k < h; k++) sum += L[k];
-      dcAvg = Clip1((sum + (h >> 1)) >> log2H);
+      *dcAvg = Clip1((sum + (h >> 1)) >> log2H);
     } else if (haveAbove) {
       for (int k = 0; k < w; k++) sum += A[k];
-      dcAvg = Clip1((sum + (w >> 1)) >> log2W);
+      *dcAvg = Clip1((sum + (w >> 1)) >> log2W);
     } else {
-      dcAvg = 1 << 7;
+      *dcAvg = 1 << 7;
     }
   }
-  int nu = w >> 2, n = nu * (h >> 2), s = 0;
-  for (int u = (int)lane; u < n; u += 32) {
-    int ux = (u % nu) * 4, uy = (u / nu) * 4;
-    int32_t d[16];
-    for (int r = 0; r < 4; r++)
-      for (int c = 0; c < 4; c++)
-        d[r * 4 + c] = (int)px[(y + uy + r) * stride + x + ux + c] -
-                       coop_intra_px(mode, pAngle, dx, dy, dcAvg, uy + r, ux + c, w, h, log2W, log2H, A, L);
-    s += satd4x4(d);
-  }
+}
+
+/* SATD of 4x4 unit u of the intra prediction (parameters prebuilt). */
+INLINE int coop_intra_unit(DEV const uint8_t *px, int stride, int x, int y, int log2W, int log2H, int mode, int pAngle,
+                           int dx, int dy, int dcAvg, int u, threadgroup const uint8_t *A,
+                           threadgroup const uint8_t *L) {
+  int w = 1 << log2W, h = 1 << log2H, nu = w >> 2;
+  int ux = (u % nu) * 4, uy = (u / nu) * 4;
+  int32_t d[16];
+  for (int r = 0; r < 4; r++)
+    for (int c = 0; c < 4; c++)
+      d[r * 4 + c] = (int)px[(y + uy + r) * stride + x + ux + c] -
+                     coop_intra_px(mode, pAngle, dx, dy, dcAvg, uy + r, ux + c, w, h, log2W, log2H, A, L);
+  return satd4x4(d);
+}
+
+/* intra_satd( ) with the work spread over the lanes (edges prebuilt). */
+INLINE int coop_intra_satd(DEV const uint8_t *px, int stride, int x, int y, int log2W, int log2H, int mode,
+                           int delta, threadgroup const uint8_t *A, threadgroup const uint8_t *L, uint lane) {
+  int w = 1 << log2W, h = 1 << log2H;
+  int pAngle, dx, dy, dcAvg;
+  coop_intra_params(mode, delta, x > 0, y > 0, w, h, log2W, log2H, A, L, &pAngle, &dx, &dy, &dcAvg);
+  int n = (w >> 2) * (h >> 2), s = 0;
+  for (int u = (int)lane; u < n; u += 32) s += coop_intra_unit(px, stride, x, y, log2W, log2H, mode, pAngle, dx, dy, dcAvg, u, A, L);
   return simd_sum(s);
+}
+
+/* SATDs of nm modes (list ml, no delta) over the planes np (1: luma at
+ * (x, y) with edges A0/L0; 2: both chroma planes, edges A0/L0 and A1/L1),
+ * all (mode, plane, unit) items spread over the lanes in one sweep:
+ * out[k] = sum over the planes of mode ml[k]. */
+INLINE void coop_intra_multi(DEV const FrameParams *fp, DEV const uint8_t *src, int chroma, int x, int y, int log2W,
+                             int log2H, THR const int *ml, int nm, threadgroup const uint8_t *A0,
+                             threadgroup const uint8_t *L0, threadgroup const uint8_t *A1,
+                             threadgroup const uint8_t *L1, uint lane, THR long *out) {
+  int w = 1 << log2W, h = 1 << log2H, n = (w >> 2) * (h >> 2), np = chroma ? 2 : 1;
+  int per = n * np, items = nm * per;
+  int haveLeft = x > 0, haveAbove = y > 0;
+  /* DC_PRED averages of the planes (edge sums over the lanes) */
+  int dcs[2];
+  for (int pl = 0; pl < np; pl++) {
+    threadgroup const uint8_t *A = pl ? A1 : A0, *L = pl ? L1 : L0;
+    int sa = 0, sl = 0;
+    for (int k = (int)lane; k < w; k += 32) sa += A[k];
+    for (int k = (int)lane; k < h; k += 32) sl += L[k];
+    sa = simd_sum(sa);
+    sl = simd_sum(sl);
+    if (haveLeft && haveAbove) dcs[pl] = (sa + sl + ((w + h) >> 1)) / (w + h);
+    else if (haveLeft) dcs[pl] = Clip1((sl + (h >> 1)) >> log2H);
+    else if (haveAbove) dcs[pl] = Clip1((sa + (w >> 1)) >> log2W);
+    else dcs[pl] = 1 << 7;
+  }
+  for (int k = 0; k < nm; k++) out[k] = 0;
+  for (int base = 0; base < items; base += 32) {
+    int wi = base + (int)lane, s = 0, mi = -1;
+    if (wi < items) {
+      mi = wi / per;
+      int pl = (wi / n) % np, u = wi % n;
+      int mode = ml[mi], pAngle = 0, dx = 0, dy = 0;
+      threadgroup const uint8_t *A = pl ? A1 : A0, *L = pl ? L1 : L0;
+      if (intra_is_directional(mode)) {
+        pAngle = Mode_To_Angle[mode];
+        if (pAngle < 90) dx = Dr_Intra_Derivative[pAngle];
+        else if (pAngle > 90 && pAngle < 180) dx = Dr_Intra_Derivative[180 - pAngle];
+        if (pAngle > 90 && pAngle < 180) dy = Dr_Intra_Derivative[pAngle - 90];
+        else if (pAngle > 180) dy = Dr_Intra_Derivative[270 - pAngle];
+      }
+      int p = chroma ? 1 + pl : 0;
+      if (mode == DC_PRED || mode == V_PRED || mode == H_PRED || mode == SMOOTH_PRED) {
+        /* the turbo modes, directly (equal to coop_intra_px) */
+        int nu = w >> 2, ux = (u % nu) * 4, uy = (u / nu) * 4, stride = fp->stride[p];
+        DEV const uint8_t *sp = src + fp->offset[p] + (y + uy) * stride + x + ux;
+        int4 r[4];
+        int dc = dcs[pl];
+        if (mode == SMOOTH_PRED) {
+          KCONST int32_t *wX = intra_sm_weights(log2W);
+          KCONST int32_t *wY = intra_sm_weights(log2H);
+          int bl = L[h - 1], tr = A[w - 1];
+          int4 wx = int4(wX[ux], wX[ux + 1], wX[ux + 2], wX[ux + 3]);
+          int4 a = int4(A[ux], A[ux + 1], A[ux + 2], A[ux + 3]);
+          for (int k = 0; k < 4; k++) {
+            int wy = wY[uy + k], l = L[uy + k];
+            int4 pr = (wy * a + (256 - wy) * bl + wx * l + (256 - wx) * tr + 256) >> 9;
+            r[k] = int4(uchar4(*(DEV const packed_uchar4 *)(sp + k * stride))) - pr;
+          }
+        } else {
+          int4 a = int4(A[ux], A[ux + 1], A[ux + 2], A[ux + 3]);
+          for (int k = 0; k < 4; k++) {
+            int4 pr = mode == DC_PRED ? int4(dc) : mode == V_PRED ? a : int4(L[uy + k]);
+            r[k] = int4(uchar4(*(DEV const packed_uchar4 *)(sp + k * stride))) - pr;
+          }
+        }
+        s = satd4x4_v(r[0], r[1], r[2], r[3]);
+      } else
+      s = coop_intra_unit(src + fp->offset[p], fp->stride[p], x, y, log2W, log2H, mode, pAngle, dx, dy, dcs[pl], u, A, L);
+    }
+    int m0 = base / per, m1 = k_min(nm - 1, (base + 31) / per);
+    for (int k = m0; k <= m1; k++) out[k] += simd_sum(mi == k ? s : 0);
+  }
 }
 
 /* CfL cost of chroma plane p (the eval_block CfL step, lanes over samples):
  * DC prediction (a constant), best alpha by SSE over -16..16 (first
  * minimum), SATD of that prediction. */
 INLINE int coop_cfl_satd(DEV const FrameParams *fp, DEV const uint8_t *src, int p, int cx, int cy, int clw, int clh,
-                         int maxLumaW, int maxLumaH, threadgroup int *A, threadgroup int *L, uint lane) {
+                         int maxLumaW, int maxLumaH, threadgroup uint8_t *A, threadgroup uint8_t *L, uint lane) {
   int cw = 1 << clw, ch = 1 << clh;
   DEV const uint8_t *pp = src + fp->offset[p];
   int stride = fp->stride[p], ls = fp->stride[0];
@@ -556,16 +647,22 @@ INLINE long coop_inter_cost(DEV const FrameParams *fp, DEV const uint8_t *src, D
   DEV const int32_t *mvp = mvField + (sbIdx * NUM_NODES + mvNode) * 2;
   *mvr = mvp[0];
   *mvc = mvp[1];
-  long c = coop_inter_satd(fp, src, ref, 0, x, y, w, h, *mvr, *mvc, lane);
-  for (int p = 1; p < 3; p++) c += coop_inter_satd(fp, src, ref, p, cx, cy, w >> 1, h >> 1, *mvr, *mvc, lane);
+  /* (plane, unit) items of all planes in one sweep */
+  int n0 = (w >> 2) * (h >> 2), nc = n0 >> 2, s = 0;
+  for (int wi = (int)lane; wi < n0 + 2 * nc; wi += 32) {
+    int p = wi < n0 ? 0 : (wi < n0 + nc ? 1 : 2), u = p == 0 ? wi : wi - n0 - (p - 1) * nc;
+    s += p ? coop_inter_unit(fp, src, ref, p, cx, cy, w >> 1, h >> 1, *mvr, *mvc, u)
+           : coop_inter_unit(fp, src, ref, 0, x, y, w, h, *mvr, *mvc, u);
+  }
+  long c = simd_sum(s);
   return c + (long)lam * (4 + mv_bits8(*mvr, *mvc)) / 8;
 }
 
 INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
                             DEV const uint8_t *gold, DEV const int32_t *mvField, DEV const int32_t *mvFieldGold,
                             int mvNode, int miRow, int miCol, int bsize,
-                            DEV int32_t *scratch, int ps, THR BlockInfo *out, threadgroup int *A,
-                            threadgroup int *L, uint lane) {
+                            DEV int32_t *scratch, int ps, THR BlockInfo *out, threadgroup uint8_t *A,
+                            threadgroup uint8_t *L, threadgroup uint8_t *A2, threadgroup uint8_t *L2, uint lane) {
   DEV uint8_t *pred = (DEV uint8_t *)scratch;
   DEV int32_t *tmpArea = scratch + (ps * ps + 3) / 4;
   int lw = Mi_Width_Log2[bsize] + 2, lh = Mi_Height_Log2[bsize] + 2;
@@ -635,10 +732,14 @@ INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, D
   if (!skipIntra) {
     DEV const uint8_t *py = src + fp->offset[0];
     coop_edges(fp, py, fp->stride[0], 0, x, y, w, h, A, L, lane);
-    for (int mode = DC_PRED; mode <= PAETH_PRED; mode++) {
-      if (turbo_mode_off(fp, mode)) continue;
-      long c = coop_intra_satd(py, fp->stride[0], x, y, lw, lh, mode, 0, A, L, lane) + (long)lam * mode_bits8(mode) / 8;
-      if (best < 0 || c < best) { best = c; bestMode = mode; }
+    int ml[PAETH_PRED + 1], nm = 0;
+    for (int mode = DC_PRED; mode <= PAETH_PRED; mode++)
+      if (!turbo_mode_off(fp, mode)) ml[nm++] = mode;
+    long sm[PAETH_PRED + 1];
+    coop_intra_multi(fp, src, 0, x, y, lw, lh, ml, nm, A, L, A, L, lane, sm);
+    for (int k = 0; k < nm; k++) {
+      long c = sm[k] + (long)lam * mode_bits8(ml[k]) / 8;
+      if (best < 0 || c < best) { best = c; bestMode = ml[k]; }
     }
     if (intra_is_directional(bestMode) && !fp->fast) {
       int base = bestMode;
@@ -658,6 +759,20 @@ INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, D
   if (!skipUv) {
     long cu[PAETH_PRED + 1];
     for (int m = DC_PRED; m <= PAETH_PRED; m++) cu[m] = 0;
+    if (bestDelta == 0) {
+      /* both planes, all modes in one sweep */
+      coop_edges(fp, src + fp->offset[1], fp->stride[1], 1, cx, cy, w >> 1, h >> 1, A, L, lane);
+      coop_edges(fp, src + fp->offset[2], fp->stride[2], 2, cx, cy, w >> 1, h >> 1, A2, L2, lane);
+      int ml[PAETH_PRED + 1], nm = 0;
+      for (int m = DC_PRED; m <= PAETH_PRED; m++) {
+        if (intra_is_directional(m) && m != V_PRED && m != H_PRED && m != bestMode) continue;
+        if (turbo_mode_off(fp, m)) continue;
+        ml[nm++] = m;
+      }
+      long sm[PAETH_PRED + 1];
+      coop_intra_multi(fp, src, 1, cx, cy, clw, clh, ml, nm, A, L, A2, L2, lane, sm);
+      for (int k = 0; k < nm; k++) cu[ml[k]] = sm[k];
+    } else
     for (int p = 1; p < 3; p++) {
       DEV const uint8_t *pp = src + fp->offset[p];
       coop_edges(fp, pp, fp->stride[p], p, cx, cy, w >> 1, h >> 1, A, L, lane);
@@ -730,7 +845,7 @@ kernel void mav1_analyze_coop(device const FrameParams *fp [[buffer(0)]],
                               constant int2 &band [[buffer(10)]],
                               uint gid [[threadgroup_position_in_grid]],
                               uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup int eA[EDGE_LEN], eL[EDGE_LEN];
+  threadgroup uint8_t eA[EDGE_OFF + 160], eL[EDGE_OFF + 160], eA2[EDGE_OFF + 160], eL2[EDGE_OFF + 160];
   int ns = level_slots(fp, level), nn = 1 << (2 * level);
   if ((int)gid >= band.y * nn * ns) return;
   int sbIdx = band.x + (int)gid / (nn * ns), rem = (int)gid % (nn * ns);
@@ -753,9 +868,257 @@ kernel void mav1_analyze_coop(device const FrameParams *fp [[buffer(0)]],
   BlockInfo b;
   long cost = coop_eval_block(fp, src, ref, gold, mvField, mvFieldGold, node, r + dr, c + dc, bs,
                               scratch + (long)gid * analysis_slot_ints(level), 64 >> level, &b, eA + EDGE_OFF,
-                              eL + EDGE_OFF, lane);
+                              eL + EDGE_OFF, eA2 + EDGE_OFF, eL2 + EDGE_OFF, lane);
   if (lane == 0) {
     costs[idx] = cost;
     infos[idx] = b;
   }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Level 3 (8x8) pass 1 on turbo inter frames (T_INTRA: luma and chroma     */
+/* intra DC / V / H / SMOOTH, no CfL): one SIMD group per 16x16 node, lanes */
+/* 8q .. 8q + 7 evaluate its child q. Costs equal eval_block( ).            */
+
+INLINE int osum(int v) {
+  v += simd_shuffle_xor(v, 4);
+  v += simd_shuffle_xor(v, 2);
+  v += simd_shuffle_xor(v, 1);
+  return v;
+}
+
+/* Turbo intra prediction sample (DC / V / H / SMOOTH) of a w x h block. */
+INLINE int o_intra_px(int mode, int dc, int a, int l, int aLast, int lLast, int wx, int wy) {
+  if (mode == DC_PRED) return dc;
+  if (mode == V_PRED) return a;
+  if (mode == H_PRED) return l;
+  return (wy * a + (256 - wy) * lLast + wx * l + (256 - wx) * aLast + 256) >> 9;
+}
+
+/* Edge sample k (< w) of the above row / left column as coop_edges( ). */
+INLINE int o_above(DEV const uint8_t *px, int stride, int x, int y, int k) {
+  if (y > 0) return px[(y - 1) * stride + x + k];
+  return x > 0 ? px[y * stride + x - 1] : (1 << 7) - 1;
+}
+INLINE int o_left(DEV const uint8_t *px, int stride, int x, int y, int k) {
+  if (x > 0) return px[(y + k) * stride + x - 1];
+  return y > 0 ? px[(y - 1) * stride + x] : (1 << 7) + 1;
+}
+INLINE int o_dc(int sa, int sl, int haveLeft, int haveAbove, int log2) {
+  int n = 1 << log2;
+  if (haveLeft && haveAbove) return (sa + sl + n) / (2 * n);
+  if (haveLeft) return Clip1((sl + (n >> 1)) >> log2);
+  if (haveAbove) return Clip1((sa + (n >> 1)) >> log2);
+  return 1 << 7;
+}
+
+kernel void mav1_analyze_l3o(device const FrameParams *fp [[buffer(0)]],
+                             device const uint8_t *src [[buffer(1)]],
+                             device const uint8_t *ref [[buffer(2)]],
+                             device const int32_t *mvField [[buffer(3)]],
+                             device long *costs [[buffer(4)]],
+                             device BlockInfo *infos [[buffer(5)]],
+                             device int32_t *scratch [[buffer(6)]],
+                             constant int &level [[buffer(7)]],
+                             device const uint8_t *gold [[buffer(8)]],
+                             device const int32_t *mvFieldGold [[buffer(9)]],
+                             constant int2 &band [[buffer(10)]],
+                             uint gid [[threadgroup_position_in_grid]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+  if ((int)gid >= band.y * 16) return;
+  int sbIdx = band.x + (int)gid / 16, i2 = (int)gid % 16;
+  int q = (int)lane >> 3, t = (int)lane & 7, ob = (int)lane & ~7;
+  int i = ((i2 >> 2) * 2 + (q >> 1)) * 8 + (i2 & 3) * 2 + (q & 1);
+  int sbRow = sbIdx / fp->sb_cols, sbCol = sbIdx % fp->sb_cols;
+  int node = NODE_BASE(3) + i;
+  int r = sbRow * 16 + (i / 8) * 2, c = sbCol * 16 + (i % 8) * 2;
+  long idx = (long)sbIdx * A_ITEMS + node * A_SLOTS;
+  bool valid = !(r >= fp->mi_rows || c >= fp->mi_cols || depth_pruned(fp, costs, sbIdx, 3, i) ||
+                 (leaf_no8(fp) && !node8_at_edge(fp, sbIdx, i)));
+  int dr = 0, dc = 0, bs = 0;
+  if (valid) {
+    int hasRows = (r + 1) < fp->mi_rows, hasCols = (c + 1) < fp->mi_cols;
+    valid = part_allowed(fp, 3, PARTITION_NONE, hasRows, hasCols) && 0 < part_count(fp, PARTITION_NONE, r, c, 1);
+    if (valid) bs = part_block(PARTITION_NONE, level_bsize(3), 0, 1, &dr, &dc);
+  }
+  if (!valid) {
+    if (t == 0) costs[idx] = -1;
+    return;
+  }
+  int miRow = r + dr, miCol = c + dc;
+  int lw = Mi_Width_Log2[bs] + 2, lh = Mi_Height_Log2[bs] + 2; /* 3, 3 */
+  int w = 1 << lw, h = 1 << lh;
+  int x = miCol * 4, y = miRow * 4;
+  int lam = fp->ac_q[0] / 16;
+  int cx = x >> 1, cy = y >> 1;
+  /* inter: items t < 6: luma units 0..3, U, V */
+  int ip = t < 4 ? 0 : t - 3, iu = t < 4 ? t : 0;
+  int ibw = ip ? w >> 1 : w, ibh = ip ? h >> 1 : h, ibx = ip ? cx : x, iby = ip ? cy : y;
+  long interCost = -1;
+  int mvr = 0, mvc = 0, refFrame = LAST_FRAME, refFrame1 = 0, mvr1 = 0, mvc1 = 0;
+  int sbI = (y >> 6) * fp->sb_cols + (x >> 6);
+  if (!fp->frame_is_intra) {
+    DEV const int32_t *m0 = mvField + (sbI * NUM_NODES + node) * 2;
+    int lr = m0[0], lc = m0[1], gr = 0, gc = 0;
+    if (fp->golden) {
+      DEV const int32_t *m1 = mvFieldGold + (sbI * NUM_NODES + node) * 2;
+      gr = m1[0];
+      gc = m1[1];
+    }
+    int a0 = 0, a1 = 0, a2 = 0;
+    if (t < 6) {
+      int pr[16], pr2[16];
+      coop_pred_unit(fp, ref, ip, ibx, iby, ibw, ibh, lr, lc, iu, pr);
+      if (fp->golden) coop_pred_unit(fp, gold, ip, ibx, iby, ibw, ibh, gr, gc, iu, pr2);
+      int stride = fp->stride[ip], nu = ibw >> 2;
+      DEV const uint8_t *sp = src + fp->offset[ip] + (iby + (iu / nu) * 4) * stride + ibx + (iu % nu) * 4;
+      int4 d0[4], d1[4], d2[4];
+      for (int k = 0; k < 4; k++) {
+        int4 sv = int4(sp[k * stride], sp[k * stride + 1], sp[k * stride + 2], sp[k * stride + 3]);
+        int4 p0 = int4(pr[k * 4], pr[k * 4 + 1], pr[k * 4 + 2], pr[k * 4 + 3]);
+        int4 p1 = int4(pr2[k * 4], pr2[k * 4 + 1], pr2[k * 4 + 2], pr2[k * 4 + 3]);
+        d0[k] = sv - p0;
+        d1[k] = sv - p1;
+        d2[k] = sv - ((p0 + p1 + 1) >> 1);
+      }
+      a0 = satd4x4_v(d0[0], d0[1], d0[2], d0[3]);
+      if (fp->golden) {
+        a1 = satd4x4_v(d1[0], d1[1], d1[2], d1[3]);
+        a2 = satd4x4_v(d2[0], d2[1], d2[2], d2[3]);
+      }
+    }
+    long s0 = osum(a0), s1 = osum(a1), s2 = osum(a2);
+    interCost = s0 + (long)lam * (4 + mv_bits8(lr, lc)) / 8;
+    mvr = lr;
+    mvc = lc;
+    if (fp->golden) {
+      long g = s1 + (long)lam * (4 + mv_bits8(gr, gc)) / 8 + (long)lam * GOLDEN_REF_BITS8 / 8;
+      if (g < interCost) {
+        interCost = g;
+        mvr = gr;
+        mvc = gc;
+        refFrame = fp->ref2_frame;
+      }
+      if (fp->compound) {
+        long cc = s2 + (long)lam * (8 + mv_bits8(lr, lc) + mv_bits8(gr, gc) + COMPOUND_BITS8) / 8;
+        if (cc < interCost) {
+          interCost = cc;
+          mvr = lr;
+          mvc = lc;
+          mvr1 = gr;
+          mvc1 = gc;
+          refFrame = LAST_FRAME;
+          refFrame1 = fp->ref2_frame;
+        }
+      }
+    }
+  }
+  /* luma intra: DC, V, H, SMOOTH (16 (mode, unit) items, two sweeps) */
+  long best = -1;
+  int bestMode = DC_PRED;
+  int skipIntra = interCost >= 0 && (fp->leaf || (fp->fast && interCost * 16 < (long)w * h * lam * 16));
+  const int modes[4] = {DC_PRED, V_PRED, H_PRED, SMOOTH_PRED};
+  if (!skipIntra) {
+    DEV const uint8_t *py = src + fp->offset[0];
+    int Ay = o_above(py, fp->stride[0], x, y, t), Ly = o_left(py, fp->stride[0], x, y, t);
+    int dcv = o_dc(osum(Ay), osum(Ly), x > 0, y > 0, lw);
+    int aLast = simd_shuffle(Ay, (ushort)(ob + 7)), lLast = simd_shuffle(Ly, (ushort)(ob + 7));
+    long sm[4];
+    for (int pass = 0; pass < 2; pass++) {
+      int mi = pass * 2 + (t >> 2), u = t & 3, ux = (u & 1) * 4, uy = (u >> 1) * 4;
+      int mode = modes[mi];
+      int s = 0;
+      int4 rr[4];
+      for (int k = 0; k < 4; k++) {
+        int l = simd_shuffle(Ly, (ushort)(ob + uy + k));
+        int wy = Sm_Weights_Tx_8x8[uy + k];
+        DEV const uint8_t *sp = py + (y + uy + k) * fp->stride[0] + x + ux;
+        int pv[4];
+        for (int cc = 0; cc < 4; cc++) {
+          int a = simd_shuffle(Ay, (ushort)(ob + ux + cc));
+          pv[cc] = o_intra_px(mode, dcv, a, l, aLast, lLast, Sm_Weights_Tx_8x8[ux + cc], wy);
+        }
+        rr[k] = int4(sp[0], sp[1], sp[2], sp[3]) - int4(pv[0], pv[1], pv[2], pv[3]);
+      }
+      s = satd4x4_v(rr[0], rr[1], rr[2], rr[3]);
+      sm[pass * 2] = osum(t < 4 ? s : 0);
+      sm[pass * 2 + 1] = osum(t < 4 ? 0 : s);
+    }
+    for (int k = 0; k < 4; k++) {
+      long cst = sm[k] + (long)lam * mode_bits8(modes[k]) / 8;
+      if (best < 0 || cst < best) { best = cst; bestMode = modes[k]; }
+    }
+  } else {
+    best = 1L << 40;
+  }
+  int skipUv = fp->fast && interCost >= 0 && best + (long)lam * 16 / 8 >= interCost;
+  long bestUv = skipUv ? 0 : -1;
+  int bestUvMode = DC_PRED;
+  if (!skipUv) {
+    /* lane t: mode t & 3 of plane 1 + (t >> 2); 4x4 blocks */
+    int pl = 1 + (t >> 2), e = t & 3, qb = ob + (t & 4);
+    DEV const uint8_t *pp = src + fp->offset[pl];
+    int st = fp->stride[pl];
+    int Ac = o_above(pp, st, cx, cy, e), Lc = o_left(pp, st, cx, cy, e);
+    int sa = Ac + simd_shuffle_xor(Ac, 1);
+    sa += simd_shuffle_xor(sa, 2);
+    int sl = Lc + simd_shuffle_xor(Lc, 1);
+    sl += simd_shuffle_xor(sl, 2);
+    int dcv = o_dc(sa, sl, cx > 0, cy > 0, 2);
+    int aLast = simd_shuffle(Ac, (ushort)(qb + 3)), lLast = simd_shuffle(Lc, (ushort)(qb + 3));
+    int mode = modes[e];
+    int4 rr[4];
+    for (int k = 0; k < 4; k++) {
+      int l = simd_shuffle(Lc, (ushort)(qb + k));
+      int wy = Sm_Weights_Tx_4x4[k];
+      DEV const uint8_t *sp = pp + (cy + k) * st + cx;
+      int pv[4];
+      for (int cc = 0; cc < 4; cc++) {
+        int a = simd_shuffle(Ac, (ushort)(qb + cc));
+        pv[cc] = o_intra_px(mode, dcv, a, l, aLast, lLast, Sm_Weights_Tx_4x4[cc], wy);
+      }
+      rr[k] = int4(sp[0], sp[1], sp[2], sp[3]) - int4(pv[0], pv[1], pv[2], pv[3]);
+    }
+    int s = satd4x4_v(rr[0], rr[1], rr[2], rr[3]);
+    s += simd_shuffle_xor(s, 4); /* U + V */
+    for (int k = 0; k < 4; k++) {
+      long cst = (long)simd_shuffle(s, (ushort)(ob + k)) + (long)lam * (modes[k] == DC_PRED ? 8 : 24) / 8;
+      if (bestUv < 0 || cst < bestUv) { bestUv = cst; bestUvMode = modes[k]; }
+    }
+  }
+  if (t != 0) return;
+  BlockInfo b;
+  b.mi_row = miRow;
+  b.mi_col = miCol;
+  b.bsize = bs;
+  b.is_inter = 0;
+  b.y_mode = bestMode;
+  b.angle_y = 0;
+  b.uv_mode = bestUvMode;
+  b.angle_uv = 0;
+  b.cfl_alpha_u = b.cfl_alpha_v = 0;
+  b.tx_depth = 0;
+  b.interp_filter = 0;
+  b.tx_types_lo = b.tx_types_hi = 0;
+  b.mv_row = 0;
+  b.mv_col = 0;
+  b.ref_frame = INTRA_FRAME;
+  b.ref_frame1 = 0;
+  b.mv1_row = b.mv1_col = 0;
+  b.tx_type = DCT_DCT;
+  long cost = best + bestUv + (long)lam * (fp->frame_is_intra ? 0 : 16) / 8;
+  if (interCost >= 0 && interCost < cost) {
+    cost = interCost;
+    b.is_inter = 1;
+    b.y_mode = NEWMV;
+    b.uv_mode = DC_PRED;
+    b.mv_row = mvr;
+    b.mv_col = mvc;
+    b.ref_frame = refFrame;
+    b.ref_frame1 = refFrame1;
+    b.mv1_row = mvr1;
+    b.mv1_col = mvc1;
+  }
+  costs[idx] = cost;
+  infos[idx] = b;
 }
