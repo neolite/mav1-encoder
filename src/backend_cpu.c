@@ -5,6 +5,7 @@
 #include <dispatch/dispatch.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#include <Block.h>
 
 #include "backend.h"
 #include "enc_internal.h"
@@ -79,33 +80,74 @@ static int recon_prereq(const struct Mav1Encoder *e, int r, int c, int *pre) {
   return n;
 }
 
-void cpu_backend_recon(Backend *b, struct Mav1Encoder *e) {
-  (void)b;
-  const FrameParams *fp = ENC_PARAMS(e);
+typedef struct {
+  struct Mav1Encoder *e;
+  _Atomic int *deps;
+  int (*next)[3]; /* dependents: count, ids */
+  dispatch_queue_t q;
+  dispatch_group_t g;
+  void (^run)(int);
+} ReconSched;
+
+void *recon_sched_begin(struct Mav1Encoder *e, int extra) {
+  ReconSched *rs = calloc(1, sizeof *rs);
   int n = e->num_sbs;
-  _Atomic int *deps = calloc((size_t)n, sizeof *deps);
-  int (*next)[3] = calloc((size_t)n, sizeof *next); /* dependents: count, ids */
+  rs->e = e;
+  rs->deps = calloc((size_t)n, sizeof *rs->deps);
+  rs->next = calloc((size_t)n, sizeof *rs->next);
   for (int i = 0; i < n; i++) {
     int pre[2], k = recon_prereq(e, i / e->sb_cols, i % e->sb_cols, pre);
-    deps[i] = k;
-    for (int j = 0; j < k; j++) next[pre[j]][1 + next[pre[j]][0]++] = i;
+    rs->deps[i] = k + extra;
+    for (int j = 0; j < k; j++) rs->next[pre[j]][1 + rs->next[pre[j]][0]++] = i;
   }
-  dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
-  dispatch_group_t g = dispatch_group_create();
+  rs->q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+  rs->g = dispatch_group_create();
+  const FrameParams *fp = ENC_PARAMS(e);
+  _Atomic int *deps = rs->deps;
+  int (*next)[3] = rs->next;
+  dispatch_queue_t q = rs->q;
+  dispatch_group_t g = rs->g;
   __block void (^run)(int);
-  void (^body)(int) = ^(int idx) {
+  run = Block_copy(^(int idx) {
     recon_sb(fp, ENC_SBS(e)[idx], ENC_BLOCKS(e), e->src.base, e->rec.base, e->ref.base, e->gold.base, ENC_COEFS(e),
              (const int32_t *)e->mats.base, (int32_t *)e->scratch.base + (size_t)idx * SCRATCH_INTS);
     for (int j = 0; j < next[idx][0]; j++) {
       int d = next[idx][1 + j];
       if (atomic_fetch_sub(&deps[d], 1) == 1) dispatch_group_async(g, q, ^{ run(d); });
     }
-  };
-  run = body;
-  dispatch_group_async(g, q, ^{ run(0); });
-  dispatch_group_wait(g, DISPATCH_TIME_FOREVER);
-  free((void *)deps);
-  free(next);
+  });
+  rs->run = run;
+  /* collect the ready set first: launched tasks decrement deps meanwhile */
+  int *ready = malloc(sizeof(int) * (size_t)n), nr = 0;
+  for (int i = 0; i < n; i++)
+    if (rs->deps[i] == 0) ready[nr++] = i;
+  for (int k = 0; k < nr; k++) {
+    int i = ready[k];
+    dispatch_group_async(g, q, ^{ run(i); });
+  }
+  free(ready);
+  return rs;
+}
+
+void recon_sched_release(void *p, int sb0, int nsb) {
+  ReconSched *rs = p;
+  void (^run)(int) = rs->run;
+  for (int i = sb0; i < sb0 + nsb; i++)
+    if (atomic_fetch_sub(&rs->deps[i], 1) == 1) dispatch_group_async(rs->g, rs->q, ^{ run(i); });
+}
+
+void recon_sched_end(void *p) {
+  ReconSched *rs = p;
+  dispatch_group_wait(rs->g, DISPATCH_TIME_FOREVER);
+  Block_release(rs->run);
+  free((void *)rs->deps);
+  free(rs->next);
+  free(rs);
+}
+
+void cpu_backend_recon(Backend *b, struct Mav1Encoder *e) {
+  (void)b;
+  recon_sched_end(recon_sched_begin(e, 0));
 }
 
 static void cpu_filter(Backend *b, struct Mav1Encoder *e) {

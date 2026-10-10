@@ -38,7 +38,7 @@ typedef struct {
   int lr_test;         /* testing: force Wiener / self-guided on alternate units, ignoring rate */
   int me_range;        /* full-pel motion search range */
   int threads;         /* CPU backend worker threads (0: auto) */
-  int turbo;           /* speed mode: implies fast, altref 4, leaf; reduced ME and analysis */
+  int turbo;           /* speed mode: implies fast, altref 2, leaf; reduced ME and analysis */
 } Mav1Config;
 
 typedef struct {

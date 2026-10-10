@@ -66,7 +66,7 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
   e->cfg = *cfg;
   if (e->cfg.turbo) {
     e->cfg.fast = 1;
-    if (e->cfg.altref < 2) e->cfg.altref = 4;
+    if (e->cfg.altref < 2) e->cfg.altref = 2;
     e->cfg.leaf = 1;
   }
   if (e->cfg.altref == 1) e->cfg.altref = 0;
@@ -238,13 +238,15 @@ static void load_source(Mav1Encoder *e, const uint8_t *const planes[3], const in
  * so AvailUChroma / AvailLChroma equal AvailU / AvailL. */
 static int smooth_mode(int m) { return m == SMOOTH_PRED || m == SMOOTH_V_PRED || m == SMOOTH_H_PRED; }
 
-static void edge_filter_types(Mav1Encoder *e) {
+/* Edge filter types of the blocks of SB rows [row0, row1) (the rows above
+ * done before); ys / uvs map every mi to its luma / chroma smooth flag. */
+void edge_types_rows(Mav1Encoder *e, uint8_t *ys, uint8_t *uvs, int row0, int row1) {
   const FrameParams *fp = ENC_PARAMS(e);
   int cols = e->mi_cols, rows = e->mi_rows;
-  uint8_t *ys = calloc((size_t)rows * cols, 1), *uvs = calloc((size_t)rows * cols, 1);
   BlockInfo *blocks = ENC_BLOCKS(e);
   const SbInfo *sbs = ENC_SBS(e);
-  for (int s = 0; s < e->num_sbs; s++)
+  int s0 = row0 * e->sb_cols, s1 = row1 * e->sb_cols;
+  for (int s = s0; s < s1; s++)
     for (int i = 0; i < sbs[s].num_blocks; i++) {
       const BlockInfo *b = &blocks[sbs[s].first_block + i];
       int ysm = smooth_mode(b->y_mode) && !b->is_inter, uvsm = !b->is_inter && smooth_mode(b->uv_mode);
@@ -254,7 +256,7 @@ static void edge_filter_types(Mav1Encoder *e) {
           uvs[r * cols + c] = (uint8_t)uvsm;
         }
     }
-  for (int s = 0; s < e->num_sbs; s++)
+  for (int s = s0; s < s1; s++)
     for (int i = 0; i < sbs[s].num_blocks; i++) {
       BlockInfo *b = &blocks[sbs[s].first_block + i];
       int r = b->mi_row, c = b->mi_col;
@@ -265,6 +267,11 @@ static void edge_filter_types(Mav1Encoder *e) {
                 (availL && uvs[k_min(r + 1, rows - 1) * cols + c - 1]);
       b->interp_filter = (b->interp_filter & 15) | fy << 4 | fuv << 5;
     }
+}
+
+static void edge_filter_types(Mav1Encoder *e) {
+  uint8_t *ys = calloc((size_t)e->mi_rows * e->mi_cols, 1), *uvs = calloc((size_t)e->mi_rows * e->mi_cols, 1);
+  edge_types_rows(e, ys, uvs, 0, e->sb_rows);
   free(ys);
   free(uvs);
 }
@@ -448,15 +455,21 @@ static int frame_qindex(const Mav1Encoder *e, int isKey) {
 static size_t run_frame(Mav1Encoder *e, int isKey, uint8_t **tile) {
   setup_params(e, isKey);
 
-  double t0 = now();
-  if (!isKey) e->be->motion_search(e->be, e);
-  double tme = now();
-  e->be->analyze(e->be, e);
-  double tan = now();
-  if (e->cfg.intra_edge_filter) edge_filter_types(e);
-  double t1 = now();
-  e->be->recon(e->be, e);
-  double t2 = now();
+  double t0 = now(), tme, tan, t1, t2;
+  if (e->cfg.turbo && e->be->frame_core) {
+    e->be->frame_core(e->be, e); /* stages overlapped (timed as recon) */
+    tme = tan = t1 = t0;
+    t2 = now();
+  } else {
+    if (!isKey) e->be->motion_search(e->be, e);
+    tme = now();
+    e->be->analyze(e->be, e);
+    tan = now();
+    if (e->cfg.intra_edge_filter) edge_filter_types(e);
+    t1 = now();
+    e->be->recon(e->be, e);
+    t2 = now();
+  }
   build_filter_info(e);
   int cdefOff = (e->leafopt & 4) != 0, nPresets = e->num_cdef_presets;
   if (cdefOff) { /* the filter stage skips CDEF; every superblock codes index 0 */

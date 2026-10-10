@@ -103,6 +103,9 @@ struct Mav1Encoder {
 /* tile_writer.c: entropy codes the whole frame as one tile. */
 size_t write_tile(struct Mav1Encoder *e, uint8_t **out);
 
+/* encoder.c: edge filter types of the blocks of SB rows [row0, row1) */
+void edge_types_rows(struct Mav1Encoder *e, uint8_t *ys, uint8_t *uvs, int row0, int row1);
+
 /* lr_search.c */
 void lr_select(struct Mav1Encoder *e);
 int lr_unit_params(EntEnc *ec, int plane, const void *unit, int refW[2][3], int refX[2]);

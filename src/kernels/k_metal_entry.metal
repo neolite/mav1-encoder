@@ -109,10 +109,12 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
                     device const uint8_t *gold [[buffer(6)]],
                     device int32_t *mvFieldGold [[buffer(7)]],
                     device const uint8_t *hp [[buffer(8)]],
+                    constant int2 &band [[buffer(9)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint lane [[thread_index_in_simdgroup]]) {
   /* groups [0, nodes): LAST, [nodes, 2 * nodes): GOLDEN */
-  int nn = 1 << (2 * level), nodes = fp->sb_cols * fp->sb_rows * nn;
+  /* superblocks [band.x, band.x + band.y) */
+  int nn = 1 << (2 * level), nodes = band.y * nn;
   int g = (int)tg;
   DEV const uint8_t *ds = dec_plane(fp, hp, 0), *dr = dec_plane(fp, hp, 1);
   if (g >= nodes) {
@@ -123,7 +125,7 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
     mvField = mvFieldGold;
     hp += 16 * (long)fp->frame_w * fp->frame_h;
   }
-  int sbIdx = g / nn, i = g % nn;
+  int sbIdx = band.x + g / nn, i = g % nn;
   MeNode m = me_node(fp, sbIdx, level, i, mvField);
   device int32_t *out = mvField + (sbIdx * NUM_NODES + NODE_BASE(level) + i) * 2;
   if (!m.valid) {
@@ -203,12 +205,13 @@ kernel void mav1_analyze(device const FrameParams *fp [[buffer(0)]],
                          constant int &level [[buffer(7)]],
                          device const uint8_t *gold [[buffer(8)]],
                          device const int32_t *mvFieldGold [[buffer(9)]],
+                         constant int2 &band [[buffer(10)]],
                          uint gid [[thread_position_in_grid]]) {
   /* pass 1: one thread per (superblock, node of the level, slot) */
   int ns = level_slots(fp, level), nn = 1 << (2 * level);
-  int total = fp->sb_cols * fp->sb_rows * nn * ns;
+  int total = band.y * nn * ns;
   if ((int)gid >= total) return;
-  int sb = (int)gid / (nn * ns), rem = (int)gid % (nn * ns);
+  int sb = band.x + (int)gid / (nn * ns), rem = (int)gid % (nn * ns);
   analyze_item(fp, sb, level, rem / ns, rem % ns, src, ref, gold, mvField, mvFieldGold, costs, infos,
                scratch + (long)gid * analysis_slot_ints(level));
 }
@@ -718,12 +721,13 @@ kernel void mav1_analyze_coop(device const FrameParams *fp [[buffer(0)]],
                               constant int &level [[buffer(7)]],
                               device const uint8_t *gold [[buffer(8)]],
                               device const int32_t *mvFieldGold [[buffer(9)]],
+                              constant int2 &band [[buffer(10)]],
                               uint gid [[threadgroup_position_in_grid]],
                               uint lane [[thread_index_in_simdgroup]]) {
   threadgroup int eA[EDGE_LEN], eL[EDGE_LEN];
   int ns = level_slots(fp, level), nn = 1 << (2 * level);
-  if ((int)gid >= fp->sb_cols * fp->sb_rows * nn * ns) return;
-  int sbIdx = (int)gid / (nn * ns), rem = (int)gid % (nn * ns);
+  if ((int)gid >= band.y * nn * ns) return;
+  int sbIdx = band.x + (int)gid / (nn * ns), rem = (int)gid % (nn * ns);
   int i = rem / ns, slot = rem % ns;
   int sbRow = sbIdx / fp->sb_cols, sbCol = sbIdx % fp->sb_cols;
   int n = 1 << level, size4 = 16 >> level, halfSz = size4 >> 1;
