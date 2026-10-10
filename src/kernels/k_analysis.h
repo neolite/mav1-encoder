@@ -199,27 +199,27 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
 }
 
 /* Number of blocks of partition p and the k-th block's offset / size
- * (decode order, spec decode_partition). half/quarter in mi units. */
-INLINE int part_block(int p, int bSize, int k, int half, THR int *dr, THR int *dc) {
+ * (decode order, spec decode_partition). halfMi/quarter in mi units. */
+INLINE int part_block(int p, int bSize, int k, int halfMi, THR int *dr, THR int *dc) {
   int sub = Partition_Subsize[p][bSize], split = Partition_Subsize[PARTITION_SPLIT][bSize];
-  int q = half >> 1;
+  int q = halfMi >> 1;
   *dr = 0;
   *dc = 0;
   switch (p) {
-    case PARTITION_HORZ: *dr = k * half; return sub;
-    case PARTITION_VERT: *dc = k * half; return sub;
+    case PARTITION_HORZ: *dr = k * halfMi; return sub;
+    case PARTITION_VERT: *dc = k * halfMi; return sub;
     case PARTITION_HORZ_A:
-      if (k < 2) { *dc = k * half; return split; }
-      *dr = half; return sub;
+      if (k < 2) { *dc = k * halfMi; return split; }
+      *dr = halfMi; return sub;
     case PARTITION_HORZ_B:
       if (k == 0) return sub;
-      *dr = half; *dc = (k - 1) * half; return split;
+      *dr = halfMi; *dc = (k - 1) * halfMi; return split;
     case PARTITION_VERT_A:
-      if (k < 2) { *dr = k * half; return split; }
-      *dc = half; return sub;
+      if (k < 2) { *dr = k * halfMi; return split; }
+      *dc = halfMi; return sub;
     case PARTITION_VERT_B:
       if (k == 0) return sub;
-      *dc = half; *dr = (k - 1) * half; return split;
+      *dc = halfMi; *dr = (k - 1) * halfMi; return split;
     case PARTITION_HORZ_4: *dr = k * q; return sub;
     case PARTITION_VERT_4: *dc = k * q; return sub;
     default: return sub; /* NONE */
@@ -227,25 +227,25 @@ INLINE int part_block(int p, int bSize, int k, int half, THR int *dr, THR int *d
 }
 
 /* Blocks actually decoded for partition p at (r, c) (handles frame edges). */
-INLINE int part_count(DEV const FrameParams *fp, int p, int r, int c, int half) {
-  int hasRows = (r + half) < fp->mi_rows, hasCols = (c + half) < fp->mi_cols;
+INLINE int part_count(DEV const FrameParams *fp, int p, int r, int c, int halfMi) {
+  int hasRows = (r + halfMi) < fp->mi_rows, hasCols = (c + halfMi) < fp->mi_cols;
   if (p == PARTITION_NONE) return 1;
   if (p == PARTITION_HORZ) return hasRows ? 2 : 1;
   if (p == PARTITION_VERT) return hasCols ? 2 : 1;
-  if (p == PARTITION_HORZ_4) return (r + (half >> 1) * 3 < fp->mi_rows) ? 4 : 3;
-  if (p == PARTITION_VERT_4) return (c + (half >> 1) * 3 < fp->mi_cols) ? 4 : 3;
+  if (p == PARTITION_HORZ_4) return (r + (halfMi >> 1) * 3 < fp->mi_rows) ? 4 : 3;
+  if (p == PARTITION_VERT_4) return (c + (halfMi >> 1) * 3 < fp->mi_cols) ? 4 : 3;
   return 3;
 }
 
 /* Cost of a rectangular block of the partition, memoised per call site. */
 INLINE long part_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
-                      DEV const int32_t *mvField, int node, int p, int r, int c, int bSize, int half,
+                      DEV const int32_t *mvField, int node, int p, int r, int c, int bSize, int halfMi,
                       THR const long *noneCost, int childBase, int cn, int ci, DEV int32_t *scratch) {
   long total = 0;
-  int n = part_count(fp, p, r, c, half);
+  int n = part_count(fp, p, r, c, halfMi);
   for (int k = 0; k < n; k++) {
     int dr, dc;
-    int bs = part_block(p, bSize, k, half, &dr, &dc);
+    int bs = part_block(p, bSize, k, halfMi, &dr, &dc);
     if (bs == Partition_Subsize[PARTITION_SPLIT][bSize] && p != PARTITION_HORZ_4 && p != PARTITION_VERT_4 &&
         p != PARTITION_HORZ && p != PARTITION_VERT) {
       /* square quarter: reuse the child's NONE cost */
@@ -340,12 +340,12 @@ INLINE void analyze_sb(DEV const FrameParams *fp, int sbIdx, DEV const uint8_t *
       if (p < 0) break;
       if (p == PARTITION_SPLIT) continue;
       if ((zx & ((1 << shift) - 1)) == 0 && (zy & ((1 << shift) - 1)) == 0) {
-        int size4 = 16 >> level, half = size4 >> 1;
+        int size4 = 16 >> level, halfMi = size4 >> 1;
         int r = sbRow * 16 + (zy >> shift) * size4, c = sbCol * 16 + (zx >> shift) * size4;
-        int nb = part_count(fp, p, r, c, half);
+        int nb = part_count(fp, p, r, c, halfMi);
         for (int k = 0; k < nb; k++) {
           int dr, dc;
-          int bs = part_block(p, level_bsize(level), k, half, &dr, &dc);
+          int bs = part_block(p, level_bsize(level), k, halfMi, &dr, &dc);
           BlockInfo b;
           eval_block(fp, src, ref, mvField, node, r + dr, c + dc, bs, scratch, &b);
           int w = Block_Width(bs), h = Block_Height(bs);
