@@ -164,7 +164,7 @@ static void frame_header(const struct Mav1Encoder *e, BitWriter *w) {
       bw_f(w, 2, h->cdef_uv_sec[i] == 4 ? 3 : h->cdef_uv_sec[i]);
     }
   }
-  if (!codedLossless) bw_f(w, 1, 0); /* tx_mode_select -> TX_MODE_LARGEST */
+  if (!codedLossless) bw_f(w, 1, e->cfg.tx_depth != 0); /* tx_mode_select: TX_MODE_SELECT or TX_MODE_LARGEST */
   if (!intra) bw_f(w, 1, 0);     /* reference_select */
   bw_f(w, 1, 0);                 /* reduced_tx_set */
   if (!intra)

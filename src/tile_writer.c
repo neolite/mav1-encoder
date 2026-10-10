@@ -333,6 +333,50 @@ static void write_block(Tile *t, const BlockInfo *b) {
     else write_intra_modes(t, b, availU, availL, 0);
   }
 
+  /* read_block_tx_size( ) */
+  int lossless = e->hdr.base_q_idx == 0;
+  int txSize = lossless ? TX_4X4 : b->is_inter ? Max_Tx_Size_Rect[bs] : depth_tx_size(bs, b->tx_depth);
+  if (e->cfg.tx_depth && !lossless) {
+    if (b->is_inter && !skip) {
+      /* read_var_tx_size( MiRow, MiCol, maxTxSz, 0 ): one unit (blocks <= 64),
+       * never split */
+      int txSz = Max_Tx_Size_Rect[bs];
+      if (txSz != TX_4X4) {
+        int aboveW = !availU ? 64
+                     : (mi_at(e, r - 1, c)->skip && mi_at(e, r - 1, c)->is_inter)
+                         ? Block_Width(mi_at(e, r - 1, c)->bsize)
+                         : Tx_Width[mi_at(e, r - 1, c)->tx_size];
+        int leftH = !availL ? 64
+                    : (mi_at(e, r, c - 1)->skip && mi_at(e, r, c - 1)->is_inter)
+                        ? Block_Height(mi_at(e, r, c - 1)->bsize)
+                        : Tx_Height[mi_at(e, r, c - 1)->tx_size];
+        int size = k_min(64, k_max(Block_Width(bs), Block_Height(bs)));
+        int maxTxSz = FloorLog2(size) - 2; /* find_tx_size( size, size ) */
+        int ctx = (Tx_Size_Sqr_Up[txSz] != maxTxSz) * 3 + (TX_SIZES - 1 - maxTxSz) * 6 +
+                  (aboveW < Tx_Width[txSz]) + (leftH < Tx_Height[txSz]);
+        ec_symbol(&t->ec, 0, t->cdf.txfm_split[ctx], 2);
+      }
+    } else if (!b->is_inter) {
+      /* read_tx_size( 1 ) */
+      int maxRect = Max_Tx_Size_Rect[bs];
+      int maxTxDepth = Max_Tx_Depth[bs];
+      int aboveW = 0, leftH = 0;
+      if (availU) {
+        const MiInfo *a = mi_at(e, r - 1, c);
+        aboveW = a->is_inter ? Block_Width(a->bsize) : Tx_Width[a->tx_size];
+      }
+      if (availL) {
+        const MiInfo *l = mi_at(e, r, c - 1);
+        leftH = l->is_inter ? Block_Height(l->bsize) : Tx_Height[l->tx_size];
+      }
+      int ctx = (aboveW >= Tx_Width[maxRect]) + (leftH >= Tx_Height[maxRect]);
+      if (maxTxDepth == 4) ec_symbol(&t->ec, b->tx_depth, t->cdf.tx_64x64[ctx], MAX_TX_DEPTH + 1);
+      else if (maxTxDepth == 3) ec_symbol(&t->ec, b->tx_depth, t->cdf.tx_32x32[ctx], MAX_TX_DEPTH + 1);
+      else if (maxTxDepth == 2) ec_symbol(&t->ec, b->tx_depth, t->cdf.tx_16x16[ctx], MAX_TX_DEPTH + 1);
+      else ec_symbol(&t->ec, b->tx_depth, t->cdf.tx_8x8[ctx], MAX_TX_DEPTH);
+    }
+  }
+
   /* Update the mode-info grid (used by later context derivations). */
   for (int y = 0; y < bh4 && r + y < e->mi_rows; y++)
     for (int x = 0; x < bw4 && c + x < e->mi_cols; x++) {
@@ -343,7 +387,7 @@ static void write_block(Tile *t, const BlockInfo *b) {
       m->y_mode = (int8_t)(b->is_inter ? interMode : b->y_mode);
       m->written = 1;
       m->ref0 = (int8_t)(b->is_inter ? LAST_FRAME : INTRA_FRAME);
-      m->tx_size = (int8_t)Max_Tx_Size_Rect[bs];
+      m->tx_size = (int8_t)txSize; /* InterTxSizes */
       m->mv_row = (int16_t)(b->is_inter ? b->mv_row : 0);
       m->mv_col = (int16_t)(b->is_inter ? b->mv_col : 0);
     }
@@ -357,10 +401,9 @@ static void write_block(Tile *t, const BlockInfo *b) {
     return;
   }
   const int32_t *coefs = ENC_COEFS(e);
-  int lossless = e->hdr.base_q_idx == 0;
   for (int plane = 0; plane < 3; plane++) {
     int sub = plane > 0;
-    int txSz = lossless ? TX_4X4 : (plane == 0 ? Max_Tx_Size_Rect[bs] : uv_tx_size(bs, 1, 1));
+    int txSz = lossless ? TX_4X4 : (plane == 0 ? txSize : uv_tx_size(bs, 1, 1));
     int maxX = (e->mi_cols * 4) >> sub, maxY = (e->mi_rows * 4) >> sub;
     int planeSz = Subsampled_Size[bs][sub][sub];
     int tw = Tx_Width[txSz], th = Tx_Height[txSz];
@@ -370,11 +413,11 @@ static void write_block(Tile *t, const BlockInfo *b) {
     int startX = (c >> sub) * 4 + x, startY = (r >> sub) * 4 + y;
     if (startX >= maxX || startY >= maxY) continue;
     const int32_t *q = coefs + b->coef_off[plane] + txIdx * tw * th;
-    txIdx++;
     int planeTxType = lossless ? DCT_DCT
-                      : plane == 0 ? b->tx_type
+                      : plane == 0 ? tx_type_get(b, txIdx)
                                    : chroma_tx_type(txSz, b->is_inter, b->uv_mode, b->tx_type, 0);
-    int eob = lossless ? find_eob(q, get_scan(txSz, DCT_DCT), 16) : b->eob[plane];
+    txIdx++;
+    int eob = find_eob(q, get_scan(txSz, planeTxType), seg_eob(txSz));
     write_coeffs(t, plane, startX, startY, txSz, bs, q, eob, planeTxType,
                  b->is_inter, b->y_mode);
       }

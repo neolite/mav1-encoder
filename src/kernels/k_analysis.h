@@ -166,6 +166,8 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
   out->uv_mode = bestUvMode;
   out->angle_uv = (bestUvMode == bestMode) ? bestDelta : 0;
   out->cfl_alpha_u = out->cfl_alpha_v = 0;
+  out->tx_depth = 0;
+  out->tx_types_lo = out->tx_types_hi = 0;
   out->mv_row = 0;
   out->mv_col = 0;
   out->tx_type = DCT_DCT;
@@ -351,7 +353,7 @@ INLINE void analyze_sb(DEV const FrameParams *fp, int sbIdx, DEV const uint8_t *
           eval_block(fp, src, ref, mvField, node, r + dr, c + dc, bs, scratch, &b);
           int w = Block_Width(bs), h = Block_Height(bs);
           b.coef_off[0] = coefOff;
-          coefOff += fp->lossless ? w * h : k_min(32, w) * k_min(32, h);
+          coefOff += w * h; /* room for split / lossless transforms */
           b.coef_off[1] = coefOff;
           coefOff += (w >> 1) * (h >> 1);
           b.coef_off[2] = coefOff;

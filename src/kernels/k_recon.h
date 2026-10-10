@@ -29,6 +29,7 @@
 #define S_TMP 16384
 #define S_QTRY 21504
 #define S_QBEST 22528
+#define S_SAVE 23552  /* 64x64 uint8 pixel backup for the tx_depth search */
 
 #define BD_DIM 18
 #define BD(p, y, x) bd[(p) * BD_DIM * BD_DIM + ((y) + 1) * BD_DIM + ((x) + 1)]
@@ -59,7 +60,7 @@ INLINE int find_eob(DEV const int32_t *quant, KCONST int32_t *scan, int n) {
 INLINE int code_tx_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV uint8_t *rec, int stride,
                          int x, int y, int txSz, int plane, THR const int *cands, int numCands,
                          DEV int32_t *coefOut, DEV const int32_t *mats, DEV int32_t *scratch,
-                         THR int *outType) {
+                         THR int *outType, THR long *outCost) {
   int w = Tx_Width[txSz], h = Tx_Height[txSz];
   int tw = k_min(32, w), th = k_min(32, h);
   DEV int32_t *resid = scratch + S_RESID;
@@ -93,6 +94,7 @@ INLINE int code_tx_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV 
         }
     }
     *outType = DCT_DCT;
+    *outCost = 0;
     return bestEob;
   }
 
@@ -149,7 +151,125 @@ INLINE int code_tx_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV 
       }
   }
   *outType = bestType;
+  *outCost = bestCost;
   return bestEob;
+}
+
+INLINE int tx_type_get(DEV const BlockInfo *b, int idx) {
+  if (idx >= 16) return DCT_DCT;
+  return idx < 8 ? (b->tx_types_lo >> (4 * idx)) & 15 : (b->tx_types_hi >> (4 * (idx - 8))) & 15;
+}
+
+INLINE void tx_type_set(DEV BlockInfo *b, int idx, int t) {
+  if (idx >= 16) return;
+  if (idx < 8) b->tx_types_lo = (b->tx_types_lo & ~(15 << (4 * idx))) | (t << (4 * idx));
+  else b->tx_types_hi = (b->tx_types_hi & ~(15 << (4 * (idx - 8)))) | (t << (4 * (idx - 8)));
+}
+
+/* Predicts (intra), transforms and reconstructs every transform block of
+ * one plane (spec residual( ) / transform_block( ) order). Returns the RD
+ * cost; MaxLumaW/H follow the spec's definition. */
+INLINE long code_plane(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const uint8_t *src, DEV uint8_t *rec,
+                       DEV int32_t *coefs, DEV const int32_t *mats, DEV int32_t *scratch, THR uint8_t *bd,
+                       int plane, int txSz, THR int *maxLumaW, THR int *maxLumaH) {
+  int bs = b->bsize;
+  int MiRow = b->mi_row, MiCol = b->mi_col;
+  int AvailU = MiRow > 0, AvailL = MiCol > 0;
+  int subX = plane > 0, subY = plane > 0;
+  int planeSz = Subsampled_Size[bs][subX][subY];
+  int num4x4W = Num_4x4_Blocks_Wide[planeSz], num4x4H = Num_4x4_Blocks_High[planeSz];
+  int baseX = (MiCol >> subX) * 4, baseY = (MiRow >> subY) * 4;
+  int stride = fp->stride[plane];
+  DEV uint8_t *px = rec + fp->offset[plane];
+  DEV const uint8_t *spx = src + fp->offset[plane];
+  int stepX = Tx_Width[txSz] >> 2, stepY = Tx_Height[txSz] >> 2;
+  int cands[16];
+  int numCands = 0;
+  int isInter = b->is_inter;
+  if (plane == 0) {
+    int set = get_tx_set(txSz, isInter, fp->reduced_tx_set);
+    if (!fp->tx_search || set == TX_SET_DCTONLY || fp->lossless) {
+      cands[numCands++] = DCT_DCT;
+    } else {
+      for (int t = 0; t < 16; t++)
+        if (is_tx_type_in_set(set, t, isInter)) cands[numCands++] = t;
+    }
+  } else {
+    cands[numCands++] = chroma_tx_type(txSz, isInter, b->uv_mode, b->tx_type, fp->reduced_tx_set);
+  }
+  long total = 0;
+  int txIdx = 0, anyNz = 0;
+  for (int y = 0; y < num4x4H; y += stepY) {
+    for (int x = 0; x < num4x4W; x += stepX) {
+      int startX = baseX + 4 * x, startY = baseY + 4 * y;
+      /* transform_block( ) returns early for blocks outside the frame */
+      if (startX >= ((fp->mi_cols * 4) >> subX) || startY >= ((fp->mi_rows * 4) >> subY)) continue;
+      int row = (startY << subY) >> 2, col = (startX << subX) >> 2;
+      int sbr = row & 15, sbc = col & 15;
+      if (!isInter) {
+        IntraArgs a;
+        a.haveLeft = AvailL || x > 0;
+        a.haveAbove = AvailU || y > 0;
+        a.haveAboveRight = BD(plane, (sbr >> subY) - 1, (sbc >> subX) + stepX);
+        a.haveBelowLeft = BD(plane, (sbr >> subY) + stepY, (sbc >> subX) - 1);
+        int isCfl = plane > 0 && b->uv_mode == UV_CFL_PRED;
+        a.mode = plane == 0 ? b->y_mode : (isCfl ? DC_PRED : b->uv_mode);
+        a.angleDelta = plane == 0 ? b->angle_y : b->angle_uv;
+        a.log2W = Tx_Width_Log2[txSz];
+        a.log2H = Tx_Height_Log2[txSz];
+        a.maxX = ((fp->mi_cols * 4) >> subX) - 1;
+        a.maxY = ((fp->mi_rows * 4) >> subY) - 1;
+        a.edgeFilter = 0;
+        a.filterType = 0;
+        predict_intra(px, stride, startX, startY, a, px + startY * stride + startX, stride);
+        if (isCfl) {
+          DEV int32_t *dc = scratch + S_TMP;
+          DEV uint8_t *d = px + startY * stride + startX;
+          int tw = Tx_Width[txSz], th = Tx_Height[txSz];
+          for (int i = 0; i < th; i++)
+            for (int j = 0; j < tw; j++) dc[i * tw + j] = d[i * stride + j];
+          DEV const uint8_t *luma = rec + fp->offset[0];
+          int alpha;
+          if (txIdx > 0) {
+            alpha = plane == 1 ? b->cfl_alpha_u : b->cfl_alpha_v; /* one alpha per block */
+          } else if (plane == 1) {
+            alpha = cfl_best_alpha(luma, fp->stride[0], startX, startY, *maxLumaW, *maxLumaH, a.log2W, a.log2H, dc,
+                                   spx + startY * stride + startX, stride, d, stride, 0);
+            b->cfl_alpha_u = alpha;
+          } else {
+            /* (0, 0) is not codable: V must be non-zero when U is zero. */
+            alpha = cfl_best_alpha(luma, fp->stride[0], startX, startY, *maxLumaW, *maxLumaH, a.log2W, a.log2H, dc,
+                                   spx + startY * stride + startX, stride, d, stride, b->cfl_alpha_u == 0);
+            b->cfl_alpha_v = alpha;
+          }
+          cfl_predict(luma, fp->stride[0], startX, startY, *maxLumaW, *maxLumaH, a.log2W, a.log2H, alpha, dc, d,
+                      stride);
+        }
+      }
+      if (plane == 0) {
+        *maxLumaW = startX + stepX * 4;
+        *maxLumaH = startY + stepY * 4;
+      }
+      int t = DCT_DCT;
+      long c = 0;
+      int eob = code_tx_block(fp, spx, px, stride, startX, startY, txSz, plane, cands, numCands,
+                              coefs + b->coef_off[plane] + txIdx * Tx_Width[txSz] * Tx_Height[txSz], mats,
+                              scratch, &t, &c);
+      total += c;
+      if (plane == 0) {
+        tx_type_set(b, txIdx, t);
+        if (txIdx == 0) b->tx_type = t;
+      }
+      txIdx++;
+      anyNz |= eob > 0;
+      for (int i = 0; i < stepY; i++)
+        for (int j = 0; j < stepX; j++) BD(plane, (sbr >> subY) + i, (sbc >> subX) + j) = 1;
+    }
+  }
+  /* eob[] is used as a "has coefficients" flag; the writer derives the
+   * eob of each transform from the coefficients. */
+  b->eob[plane] = anyNz;
+  return total;
 }
 
 INLINE void recon_block(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const uint8_t *src, DEV uint8_t *rec,
@@ -157,106 +277,60 @@ INLINE void recon_block(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const u
                         DEV int32_t *scratch, THR uint8_t *bd) {
   int bs = b->bsize;
   int MiRow = b->mi_row, MiCol = b->mi_col;
-  int AvailU = MiRow > 0, AvailL = MiCol > 0;
-  int lumaTxType = DCT_DCT;
+  int maxLumaW = 0, maxLumaH = 0;
+  b->tx_depth = 0;
   for (int plane = 0; plane < 3; plane++) {
     int subX = plane > 0, subY = plane > 0;
-    int txSz = fp->lossless ? TX_4X4 : (plane == 0 ? Max_Tx_Size_Rect[bs] : uv_tx_size(bs, subX, subY));
-    int planeSz = Subsampled_Size[bs][subX][subY];
-    int num4x4W = Num_4x4_Blocks_Wide[planeSz], num4x4H = Num_4x4_Blocks_High[planeSz];
-    int baseX = (MiCol >> subX) * 4, baseY = (MiRow >> subY) * 4;
     int stride = fp->stride[plane];
-    DEV uint8_t *px = rec + fp->offset[plane];
-    DEV const uint8_t *spx = src + fp->offset[plane];
+    int baseX = (MiCol >> subX) * 4, baseY = (MiRow >> subY) * 4;
     if (b->is_inter) {
       predict_inter_block(ref + fp->offset[plane], stride, fp->frame_w, fp->frame_h,
-                          px + baseY * stride + baseX, stride, baseX, baseY, Block_Width(bs) >> subX, Block_Height(bs) >> subY,
-                          b->mv_row, b->mv_col, subX, subY, EIGHTTAP, scratch + S_TMP);
+                          rec + fp->offset[plane] + baseY * stride + baseX, stride, baseX, baseY,
+                          Block_Width(bs) >> subX, Block_Height(bs) >> subY, b->mv_row, b->mv_col, subX, subY,
+                          EIGHTTAP, scratch + S_TMP);
     }
-    int stepX = Tx_Width[txSz] >> 2, stepY = Tx_Height[txSz] >> 2;
-    int cands[16];
-    int numCands = 0;
-    int isInter = b->is_inter;
-    if (plane == 0) {
-      int set = get_tx_set(txSz, isInter, fp->reduced_tx_set);
-      if (!fp->tx_search || set == TX_SET_DCTONLY || fp->lossless) {
-        cands[numCands++] = DCT_DCT;
-      } else {
-        for (int t = 0; t < 16; t++)
-          if (is_tx_type_in_set(set, t, isInter)) cands[numCands++] = t;
+    if (fp->lossless) {
+      code_plane(fp, b, src, rec, coefs, mats, scratch, bd, plane, TX_4X4, &maxLumaW, &maxLumaH);
+      continue;
+    }
+    if (plane > 0) {
+      code_plane(fp, b, src, rec, coefs, mats, scratch, bd, plane, uv_tx_size(bs, subX, subY), &maxLumaW,
+                 &maxLumaH);
+      continue;
+    }
+    int maxDepth = (!b->is_inter && fp->tx_mode_select) ? k_min(MAX_TX_DEPTH, Max_Tx_Depth[bs]) : 0;
+    if (maxDepth == 0) {
+      code_plane(fp, b, src, rec, coefs, mats, scratch, bd, 0, Max_Tx_Size_Rect[bs], &maxLumaW, &maxLumaH);
+      continue;
+    }
+    /* tx_depth RD search: code the luma plane at each depth from the same
+     * starting state (pixels and BlockDecoded flags), keep the best. */
+    int w = Block_Width(bs), h = Block_Height(bs);
+    DEV uint8_t *save = (DEV uint8_t *)(scratch + S_SAVE);
+    DEV uint8_t *px = rec + fp->offset[0] + baseY * stride + baseX;
+    for (int i = 0; i < h; i++)
+      for (int j = 0; j < w; j++) save[i * w + j] = px[i * stride + j];
+    uint8_t bdSave[BD_DIM * BD_DIM];
+    for (int i = 0; i < BD_DIM * BD_DIM; i++) bdSave[i] = bd[i];
+    long best = -1;
+    int bestD = 0;
+    for (int d = 0; d <= maxDepth + 1; d++) {
+      int depth = d <= maxDepth ? d : bestD; /* final pass re-codes the winner */
+      if (d == maxDepth + 1 && bestD == maxDepth) break; /* state already holds the winner */
+      if (d > 0) {
+        for (int i = 0; i < h; i++)
+          for (int j = 0; j < w; j++) px[i * stride + j] = save[i * w + j];
+        for (int i = 0; i < BD_DIM * BD_DIM; i++) bd[i] = bdSave[i];
       }
-    } else {
-      cands[numCands++] = chroma_tx_type(txSz, isInter, b->uv_mode, lumaTxType, fp->reduced_tx_set);
-    }
-    int txIdx = 0, anyNz = 0;
-    for (int y = 0; y < num4x4H; y += stepY) {
-      for (int x = 0; x < num4x4W; x += stepX) {
-        int startX = baseX + 4 * x, startY = baseY + 4 * y;
-        /* transform_block( ) returns early for blocks outside the frame */
-        if (startX >= ((fp->mi_cols * 4) >> subX) || startY >= ((fp->mi_rows * 4) >> subY)) continue;
-        int row = (startY << subY) >> 2, col = (startX << subX) >> 2;
-        int sbr = row & 15, sbc = col & 15;
-        if (!isInter) {
-          IntraArgs a;
-          a.haveLeft = AvailL || x > 0;
-          a.haveAbove = AvailU || y > 0;
-          a.haveAboveRight = BD(plane, (sbr >> subY) - 1, (sbc >> subX) + stepX);
-          a.haveBelowLeft = BD(plane, (sbr >> subY) + stepY, (sbc >> subX) - 1);
-          int isCfl = plane > 0 && b->uv_mode == UV_CFL_PRED;
-          a.mode = plane == 0 ? b->y_mode : (isCfl ? DC_PRED : b->uv_mode);
-          a.angleDelta = plane == 0 ? b->angle_y : b->angle_uv;
-          a.log2W = Tx_Width_Log2[txSz];
-          a.log2H = Tx_Height_Log2[txSz];
-          a.maxX = ((fp->mi_cols * 4) >> subX) - 1;
-          a.maxY = ((fp->mi_rows * 4) >> subY) - 1;
-          a.edgeFilter = 0;
-          a.filterType = 0;
-          predict_intra(px, stride, startX, startY, a, px + startY * stride + startX, stride);
-          if (isCfl) {
-            /* MaxLumaW/H: end of the (single) luma transform block. */
-            int lw = Tx_Width[Max_Tx_Size_Rect[bs]], lh = Tx_Height[Max_Tx_Size_Rect[bs]];
-            int maxLumaW = MiCol * 4 + lw, maxLumaH = MiRow * 4 + lh;
-            if (fp->lossless) { /* end of the last decoded 4x4 luma transform */
-              maxLumaW = k_min(MiCol * 4 + Block_Width(bs), fp->mi_cols * 4);
-              maxLumaH = k_min(MiRow * 4 + Block_Height(bs), fp->mi_rows * 4);
-            }
-            DEV int32_t *dc = scratch + S_TMP;
-            DEV uint8_t *d = px + startY * stride + startX;
-            int tw = Tx_Width[txSz], th = Tx_Height[txSz];
-            for (int i = 0; i < th; i++)
-              for (int j = 0; j < tw; j++) dc[i * tw + j] = d[i * stride + j];
-            DEV const uint8_t *luma = rec + fp->offset[0];
-            int alpha;
-            if (txIdx > 0) {
-              alpha = plane == 1 ? b->cfl_alpha_u : b->cfl_alpha_v; /* one alpha per block */
-            } else if (plane == 1) {
-              alpha = cfl_best_alpha(luma, fp->stride[0], startX, startY, maxLumaW, maxLumaH, a.log2W, a.log2H, dc,
-                                     spx + startY * stride + startX, stride, d, stride, 0);
-              b->cfl_alpha_u = alpha;
-            } else {
-              /* (0, 0) is not codable: V must be non-zero when U is zero. */
-              alpha = cfl_best_alpha(luma, fp->stride[0], startX, startY, maxLumaW, maxLumaH, a.log2W, a.log2H, dc,
-                                     spx + startY * stride + startX, stride, d, stride, b->cfl_alpha_u == 0);
-              b->cfl_alpha_v = alpha;
-            }
-            cfl_predict(luma, fp->stride[0], startX, startY, maxLumaW, maxLumaH, a.log2W, a.log2H, alpha, dc, d,
-                        stride);
-          }
-        }
-        int t = DCT_DCT;
-        int eob = code_tx_block(fp, spx, px, stride, startX, startY, txSz, plane, cands, numCands,
-                                coefs + b->coef_off[plane] + txIdx * Tx_Width[txSz] * Tx_Height[txSz], mats,
-                                scratch, &t);
-        txIdx++;
-        anyNz |= eob > 0;
-        /* eob[] is the eob of the single transform, or a non-zero flag when
-         * the plane has several (lossless) */
-        b->eob[plane] = fp->lossless ? anyNz : eob;
-        if (plane == 0) { lumaTxType = t; b->tx_type = t; }
-        for (int i = 0; i < stepY; i++)
-          for (int j = 0; j < stepX; j++) BD(plane, (sbr >> subY) + i, (sbc >> subX) + j) = 1;
+      long c = code_plane(fp, b, src, rec, coefs, mats, scratch, bd, 0, depth_tx_size(bs, depth), &maxLumaW,
+                          &maxLumaH) + (long)fp->lambda * 8 * depth;
+      if (d <= maxDepth && (best < 0 || c < best)) {
+        best = c;
+        bestD = depth;
       }
+      if (d == maxDepth + 1) break;
     }
+    b->tx_depth = bestD;
   }
 }
 

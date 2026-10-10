@@ -9,8 +9,9 @@
 
 #include "k_scan.h"
 
-INLINE int lf_tx_size(int miSize, int plane) {
-  return plane == 0 ? Max_Tx_Size_Rect[miSize] : uv_tx_size(miSize, 1, 1);
+/* info = MiSize | skip << 5 | tx_depth << 6 (LoopfilterTxSizes of the block). */
+INLINE int lf_tx_size(int info, int plane) {
+  return plane == 0 ? depth_tx_size(info & 31, (info >> 6) & 3) : uv_tx_size(info & 31, 1, 1);
 }
 
 INLINE void lf_sample(DEV uint8_t *px, int pitch /* step across the edge */, int plane, int lvl, int sharp,
@@ -115,10 +116,10 @@ INLINE void lf_line(DEV const FrameParams *fp, DEV uint8_t *rec, DEV const uint8
     if (pass == 1 && y == 0) continue;
     int xP = x >> sub, yP = y >> sub;
     int prevRow = row - (dy << sub), prevCol = col - (dx << sub);
-    int miSize = miSizes[row * fp->mi_cols + col] & 31;
-    int txSz = lf_tx_size(miSize, plane);
-    int prevTxSz = lf_tx_size(miSizes[prevRow * fp->mi_cols + prevCol] & 31, plane);
-    /* Every transform edge is a block edge here, so applyFilter = isTxEdge. */
+    int txSz = lf_tx_size(miSizes[row * fp->mi_cols + col], plane);
+    int prevTxSz = lf_tx_size(miSizes[prevRow * fp->mi_cols + prevCol], plane);
+    /* Inner transform edges only occur in intra blocks, which are always
+     * filtered, so applyFilter = isTxEdge. */
     int isTxEdge = pass == 0 ? (xP % Tx_Width[txSz]) == 0 : (yP % Tx_Height[txSz]) == 0;
     if (!isTxEdge) continue;
     int baseSize = pass == 0 ? k_min(Tx_Width[prevTxSz], Tx_Width[txSz]) : k_min(Tx_Height[prevTxSz], Tx_Height[txSz]);

@@ -45,6 +45,7 @@ void mav1_default_config(Mav1Config *cfg, int width, int height) {
   cfg->use_metal = 1;
   cfg->keyint = 0;
   cfg->tx_search = 1;
+  cfg->tx_depth = 1;
   cfg->loop_filter = 1;
   cfg->cdef = 1;
   cfg->me_range = 32;
@@ -178,6 +179,7 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   fp->enable_intra_edge_filter = 0;
   fp->tx_search = e->cfg.tx_search;
   fp->lossless = q == 0;
+  fp->tx_mode_select = q != 0 && e->cfg.tx_depth;
   long acq = fp->ac_q[0];
   fp->lambda = (int32_t)(acq * acq * 256 / 430);
   fp->frame_w = e->w;
@@ -218,7 +220,7 @@ static void build_filter_info(Mav1Encoder *e) {
       int bw4 = Num_4x4_Blocks_Wide[b->bsize], bh4 = Num_4x4_Blocks_High[b->bsize];
       for (int y = 0; y < bh4 && b->mi_row + y < e->mi_rows; y++)
         for (int x = 0; x < bw4 && b->mi_col + x < e->mi_cols; x++)
-          info[(b->mi_row + y) * e->mi_cols + b->mi_col + x] = (uint8_t)(b->bsize | (skip << 5));
+          info[(b->mi_row + y) * e->mi_cols + b->mi_col + x] = (uint8_t)(b->bsize | (skip << 5) | (b->tx_depth << 6));
     }
 }
 

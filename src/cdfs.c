@@ -44,6 +44,11 @@ void cdf_init(CdfContext *c, int base_q_idx) {
     COPY(c->mv_fr[comp], Default_Mv_Fr_Cdf[comp]);
     COPY(c->mv_hp[comp], Default_Mv_Hp_Cdf);
   }
+  COPY(c->tx_8x8, Default_Tx_8x8_Cdf);
+  COPY(c->tx_16x16, Default_Tx_16x16_Cdf);
+  COPY(c->tx_32x32, Default_Tx_32x32_Cdf);
+  COPY(c->tx_64x64, Default_Tx_64x64_Cdf);
+  COPY(c->txfm_split, Default_Txfm_Split_Cdf);
   int idx = base_q_idx <= 20 ? 0 : base_q_idx <= 60 ? 1 : base_q_idx <= 120 ? 2 : 3;
   COPY(c->txb_skip, Default_Txb_Skip_Cdf[idx]);
   COPY(c->eob_pt_16, Default_Eob_Pt_16_Cdf[idx]);

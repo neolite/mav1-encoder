@@ -40,6 +40,11 @@ typedef struct {
   uint16_t mv_bit[2][MV_OFFSET_BITS][3];
   uint16_t mv_fr[2][MV_JOINTS + 1];
   uint16_t mv_hp[2][3];
+  uint16_t tx_8x8[TX_SIZE_CONTEXTS][MAX_TX_DEPTH + 1];
+  uint16_t tx_16x16[TX_SIZE_CONTEXTS][MAX_TX_DEPTH + 2];
+  uint16_t tx_32x32[TX_SIZE_CONTEXTS][MAX_TX_DEPTH + 2];
+  uint16_t tx_64x64[TX_SIZE_CONTEXTS][MAX_TX_DEPTH + 2];
+  uint16_t txfm_split[TXFM_PARTITION_CONTEXTS][3];
   /* coefficients (already indexed by the quantizer context) */
   uint16_t txb_skip[TX_SIZES][TXB_SKIP_CONTEXTS][3];
   uint16_t eob_pt_16[PLANE_TYPES][2][6];

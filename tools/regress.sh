@@ -1,24 +1,33 @@
 #!/bin/zsh
 # Bit-exactness regression: encoder recon vs dav1d and aomdec, Metal vs CPU bitstream.
-# usage: regress.sh <encoder> [extra encoder flags...]
-enc=$1; shift
-fail=0
-for clip in media/ts352.y4m media/mb203.y4m; do
-  for q in 0 1 40 100 180 255; do
-    $enc -i $clip -o r_cpu.ivf -r r_rec.y4m -n 5 --cpu -q $q "$@" >/dev/null 2>&1 || { echo "$clip q=$q encode FAILED"; fail=1; continue; }
-    $enc -i $clip -o r_mtl.ivf -n 5 --metal -q $q "$@" >/dev/null 2>&1
-    dav1d -q -i r_cpu.ivf -o r_d.y4m 2>/dev/null
-    aomdec --rawvideo -o r_a.yuv r_cpu.ivf 2>/dev/null
-    hl=$(head -1 r_rec.y4m | wc -c)
-    python3 -c "
-import sys
-d=open('r_rec.y4m','rb').read(); a=open('r_a.yuv','rb').read()
+# Every (clip, q) case runs in its own directory, all cases in parallel.
+# usage: regress.sh <encoder> [extra encoder flags...]   (JOBS=N to limit)
+enc=${1:A}; shift
+flags="$*"
+tmp=$(mktemp -d)
+sdir=${0:A:h}
+export enc flags tmp sdir
+one() {
+  clip=$1 q=$2
+  dir=$tmp/$(basename $clip .y4m)_$q; mkdir -p $dir
+  ${=enc} -i $clip -o $dir/cpu.ivf -r $dir/rec.y4m -n 5 --cpu -q $q ${=flags} >/dev/null 2>&1 || { echo "FAIL $(basename $clip) q=$q encode"; return; }
+  ${=enc} -i $clip -o $dir/mtl.ivf -n 5 --metal -q $q ${=flags} >/dev/null 2>&1
+  dav1d -q -i $dir/cpu.ivf -o $dir/d.y4m 2>/dev/null
+  aomdec --rawvideo -o $dir/a.yuv $dir/cpu.ivf 2>/dev/null
+  a=$(python3 -c "
+d=open('$dir/rec.y4m','rb').read(); a=open('$dir/a.yuv','rb').read()
 fr=[x[x.index(b'\n')+1:] for x in d.split(b'FRAME')[1:]]
-print('aom_ok' if b''.join(fr)==a else 'aom_DIFF')" > r_aom.txt
-    d=$(python3 ../tools/y4mcmp.py r_rec.y4m r_d.y4m | head -1)
-    cmp -s r_cpu.ivf r_mtl.ivf && m=metal==cpu || { m=METAL_DIFF; fail=1; }
-    a=$(bat --plain r_aom.txt); [[ $a == aom_ok && $d == identical* ]] || fail=1
-    echo "$(basename $clip) q=$q $(stat -f%z r_cpu.ivf)B dav1d:[$d] $a $m"
-  done
+print('aom_ok' if b''.join(fr)==a else 'aom_DIFF')")
+  d=$(python3 $sdir/y4mcmp.py $dir/rec.y4m $dir/d.y4m 2>&1 | head -1)
+  cmp -s $dir/cpu.ivf $dir/mtl.ivf && m=metal==cpu || m=METAL_DIFF
+  st=ok; [[ $a == aom_ok && $d == identical* && $m == metal==cpu ]] || st=FAIL
+  echo "$st $(basename $clip) q=$q $(stat -f%z $dir/cpu.ivf)B dav1d:[$d] $a $m"
+}
+cases=()
+for clip in media/ts352.y4m media/mb203.y4m; do
+  for q in 0 1 40 100 180 255; do cases+=("$clip $q"); done
 done
-exit $fail
+out=$(printf '%s\n' "${cases[@]}" | xargs -P ${JOBS:-$(sysctl -n hw.ncpu)} -L1 zsh -c "$(functions one); one \$1 \$2" _ | sort -k2,2 -k3,3V)
+rm -rf $tmp
+print -r -- "$out"
+[[ $out != *FAIL* ]]

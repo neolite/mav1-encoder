@@ -23,6 +23,7 @@ typedef struct {
   int use_metal;       /* 1: Metal backend, 0: CPU backend */
   int keyint;          /* key frame interval (0: only the first frame) */
   int tx_search;       /* closed-loop luma transform type search */
+  int tx_depth;        /* TX_MODE_SELECT: intra transform split (tx_depth) RD search */
   int loop_filter;     /* deblocking filter */
   int cdef;            /* constrained directional enhancement filter */
   int me_range;        /* full-pel motion search range */

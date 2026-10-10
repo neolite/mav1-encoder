@@ -59,6 +59,7 @@ typedef struct {
   int32_t frame_w, frame_h;           /* real (cropped) luma frame size */
   int32_t me_range;                   /* full-pel motion search range */
   int32_t lossless;                   /* CodedLossless (base_q_idx == 0) */
+  int32_t tx_mode_select;             /* TxMode == TX_MODE_SELECT */
   int32_t lf_level[4];                /* loop_filter_level[] */
   int32_t lf_sharpness;
   int32_t cdef_damping, cdef_bits;
@@ -77,6 +78,8 @@ typedef struct {
   int32_t eob[3];
   int32_t coef_off[3];                  /* offsets into the coefficient buffer */
   int32_t cfl_alpha_u, cfl_alpha_v;     /* CflAlphaU/V when uv_mode == UV_CFL_PRED */
+  int32_t tx_depth;                     /* intra tx_depth (TX_MODE_SELECT) */
+  int32_t tx_types_lo, tx_types_hi;     /* luma TxType of each transform, 4 bits each (raster) */
   int32_t pad0;
 } BlockInfo;
 
@@ -86,5 +89,12 @@ typedef struct {
   int32_t sb_row, sb_col;
   int32_t part[85];                     /* partition per square node (-1 outside) */
 } SbInfo;
+
+/* Luma transform size of an intra block for the given tx_depth. */
+INLINE int depth_tx_size(int bs, int depth) {
+  int t = Max_Tx_Size_Rect[bs];
+  for (int i = 0; i < depth; i++) t = Split_Tx_Size[t];
+  return t;
+}
 
 #endif
