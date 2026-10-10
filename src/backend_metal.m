@@ -354,35 +354,58 @@ static void mtl_destroy(Backend *b) {
 Backend *backend_metal_create(struct Mav1Encoder *e, char *err, size_t errlen) {
   (void)e;
   @autoreleasepool {
-    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-    if (!dev) {
-      snprintf(err, errlen, "no Metal device");
-      return NULL;
-    }
-    MTLCompileOptions *opt = [MTLCompileOptions new];
-    opt.mathMode = MTLMathModeSafe;
-    NSError *nerr = nil;
-    id<MTLLibrary> lib = [dev newLibraryWithSource:@(kMav1KernelSource) options:opt error:&nerr];
-    if (!lib) {
-      snprintf(err, errlen, "Metal kernel compilation failed: %s", nerr.localizedDescription.UTF8String);
+    /* the library and pipelines are built once per process; every backend
+     * (frame engine) has its own command queue and buffer wrappers */
+    static Mav1MetalState *proto;
+    static dispatch_once_t once;
+    static char perr[256];
+    dispatch_once(&once, ^{
+      Mav1MetalState *s = [Mav1MetalState new];
+      perr[0] = 0;
+      id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+      if (!dev) {
+        snprintf(perr, sizeof perr, "no Metal device");
+        return;
+      }
+      MTLCompileOptions *opt = [MTLCompileOptions new];
+      opt.mathMode = MTLMathModeSafe;
+      NSError *nerr = nil;
+      id<MTLLibrary> lib = [dev newLibraryWithSource:@(kMav1KernelSource) options:opt error:&nerr];
+      if (!lib) {
+        snprintf(perr, sizeof perr, "Metal kernel compilation failed: %s", nerr.localizedDescription.UTF8String);
+        return;
+      }
+      s.device = dev;
+      s.analyze = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_analyze"] error:&nerr];
+      s.analyzeCoop = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_analyze_coop"] error:&nerr];
+      s.recon = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_recon"] error:&nerr];
+      s.me = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_me"] error:&nerr];
+      s.hpel = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_hpel"] error:&nerr];
+      s.lf = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_lf"] error:&nerr];
+      s.cdef = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_cdef"] error:&nerr];
+      s.lr = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_lr"] error:&nerr];
+      if (!s.analyze || !s.analyzeCoop || !s.recon || !s.me || !s.hpel || !s.lf || !s.cdef || !s.lr) {
+        snprintf(perr, sizeof perr, "pipeline creation failed: %s", nerr.localizedDescription.UTF8String);
+        return;
+      }
+      proto = s;
+    });
+    if (!proto) {
+      snprintf(err, errlen, "%s", perr);
       return NULL;
     }
     Mav1MetalState *s = [Mav1MetalState new];
-    s.device = dev;
-    s.queue = [dev newCommandQueue];
+    s.device = proto.device;
+    s.analyze = proto.analyze;
+    s.analyzeCoop = proto.analyzeCoop;
+    s.recon = proto.recon;
+    s.me = proto.me;
+    s.hpel = proto.hpel;
+    s.lf = proto.lf;
+    s.cdef = proto.cdef;
+    s.lr = proto.lr;
+    s.queue = [s.device newCommandQueue];
     s.buffers = [NSMutableDictionary new];
-    s.analyze = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_analyze"] error:&nerr];
-    s.analyzeCoop = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_analyze_coop"] error:&nerr];
-    s.recon = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_recon"] error:&nerr];
-    s.me = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_me"] error:&nerr];
-    s.hpel = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_hpel"] error:&nerr];
-    s.lf = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_lf"] error:&nerr];
-    s.cdef = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_cdef"] error:&nerr];
-    s.lr = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_lr"] error:&nerr];
-    if (!s.analyze || !s.analyzeCoop || !s.recon || !s.me || !s.hpel || !s.lf || !s.cdef || !s.lr) {
-      snprintf(err, errlen, "pipeline creation failed: %s", nerr.localizedDescription.UTF8String);
-      return NULL;
-    }
     MetalBackend *m = calloc(1, sizeof(*m));
     m->base.name = "metal";
     m->base.motion_search = mtl_motion_search;

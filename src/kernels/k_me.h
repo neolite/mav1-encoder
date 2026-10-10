@@ -17,8 +17,37 @@
 
 /* SAD of a w x w block against the reference at full-pel offset (dy, dx),
  * with reference coordinates clamped to the frame like the predictor. */
+#ifdef __METAL_VERSION__
+/* 4x4 SATD of the rows of differences r0..r3 (vertical butterflies on the
+ * row vectors, then horizontal ones): equals satd4x4. */
+INLINE int satd4x4_v(int4 r0, int4 r1, int4 r2, int4 r3) {
+  int4 a0 = r0 + r1, a1 = r0 - r1, a2 = r2 + r3, a3 = r2 - r3;
+  int4 t[4] = {a0 + a2, a1 + a3, a0 - a2, a1 - a3};
+  int s = 0;
+  for (int i = 0; i < 4; i++) {
+    int4 u = t[i].xxzz + t[i].yyww * int4(1, -1, 1, -1);
+    int4 v = u.xyxy + u.zwzw * int4(1, 1, -1, -1);
+    uint4 a = uint4(abs(v));
+    s += (int)(a.x + a.y + a.z + a.w);
+  }
+  return s;
+}
+#endif
+
 INLINE int me_sad(DEV const uint8_t *src, DEV const uint8_t *ref, int stride, int frameW, int frameH, int x, int y,
                   int w, int dy, int dx) {
+#ifdef __METAL_VERSION__
+  if (x + dx >= 0 && x + dx + w <= frameW && y + dy >= 0 && y + dy + w <= frameH) {
+    /* no clamping: 4 samples per load */
+    uint4 acc = 0;
+    for (int i = 0; i < w; i++) {
+      DEV const packed_uchar4 *s = (DEV const packed_uchar4 *)(src + (y + i) * stride + x);
+      DEV const packed_uchar4 *r = (DEV const packed_uchar4 *)(ref + (y + i + dy) * stride + x + dx);
+      for (int j = 0; j < (w >> 2); j++) acc += uint4(absdiff(uchar4(s[j]), uchar4(r[j])));
+    }
+    return (int)(acc.x + acc.y + acc.z + acc.w);
+  }
+#endif
   int sad = 0;
   for (int i = 0; i < w; i++) {
     int ry = Clip3(0, frameH - 1, y + i + dy);
@@ -266,8 +295,17 @@ INLINE int me_unit_satd_hp(DEV const FrameParams *fp, DEV const uint8_t *src, DE
   int ux = m->x + (u % nu) * 4, uy = m->y + (u / nu) * 4;
   DEV const uint8_t *pl = qp + (size_t)(((mvr >> 1) & 3) * 4 + ((mvc >> 1) & 3)) * W * H;
   int iy = uy + (mvr >> 3), ix = ux + (mvc >> 3);
-  int32_t d[16];
   DEV const uint8_t *sp = src + fp->offset[0] + uy * fp->stride[0] + ux;
+#ifdef __METAL_VERSION__
+  if (iy >= 0 && iy + 4 <= H && ix >= 0 && ix + 4 <= W) {
+    int4 r[4];
+    for (int k = 0; k < 4; k++)
+      r[k] = int4(uchar4(*(DEV const packed_uchar4 *)(sp + k * fp->stride[0]))) -
+             int4(uchar4(*(DEV const packed_uchar4 *)(pl + (size_t)(iy + k) * W + ix)));
+    return satd4x4_v(r[0], r[1], r[2], r[3]);
+  }
+#endif
+  int32_t d[16];
   for (int r = 0; r < 4; r++) {
     DEV const uint8_t *row = pl + (size_t)Clip3(0, H - 1, iy + r) * W;
     for (int c = 0; c < 4; c++) d[r * 4 + c] = (int)sp[r * fp->stride[0] + c] - (int)row[Clip3(0, W - 1, ix + c)];

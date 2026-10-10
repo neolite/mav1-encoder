@@ -42,6 +42,7 @@ static void buf_free(Buf *b) {
 }
 
 static int wctx_init(Mav1Encoder *e);
+static Mav1Encoder *create_enc(const Mav1Config *cfg, int isEngine, char *err, size_t errlen);
 static void wctx_free(Mav1Encoder *e);
 
 void mav1_default_config(Mav1Config *cfg, int width, int height) {
@@ -61,7 +62,7 @@ void mav1_default_config(Mav1Config *cfg, int width, int height) {
   cfg->me_range = 32;
 }
 
-Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
+static Mav1Encoder *create_enc(const Mav1Config *cfg, int isEngine, char *err, size_t errlen) {
   if (cfg->width < 16 || cfg->height < 16 || cfg->width > 65536 || cfg->height > 65536) {
     snprintf(err, errlen, "unsupported frame size %dx%d", cfg->width, cfg->height);
     return NULL;
@@ -114,13 +115,17 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
   e->offset[2] = e->offset[1] + e->stride[1] * e->plane_h[1];
   e->frame_bytes = (size_t)e->offset[2] + (size_t)e->stride[2] * e->plane_h[2];
 
+  /* turbo driver: the frames are coded by the engines; the driver keeps
+   * only the reference slots (and no backend) */
+  int drv = !isEngine && e->cfg.turbo && e->cfg.altref && !getenv("MAV1_NOASYNC") && !getenv("MAV1_NOPAR");
+#define SZ(x) (drv ? 0 : (x))
   int ok = 0;
-  ok |= buf_alloc(&e->src, e->frame_bytes);
-  ok |= buf_alloc(&e->rec, e->frame_bytes);
-  ok |= buf_alloc(&e->ref, e->frame_bytes);
+  ok |= buf_alloc(&e->src, SZ(e->frame_bytes));
+  ok |= buf_alloc(&e->rec, SZ(e->frame_bytes));
+  ok |= buf_alloc(&e->ref, SZ(e->frame_bytes));
   int ref2 = e->cfg.multi_ref || e->cfg.altref;
-  if (ref2) ok |= buf_alloc(&e->gold, e->frame_bytes);
-  if (e->cfg.altref) {
+  if (ref2) ok |= buf_alloc(&e->gold, SZ(e->frame_bytes));
+  if (e->cfg.altref && !isEngine) {
     ok |= buf_alloc(&e->slot[0], e->frame_bytes);
     ok |= buf_alloc(&e->slot[2], e->frame_bytes);
     ok |= buf_alloc(&e->slot[3], e->frame_bytes);
@@ -129,14 +134,14 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
     e->inq = calloc((size_t)e->cfg.altref + 1, sizeof *e->inq);
   }
   ok |= buf_alloc(&e->params, sizeof(FrameParams));
-  ok |= buf_alloc(&e->blocks, sizeof(BlockInfo) * MAX_BLOCKS_PER_SB * e->num_sbs);
-  ok |= buf_alloc(&e->sbs, sizeof(SbInfo) * e->num_sbs);
-  ok |= buf_alloc(&e->coefs, sizeof(int32_t) * COEFS_PER_SB * e->num_sbs);
+  ok |= buf_alloc(&e->blocks, SZ(sizeof(BlockInfo) * MAX_BLOCKS_PER_SB * e->num_sbs));
+  ok |= buf_alloc(&e->sbs, SZ(sizeof(SbInfo) * e->num_sbs));
+  ok |= buf_alloc(&e->coefs, SZ(sizeof(int32_t) * COEFS_PER_SB * e->num_sbs));
   ok |= buf_alloc(&e->mats, sizeof(int32_t) * FWD_SLOT_SIZE * FWD_NUM_SLOTS);
-  ok |= buf_alloc(&e->mvfield, sizeof(int32_t) * 2 * NUM_NODES * e->num_sbs);
-  ok |= buf_alloc(&e->mvgold, ref2 ? sizeof(int32_t) * 2 * NUM_NODES * e->num_sbs : 0);
-  ok |= buf_alloc(&e->acosts, sizeof(long) * A_ITEMS * (size_t)e->num_sbs);
-  ok |= buf_alloc(&e->ainfos, sizeof(BlockInfo) * A_ITEMS * (size_t)e->num_sbs);
+  ok |= buf_alloc(&e->mvfield, SZ(sizeof(int32_t) * 2 * NUM_NODES * e->num_sbs));
+  ok |= buf_alloc(&e->mvgold, SZ(ref2 ? sizeof(int32_t) * 2 * NUM_NODES * e->num_sbs : 0));
+  ok |= buf_alloc(&e->acosts, SZ(sizeof(long) * A_ITEMS * (size_t)e->num_sbs));
+  ok |= buf_alloc(&e->ainfos, SZ(sizeof(BlockInfo) * A_ITEMS * (size_t)e->num_sbs));
   {
     /* pass-1 GPU scratch: the largest level dispatch (threads x slot size) */
     size_t mx = 0;
@@ -144,22 +149,24 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
       size_t t = (size_t)e->num_sbs * (1u << (2 * l)) * (l == 3 ? 1 : l == 2 ? 5 : A_SLOTS) * analysis_slot_ints(l);
       if (t > mx) mx = t;
     }
-    ok |= buf_alloc(&e->ascratch, sizeof(int32_t) * mx);
+    ok |= buf_alloc(&e->ascratch, SZ(sizeof(int32_t) * mx));
   }
-  ok |= buf_alloc(&e->hpel, e->cfg.turbo ? (size_t)(ME_QP_ENTRIES * 16 + 1) * e->w * e->h + (size_t)(ME_QP_ENTRIES + 1) * ((e->w + 3) >> 2) * ((e->h + 3) >> 2) : 0);
-  ok |= buf_alloc(&e->mescratch, sizeof(int32_t) * ME_SB_INTS * (size_t)e->num_sbs);
-  ok |= buf_alloc(&e->scratch, sizeof(int32_t) * SCRATCH_INTS * (size_t)e->num_sbs);
-  ok |= buf_alloc(&e->lfmask, (size_t)e->mi_rows * e->mi_cols);
-  ok |= buf_alloc(&e->dbk, e->frame_bytes);
-  ok |= buf_alloc(&e->lrout, e->frame_bytes);
-  ok |= buf_alloc(&e->lrunits, sizeof(LrUnit) * 3 * (size_t)(e->sb_rows + 1) * (e->sb_cols + 1));
+  ok |= buf_alloc(&e->hpel, SZ(e->cfg.turbo ? (size_t)(ME_QP_ENTRIES * 16 + 1) * e->w * e->h + (size_t)(ME_QP_ENTRIES + 1) * ((e->w + 3) >> 2) * ((e->h + 3) >> 2) : 0));
+  ok |= buf_alloc(&e->mescratch, SZ(sizeof(int32_t) * ME_SB_INTS * (size_t)e->num_sbs));
+  ok |= buf_alloc(&e->scratch, SZ(sizeof(int32_t) * SCRATCH_INTS * (size_t)e->num_sbs));
+  ok |= buf_alloc(&e->lfmask, SZ((size_t)e->mi_rows * e->mi_cols));
+  ok |= buf_alloc(&e->dbk, SZ(e->frame_bytes));
+  ok |= buf_alloc(&e->lrout, SZ(e->frame_bytes));
+  ok |= buf_alloc(&e->lrunits, SZ(sizeof(LrUnit) * 3 * (size_t)(e->sb_rows + 1) * (e->sb_cols + 1)));
   e->num_cdef_presets = e->cfg.cdef ? 4 : 0;
-  ok |= buf_alloc(&e->cdefbuf, e->frame_bytes * (e->num_cdef_presets ? e->num_cdef_presets : 1));
+  ok |= buf_alloc(&e->cdefbuf, SZ(e->frame_bytes * (e->num_cdef_presets ? e->num_cdef_presets : 1)));
+#undef SZ
   if (ok) {
     snprintf(err, errlen, "out of memory");
     mav1_destroy(e);
     return NULL;
   }
+  e->is_engine = isEngine;
   if (e->cfg.turbo && e->cfg.altref && !getenv("MAV1_NOASYNC") && wctx_init(e)) {
     snprintf(err, errlen, "out of memory");
     mav1_destroy(e);
@@ -170,7 +177,8 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
   e->cdef_idx = calloc((size_t)e->num_sbs, 1);
   e->cdef_choice = calloc((size_t)e->num_sbs, 1);
 
-  if (cfg->use_metal) {
+  if (drv) {
+  } else if (cfg->use_metal) {
     e->be = backend_metal_create(e, err, errlen);
     if (!e->be) {
       mav1_destroy(e);
@@ -179,12 +187,35 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
   } else {
     e->be = backend_cpu_create(e);
   }
+  if (drv) {
+    for (int i = 0; i < 2; i++) {
+      e->eng[i] = create_enc(cfg, 1, err, errlen);
+      if (!e->eng[i]) {
+        mav1_destroy(e);
+        return NULL;
+      }
+      e->eng_q[i] = (void *)dispatch_queue_create("mav1.engine", DISPATCH_QUEUE_SERIAL);
+      e->eng_busy[i] = (void *)dispatch_group_create();
+    }
+    for (int k = 0; k < 8; k++) e->slot_grp[k] = (void *)dispatch_group_create();
+  }
   return e;
 }
+
+Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) { return create_enc(cfg, 0, err, errlen); }
 
 void mav1_destroy(Mav1Encoder *e) {
   if (!e) return;
   wctx_free(e);
+  for (int i = 0; i < 2; i++)
+    if (e->eng[i]) {
+      dispatch_group_wait((dispatch_group_t)e->eng_busy[i], DISPATCH_TIME_FOREVER);
+      mav1_destroy(e->eng[i]);
+      dispatch_release((dispatch_queue_t)e->eng_q[i]);
+      dispatch_release((dispatch_group_t)e->eng_busy[i]);
+    }
+  for (int k = 0; k < 8; k++)
+    if (e->slot_grp[k]) dispatch_release((dispatch_group_t)e->slot_grp[k]);
   if (e->be) e->be->destroy(e->be);
   buf_free(&e->src);
   buf_free(&e->rec);
@@ -221,7 +252,7 @@ void mav1_destroy(Mav1Encoder *e) {
   free(e);
 }
 
-const char *mav1_backend_name(const Mav1Encoder *e) { return e->be->name; }
+const char *mav1_backend_name(const Mav1Encoder *e) { return e->be ? e->be->name : e->eng[0]->be->name; }
 const Mav1FrameStats *mav1_last_stats(const Mav1Encoder *e) { return &e->last; }
 
 size_t mav1_sequence_header(const Mav1Encoder *e, uint8_t *out) { return write_sequence_header(e, out); }
@@ -798,13 +829,12 @@ static void stats_add(Mav1FrameStats *a, const Mav1FrameStats *b) {
  * disp), with LAST from lastSlot and ALTREF from arfSlot (-1: none).
  * Appends the frame OBU (and, for key frames, the TD and sequence header)
  * to the temporal unit t; with the writer queue the entropy coding and the
- * append run there, after the frame's core. */
-static void alt_code(Mav1Encoder *e, const uint8_t *frame, int disp, int isKey, int kind, int lastSlot, int arfSlot,
-                     int refresh, int hidden, Tu *t) {
-  int cw = (e->w + 1) >> 1, ch = (e->h + 1) >> 1;
-  const uint8_t *pl[3] = {frame, frame + (size_t)e->w * e->h, frame + (size_t)e->w * e->h + (size_t)cw * ch};
-  int st[3] = {e->w, cw, cw};
-  load_source(e, pl, st);
+ * append run there, after the frame's core. With frame engines the frame is
+ * coded by an engine, concurrently with the driver and the other engine.
+ * Returns the packed reconstruction (complete once the frame's OBU is
+ * appended). */
+static uint8_t *alt_code(Mav1Encoder *e, const uint8_t *frame, int disp, int isKey, int kind, int lastSlot,
+                         int arfSlot, int refresh, int hidden, Tu *t) {
   if (isKey) e->key_disp = disp;
   e->nonref = e->cfg.leaf && !isKey && refresh == 0;
   e->leafopt = e->nonref ? e->leafopt_cfg : 0;
@@ -829,18 +859,80 @@ static void alt_code(Mav1Encoder *e, const uint8_t *frame, int disp, int isKey, 
      * reference, so skip_mode_present is coded */
     h->reference_select = kind >= 2 && arfSlot >= 0 && !getenv("MAV1_NOCOMP");
     h->skip_mode_allowed = h->reference_select;
-    memcpy(e->ref.base, e->slot[lastSlot].base, e->frame_bytes);
-    if (arfSlot >= 0) memcpy(e->gold.base, e->slot[arfSlot].base, e->frame_bytes);
-    e->ref_gen = e->slot_gen[lastSlot];
-    e->gold_gen = arfSlot >= 0 ? e->slot_gen[arfSlot] : 0;
   }
-  memset(&e->last, 0, sizeof e->last);
-  run_frame_core(e, isKey);
-  Mav1FrameStats fst = e->last;
-  WCtx *c = NULL;
-  Mav1Encoder *s = e->wq ? snap_take(e, &c) : e;
+  /* the engine coding the frame (the driver itself without engines) */
+  int ei = e->eng_next;
+  Mav1Encoder *E = e->eng[0] ? e->eng[ei] : e;
+  if (e->eng[0]) {
+    e->eng_next ^= 1;
+    dispatch_group_wait((dispatch_group_t)e->eng_busy[ei], DISPATCH_TIME_FOREVER);
+    if (!isKey) { /* the references are written */
+      dispatch_group_wait((dispatch_group_t)e->slot_grp[lastSlot], DISPATCH_TIME_FOREVER);
+      if (arfSlot >= 0) dispatch_group_wait((dispatch_group_t)e->slot_grp[arfSlot], DISPATCH_TIME_FOREVER);
+    }
+    for (int k = 0; k < 8; k++) /* earlier writes of the refreshed slots done */
+      if ((h->refresh_frame_flags >> k) & 1) dispatch_group_wait((dispatch_group_t)e->slot_grp[k], DISPATCH_TIME_FOREVER);
+    E->hdr = e->hdr;
+    memcpy(E->sign_bias, e->sign_bias, sizeof e->sign_bias);
+    E->key_disp = e->key_disp;
+    E->nonref = e->nonref;
+    E->leafopt = e->leafopt;
+    E->frame_kind = e->frame_kind;
+    E->order_hint = e->order_hint;
+  }
+  int cw = (e->w + 1) >> 1, ch = (e->h + 1) >> 1;
+  const uint8_t *pl[3] = {frame, frame + (size_t)e->w * e->h, frame + (size_t)e->w * e->h + (size_t)cw * ch};
+  int st[3] = {e->w, cw, cw};
+  load_source(E, pl, st);
+  if (!isKey) {
+    memcpy(E->ref.base, e->slot[lastSlot].base, e->frame_bytes);
+    if (arfSlot >= 0) memcpy(E->gold.base, e->slot[arfSlot].base, e->frame_bytes);
+    E->ref_gen = e->slot_gen[lastSlot];
+    E->gold_gen = arfSlot >= 0 ? e->slot_gen[arfSlot] : 0;
+  }
+  int rf = h->refresh_frame_flags;
+  if (rf) e->gen++;
+  for (int k = 0; k < 8; k++)
+    if ((rf >> k) & 1) {
+      e->slot_gen[k] = e->gen;
+      e->slot_hint[k] = h->order_hint;
+    }
+  uint8_t *recon = malloc(packed_size(e));
+  /* the frame's core; then the slot writes and the writer job's inputs */
+  typedef struct { Mav1Encoder *s; WCtx *c; Mav1FrameStats st; } Job;
+  Job *job = calloc(1, sizeof *job);
+  dispatch_semaphore_t coreDone = e->eng[0] ? dispatch_semaphore_create(0) : NULL;
+  void (^core)(void) = ^{
+    memset(&E->last, 0, sizeof E->last);
+    run_frame_core(E, isKey);
+    job->st = E->last;
+    job->s = E->wq ? snap_take(E, &job->c) : E;
+    for (int k = 0; k < 8; k++)
+      if (((rf >> k) & 1) && e->slot[k].base) memcpy(e->slot[k].base, E->rec.base, e->frame_bytes);
+    uint8_t *rp[3] = {recon, recon + (size_t)e->w * e->h, recon + (size_t)e->w * e->h + (size_t)cw * ch};
+    int rs[3] = {e->w, cw, cw};
+    copy_out(E, E->rec.base, rp, rs);
+  };
+  if (e->eng[0]) {
+    for (int k = 0; k < 8; k++)
+      if ((rf >> k) & 1) dispatch_group_enter((dispatch_group_t)e->slot_grp[k]);
+    void **sg = e->slot_grp;
+    dispatch_group_async((dispatch_group_t)e->eng_busy[ei], (dispatch_queue_t)e->eng_q[ei], ^{
+      core();
+      for (int k = 0; k < 8; k++)
+        if ((rf >> k) & 1) dispatch_group_leave((dispatch_group_t)sg[k]);
+      dispatch_semaphore_signal(coreDone);
+    });
+  } else {
+    core();
+  }
   q_run(e, ^{
-    Mav1FrameStats st2 = fst;
+    if (coreDone) {
+      dispatch_semaphore_wait(coreDone, DISPATCH_TIME_FOREVER);
+      dispatch_release(coreDone);
+    }
+    Mav1Encoder *s = job->s;
+    Mav1FrameStats st2 = job->st;
     uint8_t *tile = NULL;
     size_t tileSize = frame_tail(s, &tile, &st2);
     double t3 = now();
@@ -853,15 +945,10 @@ static void alt_code(Mav1Encoder *e, const uint8_t *frame, int disp, int isKey, 
     free(tile);
     st2.t_entropy += now() - t3;
     stats_add(&t->st, &st2);
-    if (c) dispatch_semaphore_signal((dispatch_semaphore_t)c->free);
+    if (job->c) dispatch_semaphore_signal((dispatch_semaphore_t)job->c->free);
+    free(job);
   });
-  if (h->refresh_frame_flags) e->gen++;
-  for (int k = 0; k < 8; k++)
-    if ((h->refresh_frame_flags >> k) & 1) {
-      e->slot_gen[k] = e->gen;
-      e->slot_hint[k] = h->order_hint;
-      if (e->slot[k].base) memcpy(e->slot[k].base, e->rec.base, e->frame_bytes);
-    }
+  return recon;
 }
 
 /* Codes the display frames strictly between a (slot as) and b (slot bs),
@@ -873,8 +960,7 @@ static Tu *pyr_code(Mav1Encoder *e, Tu *t, int a, int as, int b, int bs, int dep
   if (b - a - 1 >= 3 && depth < 4) {
     int m = (a + b) / 2, ms = 4 + depth;
     if (!t) t = tu_new(1, 0);
-    alt_code(e, e->inq[m - d0], m, 0, 3, as, bs, 1 << ms, 1, t);
-    uint8_t *rec = pack_frame(e, e->rec.base);
+    uint8_t *rec = alt_code(e, e->inq[m - d0], m, 0, 3, as, bs, 1 << ms, 1, t);
     t = pyr_code(e, t, a, as, m, ms, depth + 1);
     if (!t) t = tu_new(1, 0);
     tu_show_existing(e, t, ms, rec);
@@ -882,8 +968,7 @@ static Tu *pyr_code(Mav1Encoder *e, Tu *t, int a, int as, int b, int bs, int dep
   }
   for (int d = a + 1; d < b; d++) {
     if (!t) t = tu_new(1, 0);
-    alt_code(e, e->inq[d - d0], d, 0, 2, as, bs, 0, 0, t);
-    tu_close(e, t, pack_frame(e, e->rec.base));
+    tu_close(e, t, alt_code(e, e->inq[d - d0], d, 0, 2, as, bs, 0, 0, t));
     t = NULL;
   }
   return t;
@@ -904,14 +989,13 @@ static void alt_drain(Mav1Encoder *e, int flush) {
     if (isKey || L == 1) {
       /* key frame, or a regular frame predicting from the anchor */
       Tu *t = tu_new(!isKey, isKey);
-      alt_code(e, e->inq[0], d0, isKey, 0, e->anchor_slot, -1, 0x01, 0, t);
+      uint8_t *rec = alt_code(e, e->inq[0], d0, isKey, 0, e->anchor_slot, -1, 0x01, 0, t);
       e->anchor_slot = 0;
-      tu_close(e, t, pack_frame(e, e->rec.base));
+      tu_close(e, t, rec);
     } else if (e->cfg.leaf) {
       int arfSlot = e->anchor_slot == 2 ? 3 : 2;
       Tu *t = tu_new(1, 0);
-      alt_code(e, e->inq[L - 1], d0 + L - 1, 0, 1, e->anchor_slot, -1, 1 << arfSlot, 1, t);
-      uint8_t *arfRecon = pack_frame(e, e->rec.base);
+      uint8_t *arfRecon = alt_code(e, e->inq[L - 1], d0 + L - 1, 0, 1, e->anchor_slot, -1, 1 << arfSlot, 1, t);
       t = pyr_code(e, t, d0 - 1, e->anchor_slot, d0 + L - 1, arfSlot, 0);
       if (!t) t = tu_new(1, 0);
       tu_show_existing(e, t, arfSlot, arfRecon);
@@ -919,12 +1003,10 @@ static void alt_drain(Mav1Encoder *e, int flush) {
     } else {
       int arfSlot = e->anchor_slot == 2 ? 3 : 2;
       Tu *t = tu_new(1, 0);
-      alt_code(e, e->inq[L - 1], d0 + L - 1, 0, 1, e->anchor_slot, -1, 1 << arfSlot, 1, t);
-      uint8_t *arfRecon = pack_frame(e, e->rec.base);
+      uint8_t *arfRecon = alt_code(e, e->inq[L - 1], d0 + L - 1, 0, 1, e->anchor_slot, -1, 1 << arfSlot, 1, t);
       for (int i = 0; i < L - 1; i++) {
         if (i > 0) t = tu_new(1, 0);
-        alt_code(e, e->inq[i], d0 + i, 0, 2, i == 0 ? e->anchor_slot : 0, arfSlot, 0x01, 0, t);
-        tu_close(e, t, pack_frame(e, e->rec.base));
+        tu_close(e, t, alt_code(e, e->inq[i], d0 + i, 0, 2, i == 0 ? e->anchor_slot : 0, arfSlot, 0x01, 0, t));
       }
       t = tu_new(1, 0);
       tu_show_existing(e, t, arfSlot, arfRecon);

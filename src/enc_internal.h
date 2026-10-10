@@ -111,6 +111,12 @@ struct Mav1Encoder {
   WCtx wctx[NUM_WCTX];
   int wnext, flushing;
   void *outmu;          /* pthread mutex of outq */
+  /* turbo: frame engines (complete encoders without driver) coding frames
+   * concurrently; frames wait for the slots they reference */
+  struct Mav1Encoder *eng[2];
+  int eng_next, is_engine;
+  void *eng_q[2], *eng_busy[2]; /* serial dispatch queue, group of its jobs */
+  void *slot_grp[8];            /* dispatch group: pending writes of the slot */
 
   /* statistics of the last frame */
   Mav1FrameStats last;
