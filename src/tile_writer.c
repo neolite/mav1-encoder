@@ -199,7 +199,8 @@ static void write_coeffs(Tile *t, int plane, int startX, int startY, int txSz, i
     /* Levels, from the last coefficient backwards. `lv` mirrors the
      * decoder's Quant[] (levels of already decoded positions). */
     int32_t lv[1024];
-    memset(lv, 0, sizeof(lv));
+    /* the contexts read inside the (at most 32 x 32) adjusted transform */
+    memset(lv, 0, sizeof(int32_t) * (w < 32 ? w : 32) * (h < 32 ? h : 32));
     for (int c = eob - 1; c >= 0; c--) {
       int pos = scan[c];
       int level = abs(q[pos]);
