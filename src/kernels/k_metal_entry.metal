@@ -167,7 +167,7 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
   /* sub-pel: the 9 candidates (centre + 8 neighbours) x 4x4 units are
    * spread over the lanes; per-candidate sums by simd_sum. The (cost, index)
    * minimum equals the serial first minimum of me_finish. */
-  int mvr = dy * 8, mvc = dx * 8, bestS = 0;
+  int mvr = m.stages ? dy * 8 : m.pr, mvc = m.stages ? dx * 8 : m.pc, bestS = 0;
   int nUnits = (m.w >> 2) * (m.w >> 2);
   for (int step = 4; step >= 2; step >>= 1) {
     int sums[ME_LANES];

@@ -50,6 +50,7 @@ typedef struct {
 #define T_ME_KEEP 8    /* children keep the parent's sub-pel vector when the full-pel winner is the parent's */
 #define T_ME_HPEL 16   /* sub-pel refinement on precomputed quarter-pel planes */
 #define T_ME_CR2 64    /* children search +-2 full-pel around the parent */
+#define T_ME_L3SUB 4096 /* 8x8 nodes: no full-pel search, sub-pel steps around the parent's vector */
 #define T_ME_REF2 512  /* 64x64 full-pel refinement +-2 around the coarse winner (instead of +-3) */
 #define T_ME_DEC 32    /* 64x64 coarse grid (step 4) on 4x4-decimated planes */
 
@@ -127,6 +128,8 @@ INLINE MeNode me_node(DEV const FrameParams *fp, int sbIdx, int level, int i, DE
     m.range = (m.range / ME_COARSE_STEP) * ME_COARSE_STEP;
     m.stages = 2;
   }
+  /* turbo T_ME_L3SUB: 8x8 nodes refine the parent's vector at sub-pel only */
+  if (level == 3 && (fp->turbo & T_ME_L3SUB)) m.stages = 0;
   int side = 2 * (m.range / m.step) + 1;
   m.count = 1 + side * side;
   return m;
@@ -203,7 +206,7 @@ INLINE int me_subpel_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV
  * (quarter) in 1/8 units, first minimum of the 8 neighbours per step. */
 INLINE void me_finish(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref, DEV const uint8_t *hp,
                       THR const MeNode *m, int by, int bx, DEV int32_t *out, DEV int32_t *scratch) {
-  int mvr = by * 8, mvc = bx * 8;
+  int mvr = m->stages ? by * 8 : m->pr, mvc = m->stages ? bx * 8 : m->pc;
   int bestS = me_subpel_cost(fp, src, ref, hp, m, mvr, mvc, scratch);
   for (int step = 4; step >= 2; step >>= 1) {
     int cr = mvr, cc = mvc;
