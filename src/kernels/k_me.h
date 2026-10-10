@@ -110,7 +110,7 @@ INLINE MeNode me_node(DEV const FrameParams *fp, int sbIdx, int level, int i, DE
     m.cy = par[0] >> 3;
     m.cx = par[1] >> 3;
     m.range = k_min(m.range, (fp->turbo & T_ME_CR1) ? 1 : (fp->turbo & T_ME_CR2) ? 2 : 4);
-    m.copy = (fp->turbo & T_ME_L3COPY) && level == 3;
+    m.copy = ((fp->turbo & T_ME_L3COPY) || leaf_no8(fp)) && level == 3;
   }
   m.step = 1;
   m.stages = 1;

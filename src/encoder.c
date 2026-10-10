@@ -276,6 +276,7 @@ static void edge_filter_types(Mav1Encoder *e) {
   free(uvs);
 }
 
+static int env_or(const char *n, int d);
 static void setup_params(Mav1Encoder *e, int isKey) {
   FrameParams *fp = ENC_PARAMS(e);
   memset(fp, 0, sizeof(*fp));
@@ -315,8 +316,9 @@ static void setup_params(Mav1Encoder *e, int isKey) {
    * inter frames; motion search bits T_ME_* of k_me.h (2, 4, 8 cost
    * quality, off by default; 16 quarter-pel planes, 32 decimated coarse grid,
    * 64 children +-2, 512 64x64 refinement +-2); 128 reduced intra search in
-   * inter frames; 256 square partitions on key frames too */
-  fp->turbo = e->cfg.turbo ? (getenv("MAV1_TURBO") ? (int)strtol(getenv("MAV1_TURBO"), NULL, 0) : 0x3F1) : 0;
+   * inter frames; 256 square partitions on key frames too; 1024 no 8x8 in leaf frames (off by
+   * default); 2048 two CDEF sets (off and MAV1_CP, default preset 2) */
+  fp->turbo = e->cfg.turbo ? (getenv("MAV1_TURBO") ? (int)strtol(getenv("MAV1_TURBO"), NULL, 0) : 0xBF1) : 0;
   fp->leaf = e->cfg.leaf ? (e->leafopt & 1) : e->nonref && !getenv("MAV1_LEAFINTRA");
   if (e->leafopt & 16) fp->tx_search = 0;
   fp->depth_thr = getenv("MAV1_DT") ? atoi(getenv("MAV1_DT")) : 0;
@@ -346,11 +348,17 @@ static void setup_params(Mav1Encoder *e, int isKey) {
     h->cdef_damping = fp->cdef_damping = 3;
     h->cdef_bits = fp->cdef_bits = 0;
   }
+  int pi[4] = {0, 1, 2, 3};
+  if ((fp->turbo & 2048) && h->cdef_bits == 2) { /* turbo: two sets, off and one strength */
+    h->cdef_bits = fp->cdef_bits = 1;
+    pi[1] = env_or("MAV1_CP", 2);
+  }
   for (int i = 0; i < 4; i++) {
-    h->cdef_y_pri[i] = fp->cdef_y_pri[i] = presets[i][0];
-    h->cdef_y_sec[i] = fp->cdef_y_sec[i] = presets[i][1];
-    h->cdef_uv_pri[i] = fp->cdef_uv_pri[i] = presets[i][2];
-    h->cdef_uv_sec[i] = fp->cdef_uv_sec[i] = presets[i][3];
+    const int *ps = presets[pi[i]];
+    h->cdef_y_pri[i] = fp->cdef_y_pri[i] = ps[0];
+    h->cdef_y_sec[i] = fp->cdef_y_sec[i] = ps[1];
+    h->cdef_uv_pri[i] = fp->cdef_uv_pri[i] = ps[2];
+    h->cdef_uv_sec[i] = fp->cdef_uv_sec[i] = ps[3];
   }
   /* Loop restoration units: 64x64 (lr_unit_shift = 0, lr_uv_shift = 0). */
   int off = 0;
@@ -473,6 +481,7 @@ static size_t run_frame(Mav1Encoder *e, int isKey, uint8_t **tile) {
   }
   build_filter_info(e);
   int cdefOff = (e->leafopt & 4) != 0, nPresets = e->num_cdef_presets;
+  if (nPresets) e->num_cdef_presets = 1 << e->hdr.cdef_bits;
   if (cdefOff) { /* the filter stage skips CDEF; every superblock codes index 0 */
     e->num_cdef_presets = 0;
     memset(e->cdef_choice, 0, (size_t)e->num_sbs);

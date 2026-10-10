@@ -557,6 +557,15 @@ INLINE void slot_part(int slot, THR int *p, THR int *k) {
 /* Turbo: square partitions only (NONE / SPLIT) on inter frames (and key
  * frames with bit 256). */
 #define T_KEY_SQUARE 256
+/* Turbo bit 1024: leaf frames code no 8x8 blocks except where the 16x16
+ * node crosses the frame edge (8x8 motion vectors are the parent's). */
+#define T_LEAF_NO8 1024
+INLINE int leaf_no8(DEV const FrameParams *fp) { return (fp->turbo & T_LEAF_NO8) && fp->leaf && !fp->frame_is_intra; }
+/* The 8x8 node i of superblock sbIdx lies in a 16x16 node crossing the frame edge. */
+INLINE int node8_at_edge(DEV const FrameParams *fp, int sbIdx, int i) {
+  int r = (sbIdx / fp->sb_cols) * 16 + ((i >> 3) & ~1) * 2, c = (sbIdx % fp->sb_cols) * 16 + ((i & 7) & ~1) * 2;
+  return r + 4 > fp->mi_rows || c + 4 > fp->mi_cols;
+}
 INLINE int turbo_square(DEV const FrameParams *fp) {
   return (fp->turbo & 1) && (!fp->frame_is_intra || (fp->turbo & T_KEY_SQUARE));
 }
@@ -610,6 +619,7 @@ INLINE void analyze_item(DEV const FrameParams *fp, int sbIdx, int level, int i,
   costs[idx] = -1;
   if (r >= fp->mi_rows || c >= fp->mi_cols) return;
   if (depth_pruned(fp, costs, sbIdx, level, i)) return;
+  if (level == 3 && leaf_no8(fp) && !node8_at_edge(fp, sbIdx, i)) return;
   int hasRows = (r + halfSz) < fp->mi_rows, hasCols = (c + halfSz) < fp->mi_cols;
   int p, k;
   slot_part(slot, &p, &k);
