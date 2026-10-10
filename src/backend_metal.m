@@ -12,7 +12,7 @@
 @interface Mav1MetalState : NSObject
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
-@property(nonatomic, strong) id<MTLComputePipelineState> analyze, recon;
+@property(nonatomic, strong) id<MTLComputePipelineState> analyze, recon, me;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, id<MTLBuffer>> *buffers;
 @end
 @implementation Mav1MetalState
@@ -51,7 +51,19 @@ static void run(Mav1MetalState *s, void (^encode)(id<MTLComputeCommandEncoder>))
   }
 }
 
-static void mtl_motion_search(Backend *b, struct Mav1Encoder *e) { (void)b; (void)e; }
+static void mtl_motion_search(Backend *b, struct Mav1Encoder *e) {
+  Mav1MetalState *s = ST(b);
+  run(s, ^(id<MTLComputeCommandEncoder> enc) {
+    [enc setComputePipelineState:s.me];
+    [enc setBuffer:wrap(s, &e->params) offset:0 atIndex:0];
+    [enc setBuffer:wrap(s, &e->src) offset:0 atIndex:1];
+    [enc setBuffer:wrap(s, &e->ref) offset:0 atIndex:2];
+    [enc setBuffer:wrap(s, &e->mvfield) offset:0 atIndex:3];
+    [enc setBuffer:wrap(s, &e->scratch) offset:0 atIndex:4];
+    NSUInteger tg = MIN((NSUInteger)32, s.me.maxTotalThreadsPerThreadgroup);
+    [enc dispatchThreads:MTLSizeMake(e->num_sbs, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+  });
+}
 
 static void mtl_analyze(Backend *b, struct Mav1Encoder *e) {
   Mav1MetalState *s = ST(b);
@@ -128,7 +140,8 @@ Backend *backend_metal_create(struct Mav1Encoder *e, char *err, size_t errlen) {
     s.buffers = [NSMutableDictionary new];
     s.analyze = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_analyze"] error:&nerr];
     s.recon = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_recon"] error:&nerr];
-    if (!s.analyze || !s.recon) {
+    s.me = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_me"] error:&nerr];
+    if (!s.analyze || !s.recon || !s.me) {
       snprintf(err, errlen, "pipeline creation failed: %s", nerr.localizedDescription.UTF8String);
       return NULL;
     }

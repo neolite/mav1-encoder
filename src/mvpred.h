@@ -11,6 +11,7 @@ struct Mav1Encoder;
 
 void mvpred_frame_start(struct Mav1Encoder *e);
 /* Writes inter_block_mode_info( ) for a single-reference LAST_FRAME block. */
-void write_inter_block(EntEnc *ec, CdfContext *cdf, struct Mav1Encoder *e, const BlockInfo *b);
+/* Returns the chosen YMode. */
+int write_inter_block(EntEnc *ec, CdfContext *cdf, struct Mav1Encoder *e, const BlockInfo *b);
 
 #endif

@@ -307,6 +307,7 @@ static void write_block(Tile *t, const BlockInfo *b) {
       ec_literal(&t->ec, e->hdr.cdef_bits, 0);
     }
   }
+  int interMode = NEWMV;
   if (isKey) {
     write_intra_modes(t, b, availU, availL, 1);
   } else {
@@ -317,7 +318,7 @@ static void write_block(Tile *t, const BlockInfo *b) {
     else if (availU || availL) ctx = 2 * (availU ? aboveIntra : leftIntra);
     else ctx = 0;
     ec_symbol(&t->ec, b->is_inter, t->cdf.is_inter[ctx], 2);
-    if (b->is_inter) write_inter_block(&t->ec, &t->cdf, e, b);
+    if (b->is_inter) interMode = write_inter_block(&t->ec, &t->cdf, e, b);
     else write_intra_modes(t, b, availU, availL, 0);
   }
 
@@ -328,7 +329,8 @@ static void write_block(Tile *t, const BlockInfo *b) {
       m->bsize = (int8_t)bs;
       m->is_inter = (int8_t)b->is_inter;
       m->skip = (int8_t)skip;
-      m->y_mode = (int8_t)(b->is_inter ? DC_PRED : b->y_mode);
+      m->y_mode = (int8_t)(b->is_inter ? interMode : b->y_mode);
+      m->written = 1;
       m->ref0 = (int8_t)(b->is_inter ? LAST_FRAME : INTRA_FRAME);
       m->tx_size = (int8_t)Max_Tx_Size_Rect[bs];
       m->mv_row = (int16_t)(b->is_inter ? b->mv_row : 0);

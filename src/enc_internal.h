@@ -22,6 +22,7 @@ typedef struct {
   int8_t ref0;      /* RefFrames[0] (INTRA_FRAME = 0) */
   int8_t tx_size;   /* TxSizes (luma) */
   int16_t mv_row, mv_col; /* Mvs[0] */
+  int8_t written;   /* decoded in the current frame */
 } MiInfo;
 
 /* Values signalled in the frame header. */

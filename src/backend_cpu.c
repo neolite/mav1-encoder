@@ -9,12 +9,19 @@
 #include "enc_internal.h"
 #include "kernels/k_analysis.h"
 #include "kernels/k_recon.h"
+#include "kernels/k_me.h"
 
 typedef struct {
   Backend base;
 } CpuBackend;
 
-static void cpu_motion_search(Backend *b, struct Mav1Encoder *e) { (void)b; (void)e; }
+static void cpu_motion_search(Backend *b, struct Mav1Encoder *e) {
+  (void)b;
+  const FrameParams *fp = ENC_PARAMS(e);
+  dispatch_apply((size_t)e->num_sbs, DISPATCH_APPLY_AUTO, ^(size_t i) {
+    me_sb(fp, (int)i, e->src.base, e->ref.base, (int32_t *)e->mvfield.base, (int32_t *)e->scratch.base + i * SCRATCH_INTS);
+  });
+}
 
 static void cpu_analyze(Backend *b, struct Mav1Encoder *e) {
   (void)b;

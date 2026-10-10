@@ -1,6 +1,17 @@
 /* Metal entry points. Each wraps a kernel shared with the CPU backend. */
 #include "k_analysis.h"
 #include "k_recon.h"
+#include "k_me.h"
+
+kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
+                    device const uint8_t *src [[buffer(1)]],
+                    device const uint8_t *ref [[buffer(2)]],
+                    device int32_t *mvField [[buffer(3)]],
+                    device int32_t *scratch [[buffer(4)]],
+                    uint gid [[thread_position_in_grid]]) {
+  if ((int)gid >= fp->sb_cols * fp->sb_rows) return;
+  me_sb(fp, (int)gid, src, ref, mvField, scratch + (long)gid * SCRATCH_INTS);
+}
 
 kernel void mav1_analyze(device const FrameParams *fp [[buffer(0)]],
                          device const uint8_t *src [[buffer(1)]],
