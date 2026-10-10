@@ -31,6 +31,7 @@ typedef struct {
   int intra_edge_filter; /* enable_intra_edge_filter */
   int nonref_odd;       /* odd frames are non-reference leaf frames */
   int fast;              /* reduced mode/partition search */
+  int multi_ref;         /* GOLDEN reference (slot 1, refreshed every 4th frame) besides LAST */
   int switchable_interp; /* per-block dual interpolation filter choice */
   int lr_test;         /* testing: force Wiener / self-guided on alternate units, ignoring rate */
   int me_range;        /* full-pel motion search range */

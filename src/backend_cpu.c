@@ -21,12 +21,15 @@ typedef struct {
 static void cpu_motion_search(Backend *b, struct Mav1Encoder *e) {
   (void)b;
   const FrameParams *fp = ENC_PARAMS(e);
+  int nref = fp->golden ? 2 : 1;
   for (int level = 0; level < 4; level++) {
-    int nn = 1 << (2 * level);
-    dispatch_apply((size_t)e->num_sbs * nn, DISPATCH_APPLY_AUTO, ^(size_t g) {
-      int sb = (int)g / nn, i = (int)g % nn;
-      me_node_serial(fp, sb, level, i, e->src.base, e->ref.base, (int32_t *)e->mvfield.base,
-                     (int32_t *)e->scratch.base + (size_t)sb * SCRATCH_INTS);
+    int nn = 1 << (2 * level), nodes = e->num_sbs * nn;
+    /* LAST then GOLDEN nodes; each reference uses its half of the SB scratch */
+    dispatch_apply((size_t)nodes * nref, DISPATCH_APPLY_AUTO, ^(size_t g) {
+      int r = (int)g / nodes, sb = ((int)g % nodes) / nn, i = (int)g % nn;
+      me_node_serial(fp, sb, level, i, e->src.base, r ? e->gold.base : e->ref.base,
+                     (int32_t *)(r ? e->mvgold.base : e->mvfield.base),
+                     (int32_t *)e->scratch.base + (size_t)sb * SCRATCH_INTS + r * (SCRATCH_INTS / 2));
     });
   }
 }
@@ -41,7 +44,8 @@ void cpu_backend_analyze(Backend *b, struct Mav1Encoder *e) {
       int ns = level_slots(fp, level);
       for (int node = 0; node < (1 << (2 * level)); node++)
         for (int slot = 0; slot < ns; slot++)
-          analyze_item(fp, (int)i, level, node, slot, e->src.base, e->ref.base, (const int32_t *)e->mvfield.base,
+          analyze_item(fp, (int)i, level, node, slot, e->src.base, e->ref.base, e->gold.base,
+                       (const int32_t *)e->mvfield.base, (const int32_t *)e->mvgold.base,
                        costs, infos, (int32_t *)e->scratch.base + i * SCRATCH_INTS);
     }
     analyze_sb_table(fp, (int)i, costs, infos, ENC_BLOCKS(e), ENC_SBS(e));
@@ -61,7 +65,7 @@ void cpu_backend_recon(Backend *b, struct Mav1Encoder *e) {
     dispatch_apply((size_t)(rmax - rmin + 1), DISPATCH_APPLY_AUTO, ^(size_t k) {
       int r = rmin + (int)k, c = t - 2 * r;
       int idx = r * e->sb_cols + c;
-      recon_sb(fp, ENC_SBS(e)[idx], ENC_BLOCKS(e), e->src.base, e->rec.base, e->ref.base, ENC_COEFS(e),
+      recon_sb(fp, ENC_SBS(e)[idx], ENC_BLOCKS(e), e->src.base, e->rec.base, e->ref.base, e->gold.base, ENC_COEFS(e),
                (const int32_t *)e->mats.base, (int32_t *)e->scratch.base + (size_t)idx * SCRATCH_INTS);
     });
   }

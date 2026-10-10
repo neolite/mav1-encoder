@@ -103,12 +103,39 @@ INLINE int mv_bits8(int mvr, int mvc) {
   return 8 * (2 + 2 * FloorLog2(k_abs(mvr) + 1) + 2 * FloorLog2(k_abs(mvc) + 1));
 }
 
-/* Evaluates the block (miRow, miCol, bsize); the inter candidate uses the
- * motion vector of square node `mvNode` of the superblock. Returns the cost
- * and fills the decision in *out. */
+/* Inter cost (luma + chroma SATD and MV rate) of the block predicted from
+ * `ref` with the vector of square node `mvNode` in `mvField`. */
+INLINE long inter_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
+                       DEV const int32_t *mvField, int mvNode, int x, int y, int w, int h, DEV uint8_t *pred,
+                       int ps, DEV int32_t *tmp, THR int *mvr, THR int *mvc) {
+  int lam = fp->ac_q[0] / 16;
+  int cx = x >> 1, cy = y >> 1;
+  int sbIdx = (y >> 6) * fp->sb_cols + (x >> 6);
+  DEV const int32_t *mvp = mvField + (sbIdx * NUM_NODES + mvNode) * 2;
+  *mvr = mvp[0];
+  *mvc = mvp[1];
+  predict_inter_block(ref + fp->offset[0], fp->stride[0], fp->frame_w, fp->frame_h, pred, ps, x, y, w, h, *mvr,
+                      *mvc, 0, 0, EIGHTTAP, tmp);
+  long c = block_satd_s(src + fp->offset[0] + y * fp->stride[0] + x, fp->stride[0], pred, ps, w, h);
+  for (int p = 1; p < 3; p++) {
+    predict_inter_block(ref + fp->offset[p], fp->stride[p], fp->frame_w, fp->frame_h, pred, ps, cx, cy, w >> 1,
+                        h >> 1, *mvr, *mvc, 1, 1, EIGHTTAP, tmp);
+    c += block_satd_s(src + fp->offset[p] + cy * fp->stride[p] + cx, fp->stride[p], pred, ps, w >> 1, h >> 1);
+  }
+  return c + (long)lam * (4 + mv_bits8(*mvr, *mvc)) / 8;
+}
+
+/* Rate of signalling GOLDEN_FRAME instead of LAST_FRAME (1/8 bit). */
+#define GOLDEN_REF_BITS8 8
+
+/* Evaluates the block (miRow, miCol, bsize); the inter candidates use the
+ * motion vector of square node `mvNode` of the superblock, per reference
+ * (LAST: ref / mvField, GOLDEN when fp->golden: gold / mvFieldGold).
+ * Returns the cost and fills the decision in *out. */
 INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
-                       DEV const int32_t *mvField, int mvNode, int miRow, int miCol, int bsize,
-                       DEV int32_t *scratch, int ps, THR BlockInfo *out) {
+                       DEV const uint8_t *gold, DEV const int32_t *mvField, DEV const int32_t *mvFieldGold,
+                       int mvNode, int miRow, int miCol, int bsize, DEV int32_t *scratch, int ps,
+                       THR BlockInfo *out) {
   /* scratch: a ps x ps byte prediction, then the filter intermediate */
   DEV uint8_t *pred = (DEV uint8_t *)scratch;
   DEV int32_t *tmpArea = scratch + (ps * ps + 3) / 4;
@@ -119,22 +146,20 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
 
   int cx = x >> 1, cy = y >> 1, clw = lw - 1, clh = lh - 1;
   long interCost = -1;
-  int mvr = 0, mvc = 0;
+  int mvr = 0, mvc = 0, refFrame = LAST_FRAME;
   if (!fp->frame_is_intra) {
-    int sbIdx = (miRow >> 4) * fp->sb_cols + (miCol >> 4);
-    DEV const int32_t *mvp = mvField + (sbIdx * NUM_NODES + mvNode) * 2;
-    mvr = mvp[0];
-    mvc = mvp[1];
-    DEV int32_t *tmp = tmpArea;
-    predict_inter_block(ref + fp->offset[0], fp->stride[0], fp->frame_w, fp->frame_h, pred, ps, x, y, w, h,
-                        mvr, mvc, 0, 0, EIGHTTAP, tmp);
-    interCost = block_satd_s(src + fp->offset[0] + y * fp->stride[0] + x, fp->stride[0], pred, ps, w, h);
-    for (int p = 1; p < 3; p++) {
-      predict_inter_block(ref + fp->offset[p], fp->stride[p], fp->frame_w, fp->frame_h, pred, ps, cx, cy,
-                          w >> 1, h >> 1, mvr, mvc, 1, 1, EIGHTTAP, tmp);
-      interCost += block_satd_s(src + fp->offset[p] + cy * fp->stride[p] + cx, fp->stride[p], pred, ps, w >> 1, h >> 1);
+    interCost = inter_cost(fp, src, ref, mvField, mvNode, x, y, w, h, pred, ps, tmpArea, &mvr, &mvc);
+    if (fp->golden) {
+      int gr, gc;
+      long g = inter_cost(fp, src, gold, mvFieldGold, mvNode, x, y, w, h, pred, ps, tmpArea, &gr, &gc) +
+               (long)lam * GOLDEN_REF_BITS8 / 8;
+      if (g < interCost) { /* tie: LAST */
+        interCost = g;
+        mvr = gr;
+        mvc = gc;
+        refFrame = GOLDEN_FRAME;
+      }
     }
-    interCost += (long)lam * (4 + mv_bits8(mvr, mvc)) / 8;
   }
   /* luma intra */
   long best = -1;
@@ -203,6 +228,7 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
   out->tx_types_lo = out->tx_types_hi = 0;
   out->mv_row = 0;
   out->mv_col = 0;
+  out->ref_frame = INTRA_FRAME;
   out->tx_type = DCT_DCT;
   long cost = best + bestUv + (long)lam * (fp->frame_is_intra ? 0 : 16) / 8;
 
@@ -216,6 +242,7 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
       out->angle_uv = 0;
       out->mv_row = mvr;
       out->mv_col = mvc;
+      out->ref_frame = refFrame;
     }
   }
   return cost;
@@ -262,7 +289,7 @@ INLINE int part_count(DEV const FrameParams *fp, int p, int r, int c, int halfMi
 
 /* Cost of a rectangular block of the partition, memoised per call site. */
 INLINE long part_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
-                      DEV const int32_t *mvField, int node, int p, int r, int c, int bSize, int halfMi,
+                      DEV const uint8_t *gold, DEV const int32_t *mvField, DEV const int32_t *mvFieldGold, int node, int p, int r, int c, int bSize, int halfMi,
                       THR const long *noneCost, int childBase, int cn, int ci, DEV int32_t *scratch) {
   long total = 0;
   int n = part_count(fp, p, r, c, halfMi);
@@ -277,7 +304,7 @@ INLINE long part_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV con
       total += cc;
     } else {
       BlockInfo b;
-      total += eval_block(fp, src, ref, mvField, node, r + dr, c + dc, bs, scratch, 64, &b);
+      total += eval_block(fp, src, ref, gold, mvField, mvFieldGold, node, r + dr, c + dc, bs, scratch, 64, &b);
     }
   }
   return total;
@@ -289,7 +316,7 @@ INLINE long part_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV con
  * node to sbs[sbIdx].part.
  */
 INLINE void analyze_sb(DEV const FrameParams *fp, int sbIdx, DEV const uint8_t *src, DEV const uint8_t *ref,
-                       DEV const int32_t *mvField, DEV BlockInfo *blocks, DEV SbInfo *sbs,
+                       DEV const uint8_t *gold, DEV const int32_t *mvField, DEV const int32_t *mvFieldGold, DEV BlockInfo *blocks, DEV SbInfo *sbs,
                        DEV int32_t *scratch) {
   int sbRow = sbIdx / fp->sb_cols, sbCol = sbIdx % fp->sb_cols;
   long cost[NUM_NODES];
@@ -331,7 +358,7 @@ INLINE void analyze_sb(DEV const FrameParams *fp, int sbIdx, DEV const uint8_t *
           if (!((p == PARTITION_HORZ && hasCols && !hasRows) || (p == PARTITION_VERT && hasRows && !hasCols)))
             continue;
         }
-        long pc = part_cost(fp, src, ref, mvField, node, p, r, c, bSize, halfSz, noneCost, cb, cn, ci, scratch);
+        long pc = part_cost(fp, src, ref, gold, mvField, mvFieldGold, node, p, r, c, bSize, halfSz, noneCost, cb, cn, ci, scratch);
         if (pc < 0) continue;
         pc += (long)lam * (p == PARTITION_NONE ? 8 : 24) / 8;
         if (p == PARTITION_NONE) noneCost[node] = pc;
@@ -371,7 +398,7 @@ INLINE void analyze_sb(DEV const FrameParams *fp, int sbIdx, DEV const uint8_t *
           int dr, dc;
           int bs = part_block(p, level_bsize(level), k, halfMi, &dr, &dc);
           BlockInfo b;
-          eval_block(fp, src, ref, mvField, node, r + dr, c + dc, bs, scratch, 64, &b);
+          eval_block(fp, src, ref, gold, mvField, mvFieldGold, node, r + dr, c + dc, bs, scratch, 64, &b);
           int w = Block_Width(bs), h = Block_Height(bs);
           b.coef_off[0] = coefOff;
           coefOff += w * h; /* room for split / lossless transforms */
@@ -450,7 +477,8 @@ INLINE int depth_pruned(DEV const FrameParams *fp, DEV const long *costs, int sb
 }
 
 INLINE void analyze_item(DEV const FrameParams *fp, int sbIdx, int level, int i, int slot, DEV const uint8_t *src,
-                         DEV const uint8_t *ref, DEV const int32_t *mvField, DEV long *costs, DEV BlockInfo *infos,
+                         DEV const uint8_t *ref, DEV const uint8_t *gold, DEV const int32_t *mvField,
+                         DEV const int32_t *mvFieldGold, DEV long *costs, DEV BlockInfo *infos,
                          DEV int32_t *scratch) {
   int sbRow = sbIdx / fp->sb_cols, sbCol = sbIdx % fp->sb_cols;
   int n = 1 << level, size4 = 16 >> level, halfSz = size4 >> 1;
@@ -468,7 +496,7 @@ INLINE void analyze_item(DEV const FrameParams *fp, int sbIdx, int level, int i,
   int dr, dc;
   int bs = part_block(p, level_bsize(level), k, halfSz, &dr, &dc);
   BlockInfo b;
-  costs[idx] = eval_block(fp, src, ref, mvField, node, r + dr, c + dc, bs, scratch, 64 >> level, &b);
+  costs[idx] = eval_block(fp, src, ref, gold, mvField, mvFieldGold, node, r + dr, c + dc, bs, scratch, 64 >> level, &b);
   infos[idx] = b;
 }
 

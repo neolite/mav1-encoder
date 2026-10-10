@@ -88,11 +88,20 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
                     device int32_t *mvField [[buffer(3)]],
                     device int32_t *scratch [[buffer(4)]],
                     constant int &level [[buffer(5)]],
+                    device const uint8_t *gold [[buffer(6)]],
+                    device int32_t *mvFieldGold [[buffer(7)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint lane [[thread_index_in_simdgroup]]) {
-  int nn = 1 << (2 * level);
-  int sbIdx = (int)tg / nn, i = (int)tg % nn;
-  if (sbIdx >= fp->sb_cols * fp->sb_rows) return;
+  /* groups [0, nodes): LAST, [nodes, 2 * nodes): GOLDEN */
+  int nn = 1 << (2 * level), nodes = fp->sb_cols * fp->sb_rows * nn;
+  int g = (int)tg;
+  if (g >= nodes) {
+    if (!fp->golden || g >= 2 * nodes) return;
+    g -= nodes;
+    ref = gold;
+    mvField = mvFieldGold;
+  }
+  int sbIdx = g / nn, i = g % nn;
   MeNode m = me_node(fp, sbIdx, level, i, mvField);
   device int32_t *out = mvField + (sbIdx * NUM_NODES + NODE_BASE(level) + i) * 2;
   if (!m.valid) {
@@ -161,13 +170,15 @@ kernel void mav1_analyze(device const FrameParams *fp [[buffer(0)]],
                          device BlockInfo *infos [[buffer(5)]],
                          device int32_t *scratch [[buffer(6)]],
                          constant int &level [[buffer(7)]],
+                         device const uint8_t *gold [[buffer(8)]],
+                         device const int32_t *mvFieldGold [[buffer(9)]],
                          uint gid [[thread_position_in_grid]]) {
   /* pass 1: one thread per (superblock, node of the level, slot) */
   int ns = level_slots(fp, level), nn = 1 << (2 * level);
   int total = fp->sb_cols * fp->sb_rows * nn * ns;
   if ((int)gid >= total) return;
   int sb = (int)gid / (nn * ns), rem = (int)gid % (nn * ns);
-  analyze_item(fp, sb, level, rem / ns, rem % ns, src, ref, mvField, costs, infos,
+  analyze_item(fp, sb, level, rem / ns, rem % ns, src, ref, gold, mvField, mvFieldGold, costs, infos,
                scratch + (long)gid * analysis_slot_ints(level));
 }
 
@@ -181,11 +192,12 @@ kernel void mav1_recon(device const FrameParams *fp [[buffer(0)]],
                        device const int32_t *mats [[buffer(7)]],
                        device int32_t *scratch [[buffer(8)]],
                        constant int2 &wave [[buffer(9)]],   /* x: wave index t, y: first row */
+                       device const uint8_t *gold [[buffer(10)]],
                        uint gid [[thread_position_in_grid]]) {
   int r = wave.y + (int)gid, c = wave.x - 2 * r;
   if (r >= fp->sb_rows || c < 0 || c >= fp->sb_cols) return;
   int idx = r * fp->sb_cols + c;
-  recon_sb(fp, sbs[idx], blocks, src, rec, ref, coefs, mats, scratch + (long)idx * SCRATCH_INTS);
+  recon_sb(fp, sbs[idx], blocks, src, rec, ref, gold, coefs, mats, scratch + (long)idx * SCRATCH_INTS);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -421,8 +433,23 @@ INLINE int coop_cfl_satd(DEV const FrameParams *fp, DEV const uint8_t *src, int 
 }
 
 /* eval_block( ) for one SIMD group. */
+INLINE long coop_inter_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
+                            DEV const int32_t *mvField, int mvNode, int x, int y, int w, int h, THR int *mvr,
+                            THR int *mvc, uint lane) {
+  int lam = fp->ac_q[0] / 16;
+  int cx = x >> 1, cy = y >> 1;
+  int sbIdx = (y >> 6) * fp->sb_cols + (x >> 6);
+  DEV const int32_t *mvp = mvField + (sbIdx * NUM_NODES + mvNode) * 2;
+  *mvr = mvp[0];
+  *mvc = mvp[1];
+  long c = coop_inter_satd(fp, src, ref, 0, x, y, w, h, *mvr, *mvc, lane);
+  for (int p = 1; p < 3; p++) c += coop_inter_satd(fp, src, ref, p, cx, cy, w >> 1, h >> 1, *mvr, *mvc, lane);
+  return c + (long)lam * (4 + mv_bits8(*mvr, *mvc)) / 8;
+}
+
 INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
-                            DEV const int32_t *mvField, int mvNode, int miRow, int miCol, int bsize,
+                            DEV const uint8_t *gold, DEV const int32_t *mvField, DEV const int32_t *mvFieldGold,
+                            int mvNode, int miRow, int miCol, int bsize,
                             DEV int32_t *scratch, int ps, THR BlockInfo *out, threadgroup int *A,
                             threadgroup int *L, uint lane) {
   DEV uint8_t *pred = (DEV uint8_t *)scratch;
@@ -433,15 +460,20 @@ INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, D
   int lam = fp->ac_q[0] / 16;
   int cx = x >> 1, cy = y >> 1, clw = lw - 1, clh = lh - 1;
   long interCost = -1;
-  int mvr = 0, mvc = 0;
+  int mvr = 0, mvc = 0, refFrame = LAST_FRAME;
   if (!fp->frame_is_intra) {
-    int sbIdx = (miRow >> 4) * fp->sb_cols + (miCol >> 4);
-    DEV const int32_t *mvp = mvField + (sbIdx * NUM_NODES + mvNode) * 2;
-    mvr = mvp[0];
-    mvc = mvp[1];
-    interCost = coop_inter_satd(fp, src, ref, 0, x, y, w, h, mvr, mvc, lane);
-    for (int p = 1; p < 3; p++) interCost += coop_inter_satd(fp, src, ref, p, cx, cy, w >> 1, h >> 1, mvr, mvc, lane);
-    interCost += (long)lam * (4 + mv_bits8(mvr, mvc)) / 8;
+    interCost = coop_inter_cost(fp, src, ref, mvField, mvNode, x, y, w, h, &mvr, &mvc, lane);
+    if (fp->golden) {
+      int gr, gc;
+      long g = coop_inter_cost(fp, src, gold, mvFieldGold, mvNode, x, y, w, h, &gr, &gc, lane) +
+               (long)lam * GOLDEN_REF_BITS8 / 8;
+      if (g < interCost) { /* tie: LAST */
+        interCost = g;
+        mvr = gr;
+        mvc = gc;
+        refFrame = GOLDEN_FRAME;
+      }
+    }
   }
   long best = -1;
   int bestMode = DC_PRED, bestDelta = 0;
@@ -505,6 +537,7 @@ INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, D
   out->tx_types_lo = out->tx_types_hi = 0;
   out->mv_row = 0;
   out->mv_col = 0;
+  out->ref_frame = INTRA_FRAME;
   out->tx_type = DCT_DCT;
   long cost = best + bestUv + (long)lam * (fp->frame_is_intra ? 0 : 16) / 8;
   if (interCost >= 0 && interCost < cost) {
@@ -516,6 +549,7 @@ INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, D
     out->angle_uv = 0;
     out->mv_row = mvr;
     out->mv_col = mvc;
+    out->ref_frame = refFrame;
   }
   return cost;
 }
@@ -529,6 +563,8 @@ kernel void mav1_analyze_coop(device const FrameParams *fp [[buffer(0)]],
                               device BlockInfo *infos [[buffer(5)]],
                               device int32_t *scratch [[buffer(6)]],
                               constant int &level [[buffer(7)]],
+                              device const uint8_t *gold [[buffer(8)]],
+                              device const int32_t *mvFieldGold [[buffer(9)]],
                               uint gid [[threadgroup_position_in_grid]],
                               uint lane [[thread_index_in_simdgroup]]) {
   threadgroup int eA[EDGE_LEN], eL[EDGE_LEN];
@@ -552,7 +588,7 @@ kernel void mav1_analyze_coop(device const FrameParams *fp [[buffer(0)]],
   int dr, dc;
   int bs = part_block(p, level_bsize(level), k, halfSz, &dr, &dc);
   BlockInfo b;
-  long cost = coop_eval_block(fp, src, ref, mvField, node, r + dr, c + dc, bs,
+  long cost = coop_eval_block(fp, src, ref, gold, mvField, mvFieldGold, node, r + dr, c + dc, bs,
                               scratch + (long)gid * analysis_slot_ints(level), 64 >> level, &b, eA + EDGE_OFF,
                               eL + EDGE_OFF, lane);
   if (lane == 0) {

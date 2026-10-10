@@ -100,12 +100,14 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
   ok |= buf_alloc(&e->src, e->frame_bytes);
   ok |= buf_alloc(&e->rec, e->frame_bytes);
   ok |= buf_alloc(&e->ref, e->frame_bytes);
+  if (cfg->multi_ref) ok |= buf_alloc(&e->gold, e->frame_bytes);
   ok |= buf_alloc(&e->params, sizeof(FrameParams));
   ok |= buf_alloc(&e->blocks, sizeof(BlockInfo) * MAX_BLOCKS_PER_SB * e->num_sbs);
   ok |= buf_alloc(&e->sbs, sizeof(SbInfo) * e->num_sbs);
   ok |= buf_alloc(&e->coefs, sizeof(int32_t) * COEFS_PER_SB * e->num_sbs);
   ok |= buf_alloc(&e->mats, sizeof(int32_t) * FWD_SLOT_SIZE * FWD_NUM_SLOTS);
   ok |= buf_alloc(&e->mvfield, sizeof(int32_t) * 2 * NUM_NODES * e->num_sbs);
+  ok |= buf_alloc(&e->mvgold, cfg->multi_ref ? sizeof(int32_t) * 2 * NUM_NODES * e->num_sbs : 0);
   ok |= buf_alloc(&e->acosts, sizeof(long) * A_ITEMS * (size_t)e->num_sbs);
   ok |= buf_alloc(&e->ainfos, sizeof(BlockInfo) * A_ITEMS * (size_t)e->num_sbs);
   {
@@ -153,6 +155,8 @@ void mav1_destroy(Mav1Encoder *e) {
   buf_free(&e->src);
   buf_free(&e->rec);
   buf_free(&e->ref);
+  buf_free(&e->gold);
+  buf_free(&e->mvgold);
   buf_free(&e->params);
   buf_free(&e->blocks);
   buf_free(&e->sbs);
@@ -259,6 +263,8 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   fp->lossless = q == 0;
   fp->tx_mode_select = q != 0 && e->cfg.tx_depth;
   fp->switchable_interp = !isKey && e->cfg.switchable_interp;
+  /* GOLDEN only when it holds another frame than LAST */
+  fp->golden = !isKey && e->cfg.multi_ref && e->gold_id != e->last_id;
   fp->fast = e->cfg.fast;
   fp->leaf = e->nonref && !getenv("MAV1_LEAFINTRA");
   fp->depth_thr = getenv("MAV1_DT") ? atoi(getenv("MAV1_DT")) : 0;
@@ -356,7 +362,7 @@ static void cdef_select(Mav1Encoder *e) {
 }
 
 const char *const mav1_tool_names[16] = {"intra", "inter", "cfl", "angle_delta", "tx_non_dct", "skip",
-                                          "rect_part", "compound", "obmc", "lr_wiener_units", "lr_sgr_units", "", "", "", "", ""};
+                                          "rect_part", "compound", "obmc", "lr_wiener_units", "lr_sgr_units", "golden", "", "", "", ""};
 
 static void count_tools(Mav1FrameStats *st, const BlockInfo *b) {
   st->tool_use[0] += !b->is_inter;
@@ -366,6 +372,7 @@ static void count_tools(Mav1FrameStats *st, const BlockInfo *b) {
   st->tool_use[4] += b->eob[0] > 0 && b->tx_type != DCT_DCT;
   st->tool_use[5] += b->eob[0] == 0 && b->eob[1] == 0 && b->eob[2] == 0;
   st->tool_use[6] += Block_Width(b->bsize) != Block_Height(b->bsize);
+  st->tool_use[11] += b->is_inter && b->ref_frame == GOLDEN_FRAME;
 }
 
 /* Frame-level quantizer cascade (low delay): the key frame and every 4th
@@ -397,7 +404,9 @@ int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int stride
   h->base_q_idx = frame_qindex(e, isKey);
   if (isKey) e->order_hint = 0;
   h->order_hint = e->order_hint;
-  h->refresh_frame_flags = isKey ? 0xFF : (e->nonref ? 0x00 : 0x01);
+  /* GOLDEN (slot 1): key frames and every 4th frame (the finer-q ones) */
+  e->golden_refresh = !isKey && !e->nonref && e->cfg.multi_ref && e->order_hint % 4 == 0;
+  h->refresh_frame_flags = isKey ? 0xFF : (e->nonref ? 0x00 : 0x01 | (e->golden_refresh ? 0x02 : 0));
   setup_params(e, isKey);
 
   double t0 = now();
@@ -454,6 +463,11 @@ int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int stride
     Buf tmp = e->ref;
     e->ref = e->rec;
     e->rec = tmp;
+    e->last_id = e->frame_num;
+    if (e->cfg.multi_ref && (isKey || e->golden_refresh)) {
+      memcpy(e->gold.base, e->ref.base, e->frame_bytes);
+      e->gold_id = e->frame_num;
+    }
   }
   e->have_ref = 1;
   e->frame_num++;

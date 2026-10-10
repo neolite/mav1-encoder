@@ -107,7 +107,9 @@ static void frame_header(const struct Mav1Encoder *e, BitWriter *w) {
     bw_f(w, 1, 0);               /* render_and_frame_size_different */
   } else {
     bw_f(w, 1, 0);               /* frame_refs_short_signaling */
-    for (int i = 0; i < REFS_PER_FRAME; i++) bw_f(w, 3, 0); /* ref_frame_idx */
+    /* ref_frame_idx: LAST -> slot 0, GOLDEN -> slot 1 (multi_ref), others slot 0 */
+    for (int i = 0; i < REFS_PER_FRAME; i++)
+      bw_f(w, 3, e->cfg.multi_ref && i == GOLDEN_FRAME - LAST_FRAME ? 1 : 0);
     bw_f(w, 1, 0);               /* render_and_frame_size_different */
     bw_f(w, 1, 0);               /* allow_high_precision_mv */
     if (e->cfg.switchable_interp) {

@@ -274,9 +274,10 @@ INLINE long code_plane(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const ui
 }
 
 INLINE void recon_block(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const uint8_t *src, DEV uint8_t *rec,
-                        DEV const uint8_t *ref, DEV int32_t *coefs, DEV const int32_t *mats,
-                        DEV int32_t *scratch, THR uint8_t *bd) {
+                        DEV const uint8_t *ref, DEV const uint8_t *gold, DEV int32_t *coefs,
+                        DEV const int32_t *mats, DEV int32_t *scratch, THR uint8_t *bd) {
   int bs = b->bsize;
+  if (b->ref_frame == GOLDEN_FRAME) ref = gold;
   int MiRow = b->mi_row, MiCol = b->mi_col;
   int maxLumaW = 0, maxLumaH = 0;
   b->tx_depth = 0;
@@ -362,7 +363,7 @@ INLINE void recon_block(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const u
 }
 
 INLINE void recon_sb(DEV const FrameParams *fp, SbInfo sb, DEV BlockInfo *blocks, DEV const uint8_t *src,
-                     DEV uint8_t *rec, DEV const uint8_t *ref, DEV int32_t *coefs, DEV const int32_t *mats,
+                     DEV uint8_t *rec, DEV const uint8_t *ref, DEV const uint8_t *gold, DEV int32_t *coefs, DEV const int32_t *mats,
                      DEV int32_t *scratch) {
   uint8_t bd[3 * BD_DIM * BD_DIM];
   int r = sb.sb_row * 16, c = sb.sb_col * 16;
@@ -381,7 +382,7 @@ INLINE void recon_sb(DEV const FrameParams *fp, SbInfo sb, DEV BlockInfo *blocks
     BD(plane, sbSize4 >> subY, -1) = 0;
   }
   for (int i = 0; i < sb.num_blocks; i++)
-    recon_block(fp, blocks + sb.first_block + i, src, rec, ref, coefs, mats, scratch, bd);
+    recon_block(fp, blocks + sb.first_block + i, src, rec, ref, gold, coefs, mats, scratch, bd);
 }
 
 #endif

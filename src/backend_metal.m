@@ -43,6 +43,9 @@ static id<MTLBuffer> wrap(Mav1MetalState *s, const Buf *buf) {
   return m;
 }
 
+/* The GOLDEN buffers exist only with multi_ref; otherwise bind LAST's. */
+static const Buf *gold_buf(struct Mav1Encoder *e) { return e->gold.base ? &e->gold : &e->ref; }
+
 static void run(Mav1MetalState *s, void (^encode)(id<MTLComputeCommandEncoder>)) {
   @autoreleasepool {
     id<MTLCommandBuffer> cb = [s.queue commandBuffer];
@@ -65,10 +68,14 @@ static void mtl_motion_search(Backend *b, struct Mav1Encoder *e) {
     [enc setBuffer:wrap(s, &e->ref) offset:0 atIndex:2];
     [enc setBuffer:wrap(s, &e->mvfield) offset:0 atIndex:3];
     [enc setBuffer:wrap(s, &e->mescratch) offset:0 atIndex:4];
-    /* levels depend on their parents: one dispatch each, one SIMD group per node */
+    [enc setBuffer:wrap(s, gold_buf(e)) offset:0 atIndex:6];
+    [enc setBuffer:wrap(s, &e->mvgold) offset:0 atIndex:7];
+    int nref = ENC_PARAMS(e)->golden ? 2 : 1;
+    /* levels depend on their parents: one dispatch each, one SIMD group per
+     * node and reference */
     for (int level = 0; level < 4; level++) {
       [enc setBytes:&level length:sizeof level atIndex:5];
-      NSUInteger groups = (NSUInteger)e->num_sbs << (2 * level);
+      NSUInteger groups = ((NSUInteger)e->num_sbs << (2 * level)) * nref;
       [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
       [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     }
@@ -88,6 +95,8 @@ static void mtl_analyze(Backend *b, struct Mav1Encoder *e) {
     [enc setBuffer:wrap(s, &e->acosts) offset:0 atIndex:4];
     [enc setBuffer:wrap(s, &e->ainfos) offset:0 atIndex:5];
     [enc setBuffer:wrap(s, &e->ascratch) offset:0 atIndex:6];
+    [enc setBuffer:wrap(s, gold_buf(e)) offset:0 atIndex:8];
+    [enc setBuffer:wrap(s, &e->mvgold) offset:0 atIndex:9];
     NSUInteger tg = MIN((NSUInteger)64, s.analyze.maxTotalThreadsPerThreadgroup);
     const FrameParams *fp = ENC_PARAMS(e);
     /* levels are independent; they share the scratch buffer, so they run as
@@ -138,6 +147,7 @@ static void mtl_recon(Backend *b, struct Mav1Encoder *e) {
     [enc setBuffer:wrap(s, &e->coefs) offset:0 atIndex:6];
     [enc setBuffer:wrap(s, &e->mats) offset:0 atIndex:7];
     [enc setBuffer:wrap(s, &e->scratch) offset:0 atIndex:8];
+    [enc setBuffer:wrap(s, gold_buf(e)) offset:0 atIndex:10];
     NSUInteger tg = MIN((NSUInteger)32, s.recon.maxTotalThreadsPerThreadgroup);
     int waves = e->sb_cols + 2 * (e->sb_rows - 1);
     /* Serial dispatch type: each wave sees the previous waves' writes. */
