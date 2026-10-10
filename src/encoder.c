@@ -232,7 +232,7 @@ static void setup_params(Mav1Encoder *e, int isKey) {
     fp->stride[p] = e->stride[p];
     fp->offset[p] = e->offset[p];
   }
-  int q = e->cfg.qindex;
+  int q = e->hdr.base_q_idx;
   fp->base_q_idx = q;
   for (int p = 0; p < 3; p++) {
     fp->dc_q[p] = Dc_Qlookup[0][q];
@@ -352,6 +352,18 @@ static void count_tools(Mav1FrameStats *st, const BlockInfo *b) {
   st->tool_use[6] += Block_Width(b->bsize) != Block_Height(b->bsize);
 }
 
+/* Frame-level quantizer cascade (low delay): the key frame and every 4th
+ * frame are coded finer, as they are the references most of the GOP
+ * predicts from. MAV1_QK / MAV1_Q4 / MAV1_QP override the offsets. */
+static int env_or(const char *n, int d) { const char *v = getenv(n); return v ? atoi(v) : d; }
+static int frame_qindex(const Mav1Encoder *e, int isKey) {
+  int q = e->cfg.qindex;
+  if (q == 0) return 0;
+  int off = isKey ? env_or("MAV1_QK", -24) : (e->order_hint % 4 == 0 ? env_or("MAV1_Q4", -8) : env_or("MAV1_QP", 4));
+  q += off;
+  return q < 1 ? 1 : q > 255 ? 255 : q;
+}
+
 int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int strides[3], uint8_t **out,
                 size_t *outSize) {
   int isKey = e->frame_num == 0 || (e->cfg.keyint > 0 && e->frame_num % e->cfg.keyint == 0);
@@ -362,7 +374,7 @@ int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int stride
   FrameHdr *h = &e->hdr;
   memset(h, 0, sizeof(*h));
   h->frame_type = isKey ? KEY_FRAME : INTER_FRAME;
-  h->base_q_idx = e->cfg.qindex;
+  h->base_q_idx = frame_qindex(e, isKey);
   if (isKey) e->order_hint = 0;
   h->order_hint = e->order_hint;
   h->refresh_frame_flags = isKey ? 0xFF : 0x01;
