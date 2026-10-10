@@ -32,6 +32,11 @@ void cdf_init(CdfContext *c, int base_q_idx) {
   COPY(c->ref_mv, Default_Ref_Mv_Cdf);
   COPY(c->drl_mode, Default_Drl_Mode_Cdf);
   COPY(c->single_ref, Default_Single_Ref_Cdf);
+  COPY(c->comp_mode, Default_Comp_Mode_Cdf);
+  COPY(c->comp_ref_type, Default_Comp_Ref_Type_Cdf);
+  COPY(c->comp_ref, Default_Comp_Ref_Cdf);
+  COPY(c->comp_bwd_ref, Default_Comp_Bwd_Ref_Cdf);
+  COPY(c->compound_mode, Default_Compound_Mode_Cdf);
   /* MvCtx 0 only (intrabc is not used). */
   COPY(c->mv_joint, Default_Mv_Joint_Cdf);
   for (int comp = 0; comp < 2; comp++) {

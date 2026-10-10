@@ -31,6 +31,11 @@ typedef struct {
   uint16_t ref_mv[REF_MV_CONTEXTS][3];
   uint16_t drl_mode[DRL_MODE_CONTEXTS][3];
   uint16_t single_ref[REF_CONTEXTS][SINGLE_REFS - 1][3];
+  uint16_t comp_mode[COMP_INTER_CONTEXTS][3];
+  uint16_t comp_ref_type[COMP_REF_TYPE_CONTEXTS][3];
+  uint16_t comp_ref[REF_CONTEXTS][FWD_REFS - 1][3];
+  uint16_t comp_bwd_ref[REF_CONTEXTS][BWD_REFS - 1][3];
+  uint16_t compound_mode[COMPOUND_MODE_CONTEXTS][COMPOUND_MODES + 1];
   uint16_t mv_joint[MV_JOINTS + 1];
   uint16_t mv_class[2][MV_CLASSES + 1];
   uint16_t mv_class0_bit[2][3];

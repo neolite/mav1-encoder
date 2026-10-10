@@ -10,9 +10,10 @@
 typedef struct {
   struct Mav1Encoder *e;
   int miRow, miCol, miSize, bw4, bh4;
-  int refFrame; /* RefFrame[ 0 ] (RefFrame[ 1 ] is NONE) */
+  int refFrame[2]; /* RefFrame[ 0 ], RefFrame[ 1 ] (0 for single prediction) */
+  int isCompound;
   int numMvFound, newMvCount, foundMatch;
-  int stack[MAX_REF_MV_STACK_SIZE + 2][2];
+  int stack[MAX_REF_MV_STACK_SIZE + 2][2][2]; /* RefStackMv[ idx ][ list ][ comp ] */
   int weight[MAX_REF_MV_STACK_SIZE + 2];
   int drlCtx[MAX_REF_MV_STACK_SIZE];
   int newMvContext, refMvContext, zeroMvContext;
@@ -41,25 +42,59 @@ static int has_newmv(int mode) {
          mode == NEW_NEARESTMV;
 }
 
-/* 7.10.2.7 / 7.10.2.8 (RefFrames[][1] is always NONE here). */
+static void mi_mv(const MiInfo *m, int list, int *mv) {
+  mv[0] = list ? m->mv1_row : m->mv_row;
+  mv[1] = list ? m->mv1_col : m->mv_col;
+}
+
+static int mi_ref(const MiInfo *m, int list) { return list ? m->ref1 : m->ref0; }
+
+/* 7.10.2.7 - 7.10.2.9 (GLOBALMV with identity motion is a plain MV). */
 static void add_ref_mv_candidate(MvStack *s, int r, int c, int weight) {
   const MiInfo *m = mi_at(s->e, r, c);
-  if (!m->is_inter || m->ref0 != s->refFrame) return;
-  int cand[2] = {m->mv_row, m->mv_col}; /* GLOBALMV with identity motion is a plain MV */
-  lower_precision(cand);
-  if (has_newmv(m->y_mode)) s->newMvCount++;
-  s->foundMatch = 1;
-  for (int i = 0; i < s->numMvFound; i++)
-    if (s->stack[i][0] == cand[0] && s->stack[i][1] == cand[1]) {
-      s->weight[i] += weight;
-      return;
+  if (!m->is_inter) return;
+  if (!s->isCompound) {
+    for (int candList = 0; candList < 2; candList++) {
+      if (mi_ref(m, candList) != s->refFrame[0]) continue;
+      int cand[2];
+      mi_mv(m, candList, cand);
+      lower_precision(cand);
+      if (has_newmv(m->y_mode)) s->newMvCount++;
+      s->foundMatch = 1;
+      int i;
+      for (i = 0; i < s->numMvFound; i++)
+        if (s->stack[i][0][0] == cand[0] && s->stack[i][0][1] == cand[1]) break;
+      if (i < s->numMvFound) {
+        s->weight[i] += weight;
+      } else if (s->numMvFound < MAX_REF_MV_STACK_SIZE) {
+        s->stack[i][0][0] = cand[0];
+        s->stack[i][0][1] = cand[1];
+        s->weight[i] = weight;
+        s->numMvFound++;
+      }
     }
-  if (s->numMvFound < MAX_REF_MV_STACK_SIZE) {
-    s->stack[s->numMvFound][0] = cand[0];
-    s->stack[s->numMvFound][1] = cand[1];
-    s->weight[s->numMvFound] = weight;
+    return;
+  }
+  if (m->ref0 != s->refFrame[0] || m->ref1 != s->refFrame[1]) return;
+  int cand[2][2];
+  mi_mv(m, 0, cand[0]);
+  mi_mv(m, 1, cand[1]);
+  lower_precision(cand[0]);
+  lower_precision(cand[1]);
+  s->foundMatch = 1;
+  int i;
+  for (i = 0; i < s->numMvFound; i++)
+    if (s->stack[i][0][0] == cand[0][0] && s->stack[i][0][1] == cand[0][1] && s->stack[i][1][0] == cand[1][0] &&
+        s->stack[i][1][1] == cand[1][1])
+      break;
+  if (i < s->numMvFound) {
+    s->weight[i] += weight;
+  } else if (s->numMvFound < MAX_REF_MV_STACK_SIZE) {
+    memcpy(s->stack[i], cand, sizeof cand);
+    s->weight[i] = weight;
     s->numMvFound++;
   }
+  if (has_newmv(m->y_mode)) s->newMvCount++;
 }
 
 static void scan_row(MvStack *s, int deltaRow) {
@@ -111,17 +146,22 @@ static void sort_stack(MvStack *s, int start, int end) {
     for (int i = start + 1; i < end; i++)
       if (s->weight[i - 1] < s->weight[i]) {
         int t = s->weight[i - 1]; s->weight[i - 1] = s->weight[i]; s->weight[i] = t;
-        for (int k = 0; k < 2; k++) { t = s->stack[i - 1][k]; s->stack[i - 1][k] = s->stack[i][k]; s->stack[i][k] = t; }
+        int tmp[2][2];
+        memcpy(tmp, s->stack[i - 1], sizeof tmp);
+        memcpy(s->stack[i - 1], s->stack[i], sizeof tmp);
+        memcpy(s->stack[i], tmp, sizeof tmp);
         newEnd = i;
       }
     end = newEnd;
   }
 }
 
-/* 7.10.2.12 / 7.10.2.13 for single prediction. */
+/* 7.10.2.12 / 7.10.2.13 (GlobalMvs are zero). */
 static void extra_search(MvStack *s) {
-  int w4 = k_min(k_min(16, s->bw4), s->e->mi_cols - s->miCol);
-  int h4 = k_min(k_min(16, s->bh4), s->e->mi_rows - s->miRow);
+  struct Mav1Encoder *e = s->e;
+  int idMvs[2][2][2], diffMvs[2][2][2], idCount[2] = {0, 0}, diffCount[2] = {0, 0};
+  int w4 = k_min(k_min(16, s->bw4), e->mi_cols - s->miCol);
+  int h4 = k_min(k_min(16, s->bh4), e->mi_rows - s->miRow);
   int num4x4 = k_min(w4, h4);
   for (int pass = 0; pass < 2; pass++) {
     int idx = 0;
@@ -129,24 +169,70 @@ static void extra_search(MvStack *s) {
       int r = pass == 0 ? s->miRow - 1 : s->miRow + idx;
       int c = pass == 0 ? s->miCol + idx : s->miCol - 1;
       if (!is_inside(s, r, c)) break;
-      const MiInfo *m = mi_at(s->e, r, c);
-      if (m->is_inter && m->ref0 > INTRA_FRAME) { /* candList 1 is NONE */
-        int cand[2] = {m->mv_row, m->mv_col};
-        if (s->e->sign_bias[m->ref0] != s->e->sign_bias[s->refFrame]) { cand[0] *= -1; cand[1] *= -1; }
-        int i;
-        for (i = 0; i < s->numMvFound; i++)
-          if (cand[0] == s->stack[i][0] && cand[1] == s->stack[i][1]) break;
-        if (i == s->numMvFound) {
-          s->stack[i][0] = cand[0];
-          s->stack[i][1] = cand[1];
-          s->weight[i] = 2;
-          s->numMvFound++;
+      const MiInfo *m = mi_at(e, r, c);
+      for (int candList = 0; candList < 2 && m->is_inter; candList++) {
+        int candRef = mi_ref(m, candList);
+        if (candRef <= INTRA_FRAME) continue;
+        if (s->isCompound) {
+          for (int list = 0; list < 2; list++) {
+            int cand[2];
+            mi_mv(m, candList, cand);
+            if (candRef == s->refFrame[list] && idCount[list] < 2) {
+              idMvs[list][idCount[list]][0] = cand[0];
+              idMvs[list][idCount[list]][1] = cand[1];
+              idCount[list]++;
+            } else if (diffCount[list] < 2) {
+              if (e->sign_bias[candRef] != e->sign_bias[s->refFrame[list]]) { cand[0] *= -1; cand[1] *= -1; }
+              diffMvs[list][diffCount[list]][0] = cand[0];
+              diffMvs[list][diffCount[list]][1] = cand[1];
+              diffCount[list]++;
+            }
+          }
+        } else {
+          int cand[2];
+          mi_mv(m, candList, cand);
+          if (e->sign_bias[candRef] != e->sign_bias[s->refFrame[0]]) { cand[0] *= -1; cand[1] *= -1; }
+          int i;
+          for (i = 0; i < s->numMvFound; i++)
+            if (cand[0] == s->stack[i][0][0] && cand[1] == s->stack[i][0][1]) break;
+          if (i == s->numMvFound) {
+            s->stack[i][0][0] = cand[0];
+            s->stack[i][0][1] = cand[1];
+            s->weight[i] = 2;
+            s->numMvFound++;
+          }
         }
       }
       idx += pass == 0 ? Num_4x4_Blocks_Wide[m->bsize] : Num_4x4_Blocks_High[m->bsize];
     }
   }
-  for (int idx = s->numMvFound; idx < 2; idx++) s->stack[idx][0] = s->stack[idx][1] = 0; /* GlobalMvs[0] */
+  if (s->isCompound) {
+    int comb[2][2][2]; /* [idx][list][comp] */
+    for (int list = 0; list < 2; list++) {
+      int n = 0;
+      for (int i = 0; i < idCount[list]; i++, n++) { comb[n][list][0] = idMvs[list][i][0]; comb[n][list][1] = idMvs[list][i][1]; }
+      for (int i = 0; i < diffCount[list] && n < 2; i++, n++) {
+        comb[n][list][0] = diffMvs[list][i][0];
+        comb[n][list][1] = diffMvs[list][i][1];
+      }
+      for (; n < 2; n++) comb[n][list][0] = comb[n][list][1] = 0;
+    }
+    if (s->numMvFound == 1) {
+      int k = (comb[0][0][0] == s->stack[0][0][0] && comb[0][0][1] == s->stack[0][0][1] &&
+               comb[0][1][0] == s->stack[0][1][0] && comb[0][1][1] == s->stack[0][1][1]) ? 1 : 0;
+      memcpy(s->stack[1], comb[k], sizeof comb[k]);
+      s->weight[1] = 2;
+      s->numMvFound++;
+    } else {
+      for (int k = 0; k < 2; k++) {
+        memcpy(s->stack[s->numMvFound], comb[k], sizeof comb[k]);
+        s->weight[s->numMvFound] = 2;
+        s->numMvFound++;
+      }
+    }
+  } else {
+    for (int idx = s->numMvFound; idx < 2; idx++) s->stack[idx][0][0] = s->stack[idx][0][1] = 0; /* GlobalMvs[0] */
+  }
 }
 
 static void find_mv_stack(MvStack *s) {
@@ -201,10 +287,11 @@ static void find_mv_stack(MvStack *s) {
   int bw = s->bw4 * 4, bh = s->bh4 * 4;
   int top = -(s->miRow * MI_SIZE * 8), bottom = (s->e->mi_rows - s->bh4 - s->miRow) * MI_SIZE * 8;
   int left = -(s->miCol * MI_SIZE * 8), right = (s->e->mi_cols - s->bw4 - s->miCol) * MI_SIZE * 8;
-  for (int i = 0; i < s->numMvFound; i++) {
-    s->stack[i][0] = Clip3(top - (MV_BORDER + bh * 8), bottom + MV_BORDER + bh * 8, s->stack[i][0]);
-    s->stack[i][1] = Clip3(left - (MV_BORDER + bw * 8), right + MV_BORDER + bw * 8, s->stack[i][1]);
-  }
+  for (int list = 0; list < 1 + s->isCompound; list++)
+    for (int i = 0; i < s->numMvFound; i++) {
+      s->stack[i][list][0] = Clip3(top - (MV_BORDER + bh * 8), bottom + MV_BORDER + bh * 8, s->stack[i][list][0]);
+      s->stack[i][list][1] = Clip3(left - (MV_BORDER + bw * 8), right + MV_BORDER + bw * 8, s->stack[i][list][1]);
+    }
   if (closeMatches == 0) {
     s->newMvContext = k_min(totalMatches, 1);
     s->refMvContext = totalMatches;
@@ -278,6 +365,47 @@ static void write_single_ref(EntEnc *ec, CdfContext *cdf, struct Mav1Encoder *e,
   else ec_symbol(ec, 0, cdf->single_ref[ref_count_ctx(cnt[LAST_FRAME], cnt[LAST2_FRAME])][3], 2);
 }
 
+/* AboveRefFrame / LeftRefFrame helpers for the compound contexts. */
+typedef struct { int avail, ref0, ref1; } Nb;
+static int nb_intra(Nb n) { return n.ref0 <= INTRA_FRAME; }
+static int nb_single(Nb n) { return n.ref1 <= INTRA_FRAME; }
+static int check_backward(int r) { return r >= BWDREF_FRAME && r <= ALTREF_FRAME; }
+static int samedir(int a, int b) { return (a >= BWDREF_FRAME) == (b >= BWDREF_FRAME); }
+
+static int comp_mode_ctx(Nb a, Nb l) {
+  if (a.avail && l.avail) {
+    if (nb_single(a) && nb_single(l)) return check_backward(a.ref0) ^ check_backward(l.ref0);
+    if (nb_single(a)) return 2 + (check_backward(a.ref0) || nb_intra(a));
+    if (nb_single(l)) return 2 + (check_backward(l.ref0) || nb_intra(l));
+    return 4;
+  }
+  if (a.avail) return nb_single(a) ? check_backward(a.ref0) : 3;
+  if (l.avail) return nb_single(l) ? check_backward(l.ref0) : 3;
+  return 1;
+}
+
+static int comp_ref_type_ctx(Nb a, Nb l) {
+  int aboveComp = a.avail && !nb_intra(a) && !nb_single(a), leftComp = l.avail && !nb_intra(l) && !nb_single(l);
+  int aboveUni = aboveComp && samedir(a.ref0, a.ref1), leftUni = leftComp && samedir(l.ref0, l.ref1);
+  if (a.avail && !nb_intra(a) && l.avail && !nb_intra(l)) {
+    int sd = samedir(a.ref0, l.ref0);
+    if (!aboveComp && !leftComp) return 1 + 2 * sd;
+    if (!aboveComp) return !leftUni ? 1 : 3 + sd;
+    if (!leftComp) return !aboveUni ? 1 : 3 + sd;
+    if (!aboveUni && !leftUni) return 0;
+    if (!aboveUni || !leftUni) return 2;
+    return 3 + ((a.ref0 == BWDREF_FRAME) == (l.ref0 == BWDREF_FRAME));
+  }
+  if (a.avail && l.avail) {
+    if (aboveComp) return 1 + 2 * aboveUni;
+    if (leftComp) return 1 + 2 * leftUni;
+    return 2;
+  }
+  if (aboveComp) return 4 * aboveUni;
+  if (leftComp) return 4 * leftUni;
+  return 2;
+}
+
 int write_inter_block(EntEnc *ec, CdfContext *cdf, struct Mav1Encoder *e, const BlockInfo *b) {
   MvStack s;
   memset(&s, 0, sizeof(s));
@@ -287,17 +415,54 @@ int write_inter_block(EntEnc *ec, CdfContext *cdf, struct Mav1Encoder *e, const 
   s.miSize = b->bsize;
   s.bw4 = Num_4x4_Blocks_Wide[b->bsize];
   s.bh4 = Num_4x4_Blocks_High[b->bsize];
-  s.refFrame = b->ref_frame;
+  s.refFrame[0] = b->ref_frame;
+  s.refFrame[1] = b->ref_frame1;
+  s.isCompound = b->ref_frame1 > INTRA_FRAME;
   int r = b->mi_row, c = b->mi_col;
 
-  /* read_ref_frames, single reference (LAST, GOLDEN or ALTREF). */
-  write_single_ref(ec, cdf, e, r, c, b->ref_frame);
+  /* read_ref_frames( ) */
+  if (e->hdr.reference_select) {
+    Nb a = {r > 0, 0, 0}, l = {c > tile_col_start(ENC_PARAMS(e), c), 0, 0};
+    if (a.avail) { a.ref0 = mi_at(e, r - 1, c)->ref0; a.ref1 = mi_at(e, r - 1, c)->ref1; }
+    if (l.avail) { l.ref0 = mi_at(e, r, c - 1)->ref0; l.ref1 = mi_at(e, r, c - 1)->ref1; }
+    ec_symbol(ec, s.isCompound, cdf->comp_mode[comp_mode_ctx(a, l)], 2);
+    if (s.isCompound) {
+      /* BIDIR_COMP_REFERENCE, LAST_FRAME + ALTREF_FRAME */
+      if (b->ref_frame != LAST_FRAME || b->ref_frame1 != ALTREF_FRAME) abort();
+      ec_symbol(ec, 1, cdf->comp_ref_type[comp_ref_type_ctx(a, l)], 2);
+      int cnt[ALTREF_FRAME + 1];
+      for (int f = LAST_FRAME; f <= ALTREF_FRAME; f++) cnt[f] = count_refs(e, r, c, f);
+      ec_symbol(ec, 0, cdf->comp_ref[ref_count_ctx(cnt[LAST_FRAME] + cnt[LAST2_FRAME], cnt[LAST3_FRAME] + cnt[GOLDEN_FRAME])][0], 2);
+      ec_symbol(ec, 0, cdf->comp_ref[ref_count_ctx(cnt[LAST_FRAME], cnt[LAST2_FRAME])][1], 2);
+      ec_symbol(ec, 1, cdf->comp_bwd_ref[ref_count_ctx(cnt[BWDREF_FRAME] + cnt[ALTREF2_FRAME], cnt[ALTREF_FRAME])][0], 2);
+    }
+  }
+  if (!s.isCompound) write_single_ref(ec, cdf, e, r, c, b->ref_frame);
 
   find_mv_stack(&s);
 
   int mr = b->mv_row, mc = b->mv_col;
+  if (s.isCompound) {
+    int mr1 = b->mv1_row, mc1 = b->mv1_col;
+    int mode = NEW_NEWMV;
+    if (mr == s.stack[0][0][0] && mc == s.stack[0][0][1] && mr1 == s.stack[0][1][0] && mc1 == s.stack[0][1][1])
+      mode = NEAREST_NEARESTMV;
+    else if (mr == 0 && mc == 0 && mr1 == 0 && mc1 == 0)
+      mode = GLOBAL_GLOBALMV;
+    if (mode == NEW_NEWMV && (!mvpred_valid_newmv(mr, mc) || !mvpred_valid_newmv(mr1, mc1))) abort();
+    int ctx = Compound_Mode_Ctx_Map[s.refMvContext >> 1][k_min(s.newMvContext, COMP_NEWMV_CTXS - 1)];
+    ec_symbol(ec, mode - NEAREST_NEARESTMV, cdf->compound_mode[ctx], COMPOUND_MODES);
+    if (mode == NEW_NEWMV) {
+      /* RefMvIdx 0: the first drl_mode (NumMvFound >= 2 for compound) is 0 */
+      if (s.numMvFound > 1) ec_symbol(ec, 0, cdf->drl_mode[s.drlCtx[0]], 2);
+      write_mv(ec, cdf, mr - s.stack[0][0][0], mc - s.stack[0][0][1]);
+      write_mv(ec, cdf, mr1 - s.stack[0][1][0], mc1 - s.stack[0][1][1]);
+    }
+    return mode;
+  }
+
   int mode = NEWMV, refMvIdx = 0;
-  if (mr == s.stack[0][0] && mc == s.stack[0][1]) {
+  if (mr == s.stack[0][0][0] && mc == s.stack[0][0][1]) {
     mode = NEARESTMV;
   } else if (mr == 0 && mc == 0) {
     mode = GLOBALMV;
@@ -306,7 +471,7 @@ int write_inter_block(EntEnc *ec, CdfContext *cdf, struct Mav1Encoder *e, const 
     for (int idx = 1; idx < 4; idx++) {
       if (idx > 1 && s.numMvFound <= idx) break;
       if (idx == 1 || idx < s.numMvFound) {
-        if (mr == s.stack[idx][0] && mc == s.stack[idx][1]) {
+        if (mr == s.stack[idx][0][0] && mc == s.stack[idx][0][1]) {
           mode = NEARMV;
           refMvIdx = idx;
           break;
@@ -339,7 +504,7 @@ int write_inter_block(EntEnc *ec, CdfContext *cdf, struct Mav1Encoder *e, const 
       }
     }
   }
-  if (mode == NEWMV) write_mv(ec, cdf, mr - s.stack[0][0], mc - s.stack[0][1]);
+  if (mode == NEWMV) write_mv(ec, cdf, mr - s.stack[0][0][0], mc - s.stack[0][0][1]);
   /* read_interintra_mode, read_motion_mode, read_compound_type and the
    * interpolation filter carry no syntax with the frame/sequence settings. */
   return mode;

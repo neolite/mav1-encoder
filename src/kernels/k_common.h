@@ -67,6 +67,7 @@ typedef struct {
   int32_t switchable_interp;          /* interpolation_filter == SWITCHABLE (dual filter) */
   int32_t golden;                     /* inter blocks may also predict from a second reference */
   int32_t ref2_frame;                 /* that reference: GOLDEN_FRAME or ALTREF_FRAME */
+  int32_t compound;                   /* LAST + ref2 compound (COMPOUND_AVERAGE) blocks allowed */
   int32_t lf_level[4];                /* loop_filter_level[] */
   int32_t lf_sharpness;
   int32_t cdef_damping, cdef_bits;
@@ -101,6 +102,8 @@ typedef struct {
   int32_t interp_filter;                /* interp_filter[0] | interp_filter[1] << 2;
                                          * bit 4/5: get_filter_type( ) for luma/chroma */
   int32_t ref_frame;                    /* RefFrame[ 0 ] of inter blocks (LAST_FRAME or fp->ref2_frame) */
+  int32_t ref_frame1;                   /* RefFrame[ 1 ] of compound blocks (fp->ref2_frame), else 0 */
+  int32_t mv1_row, mv1_col;             /* Mv[ 1 ] of compound blocks */
 } BlockInfo;
 
 /* Per-superblock index range into the block list. */

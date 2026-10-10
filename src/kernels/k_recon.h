@@ -277,12 +277,14 @@ INLINE void recon_block(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const u
                         DEV const uint8_t *ref, DEV const uint8_t *gold, DEV int32_t *coefs,
                         DEV const int32_t *mats, DEV int32_t *scratch, THR uint8_t *bd) {
   int bs = b->bsize;
+  int comp = b->is_inter && b->ref_frame1 > INTRA_FRAME; /* LAST + second reference */
+  DEV const uint8_t *ref1 = gold;
   if (b->is_inter && b->ref_frame != LAST_FRAME) ref = gold; /* second reference */
   int MiRow = b->mi_row, MiCol = b->mi_col;
   int maxLumaW = 0, maxLumaH = 0;
   b->tx_depth = 0;
   b->interp_filter &= 0x30; /* keep the intra edge filter types */
-  if (b->is_inter && fp->switchable_interp) {
+  if (b->is_inter && fp->switchable_interp && !comp) {
     /* dual filter search on the luma prediction: 3 vertical x 3 horizontal */
     int w = Block_Width(bs), h = Block_Height(bs);
     int x0 = MiCol * 4, y0 = MiRow * 4, stride = fp->stride[0];
@@ -311,7 +313,19 @@ INLINE void recon_block(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const u
     int subX = plane > 0, subY = plane > 0;
     int stride = fp->stride[plane];
     int baseX = (MiCol >> subX) * 4, baseY = (MiRow >> subY) * 4;
-    if (b->is_inter) {
+    if (comp) {
+      /* COMPOUND_AVERAGE; the raw predictions use the residual / coefficient
+       * scratch, which is free until code_plane( ) */
+      int w = Block_Width(bs) >> subX, h = Block_Height(bs) >> subY;
+      DEV int32_t *p0 = scratch + S_RESID, *p1 = scratch + S_COEF;
+      predict_inter_raw(ref + fp->offset[plane], stride, fp->frame_w, fp->frame_h, p0, w, baseX, baseY, w, h,
+                        b->mv_row, b->mv_col, subX, subY, b->interp_filter, scratch + S_TMP);
+      predict_inter_raw(ref1 + fp->offset[plane], stride, fp->frame_w, fp->frame_h, p1, w, baseX, baseY, w, h,
+                        b->mv1_row, b->mv1_col, subX, subY, b->interp_filter, scratch + S_TMP);
+      DEV uint8_t *d = rec + fp->offset[plane] + baseY * stride + baseX;
+      for (int i = 0; i < h; i++)
+        for (int j = 0; j < w; j++) d[i * stride + j] = (uint8_t)Clip1(Round2(p0[i * w + j] + p1[i * w + j], 5));
+    } else if (b->is_inter) {
       predict_inter_block(ref + fp->offset[plane], stride, fp->frame_w, fp->frame_h,
                           rec + fp->offset[plane] + baseY * stride + baseX, stride, baseX, baseY,
                           Block_Width(bs) >> subX, Block_Height(bs) >> subY, b->mv_row, b->mv_col, subX, subY,

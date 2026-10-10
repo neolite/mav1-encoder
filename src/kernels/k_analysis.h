@@ -127,6 +127,30 @@ INLINE long inter_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
 
 /* Rate of signalling GOLDEN_FRAME instead of LAST_FRAME (1/8 bit). */
 #define GOLDEN_REF_BITS8 8
+/* Extra rate of a compound block (second reference, mode) (1/8 bit). */
+#define COMPOUND_BITS8 16
+
+/* Compound (LAST + second reference) cost estimate: SATD of the rounded
+ * average of the two 8-bit single predictions, each with its reference's
+ * motion vector. pred2 holds a second ps x ps prediction. */
+INLINE long compound_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
+                          DEV const uint8_t *ref2, int x, int y, int w, int h, DEV uint8_t *pred,
+                          DEV uint8_t *pred2, int ps, DEV int32_t *tmp, int mvr, int mvc, int mvr2, int mvc2) {
+  int lam = fp->ac_q[0] / 16;
+  long c = 0;
+  for (int p = 0; p < 3; p++) {
+    int sub = p > 0;
+    int bx = x >> sub, by = y >> sub, bw = w >> sub, bh = h >> sub;
+    predict_inter_block(ref + fp->offset[p], fp->stride[p], fp->frame_w, fp->frame_h, pred, ps, bx, by, bw, bh, mvr,
+                        mvc, sub, sub, EIGHTTAP, tmp);
+    predict_inter_block(ref2 + fp->offset[p], fp->stride[p], fp->frame_w, fp->frame_h, pred2, ps, bx, by, bw, bh,
+                        mvr2, mvc2, sub, sub, EIGHTTAP, tmp);
+    for (int i = 0; i < bh; i++)
+      for (int j = 0; j < bw; j++) pred[i * ps + j] = (uint8_t)((pred[i * ps + j] + pred2[i * ps + j] + 1) >> 1);
+    c += block_satd_s(src + fp->offset[p] + by * fp->stride[p] + bx, fp->stride[p], pred, ps, bw, bh);
+  }
+  return c + (long)lam * (8 + mv_bits8(mvr, mvc) + mv_bits8(mvr2, mvc2) + COMPOUND_BITS8) / 8;
+}
 
 /* Evaluates the block (miRow, miCol, bsize); the inter candidates use the
  * motion vector of square node `mvNode` of the superblock, per reference
@@ -146,11 +170,11 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
 
   int cx = x >> 1, cy = y >> 1, clw = lw - 1, clh = lh - 1;
   long interCost = -1;
-  int mvr = 0, mvc = 0, refFrame = LAST_FRAME;
+  int mvr = 0, mvc = 0, refFrame = LAST_FRAME, refFrame1 = 0, mvr1 = 0, mvc1 = 0;
   if (!fp->frame_is_intra) {
     interCost = inter_cost(fp, src, ref, mvField, mvNode, x, y, w, h, pred, ps, tmpArea, &mvr, &mvc);
     if (fp->golden) {
-      int gr, gc;
+      int lr = mvr, lc = mvc, gr, gc;
       long g = inter_cost(fp, src, gold, mvFieldGold, mvNode, x, y, w, h, pred, ps, tmpArea, &gr, &gc) +
                (long)lam * GOLDEN_REF_BITS8 / 8;
       if (g < interCost) { /* tie: LAST */
@@ -158,6 +182,19 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
         mvr = gr;
         mvc = gc;
         refFrame = fp->ref2_frame;
+      }
+      if (fp->compound) {
+        DEV uint8_t *pred2 = (DEV uint8_t *)(tmpArea + (ps + 7) * ps);
+        long cc = compound_cost(fp, src, ref, gold, x, y, w, h, pred, pred2, ps, tmpArea, lr, lc, gr, gc);
+        if (cc < interCost) {
+          interCost = cc;
+          mvr = lr;
+          mvc = lc;
+          mvr1 = gr;
+          mvc1 = gc;
+          refFrame = LAST_FRAME;
+          refFrame1 = fp->ref2_frame;
+        }
       }
     }
   }
@@ -229,6 +266,8 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
   out->mv_row = 0;
   out->mv_col = 0;
   out->ref_frame = INTRA_FRAME;
+  out->ref_frame1 = 0;
+  out->mv1_row = out->mv1_col = 0;
   out->tx_type = DCT_DCT;
   long cost = best + bestUv + (long)lam * (fp->frame_is_intra ? 0 : 16) / 8;
 
@@ -243,6 +282,9 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
       out->mv_row = mvr;
       out->mv_col = mvc;
       out->ref_frame = refFrame;
+      out->ref_frame1 = refFrame1;
+      out->mv1_row = mvr1;
+      out->mv1_col = mvc1;
     }
   }
   return cost;
@@ -460,7 +502,7 @@ INLINE int level_slots(DEV const FrameParams *fp, int level) {
 
 INLINE int analysis_slot_ints(int level) {
   int w = 64 >> level;
-  return (w * w + 3) / 4 + (w + 7) * w;
+  return 2 * ((w * w + 3) / 4) + (w + 7) * w; /* pred, filter intermediate, pred2 */
 }
 
 /* Pass 1: item (level, node i, slot) of superblock sbIdx. */

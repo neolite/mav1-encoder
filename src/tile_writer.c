@@ -339,12 +339,14 @@ static void write_block(Tile *t, const BlockInfo *b) {
          * needs_interp_filter( ): no skip mode, SIMPLE motion; GLOBALMV with
          * GmType IDENTITY (not TRANSLATION) on blocks >= 8x8 is not coded and
          * uses EIGHTTAP (its zero MV makes the filter irrelevant). */
-        if (interMode == GLOBALMV) ((BlockInfo *)b)->interp_filter = 0;
-        for (int dir = 0; dir < 2 && interMode != GLOBALMV; dir++) {
-          int ctx = (dir & 1) * 2 * 4;
+        int glob = interMode == GLOBALMV || interMode == GLOBAL_GLOBALMV;
+        if (glob) ((BlockInfo *)b)->interp_filter &= ~15;
+        for (int dir = 0; dir < 2 && !glob; dir++) {
+          int ctx = ((dir & 1) * 2 + (b->ref_frame1 > INTRA_FRAME)) * 4;
           int leftType = 3, aboveType = 3;
-          if (availL && mi_at(e, r, c - 1)->ref0 == b->ref_frame) leftType = mi_at(e, r, c - 1)->interp[dir];
-          if (availU && mi_at(e, r - 1, c)->ref0 == b->ref_frame) aboveType = mi_at(e, r - 1, c)->interp[dir];
+          const MiInfo *lm = availL ? mi_at(e, r, c - 1) : NULL, *am = availU ? mi_at(e, r - 1, c) : NULL;
+          if (lm && (lm->ref0 == b->ref_frame || lm->ref1 == b->ref_frame)) leftType = lm->interp[dir];
+          if (am && (am->ref0 == b->ref_frame || am->ref1 == b->ref_frame)) aboveType = am->interp[dir];
           if (leftType == aboveType) ctx += leftType;
           else if (leftType == 3) ctx += aboveType;
           else if (aboveType == 3) ctx += leftType;
@@ -416,6 +418,9 @@ static void write_block(Tile *t, const BlockInfo *b) {
       m->tx_size = (int8_t)txSize; /* InterTxSizes */
       m->mv_row = (int16_t)(b->is_inter ? b->mv_row : 0);
       m->mv_col = (int16_t)(b->is_inter ? b->mv_col : 0);
+      m->ref1 = (int8_t)(b->is_inter ? b->ref_frame1 : 0);
+      m->mv1_row = (int16_t)(b->is_inter ? b->mv1_row : 0);
+      m->mv1_col = (int16_t)(b->is_inter ? b->mv1_col : 0);
     }
 
   if (skip) {

@@ -286,6 +286,7 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   if (e->cfg.altref) { /* frames inside a mini-GOP: ALTREF */
     fp->golden = !isKey && e->frame_kind == 2;
     fp->ref2_frame = ALTREF_FRAME;
+    fp->compound = e->hdr.reference_select; /* LAST + ALTREF */
   }
   fp->fast = e->cfg.fast;
   fp->leaf = e->nonref && !getenv("MAV1_LEAFINTRA");
@@ -394,6 +395,7 @@ static void count_tools(Mav1FrameStats *st, const BlockInfo *b) {
   st->tool_use[4] += b->eob[0] > 0 && b->tx_type != DCT_DCT;
   st->tool_use[5] += b->eob[0] == 0 && b->eob[1] == 0 && b->eob[2] == 0;
   st->tool_use[6] += Block_Width(b->bsize) != Block_Height(b->bsize);
+  st->tool_use[7] += b->is_inter && b->ref_frame1 > INTRA_FRAME;
   st->tool_use[11] += b->is_inter && b->ref_frame == GOLDEN_FRAME;
   st->tool_use[12] += b->is_inter && b->ref_frame == ALTREF_FRAME;
 }
@@ -594,6 +596,11 @@ static void alt_code(Mav1Encoder *e, const uint8_t *frame, int disp, int isKey, 
     if (arfSlot >= 0) h->ref_idx[ALTREF_FRAME - LAST_FRAME] = arfSlot;
     for (int i = 0; i < REFS_PER_FRAME; i++)
       e->sign_bias[LAST_FRAME + i] = rel_dist(e->slot_hint[h->ref_idx[i]], h->order_hint) > 0;
+    /* compound LAST + ALTREF (BIDIR, COMPOUND_AVERAGE) inside the mini-GOP;
+     * skip_mode_params( ): LAST is a forward and ALTREF a backward
+     * reference, so skip_mode_present is coded */
+    h->reference_select = kind == 2 && arfSlot >= 0 && !getenv("MAV1_NOCOMP");
+    h->skip_mode_allowed = h->reference_select;
     memcpy(e->ref.base, e->slot[lastSlot].base, e->frame_bytes);
     if (arfSlot >= 0) memcpy(e->gold.base, e->slot[arfSlot].base, e->frame_bytes);
   }
