@@ -60,6 +60,7 @@ typedef struct {
   int32_t me_range;                   /* full-pel motion search range */
   int32_t lossless;                   /* CodedLossless (base_q_idx == 0) */
   int32_t tx_mode_select;             /* TxMode == TX_MODE_SELECT */
+  int32_t switchable_interp;          /* interpolation_filter == SWITCHABLE (dual filter) */
   int32_t lf_level[4];                /* loop_filter_level[] */
   int32_t lf_sharpness;
   int32_t cdef_damping, cdef_bits;
@@ -82,7 +83,7 @@ typedef struct {
   int32_t cfl_alpha_u, cfl_alpha_v;     /* CflAlphaU/V when uv_mode == UV_CFL_PRED */
   int32_t tx_depth;                     /* intra tx_depth (TX_MODE_SELECT) */
   int32_t tx_types_lo, tx_types_hi;     /* luma TxType of each transform, 4 bits each (raster) */
-  int32_t pad0;
+  int32_t interp_filter;                /* interp_filter[0] | interp_filter[1] << 2 */
 } BlockInfo;
 
 /* Per-superblock index range into the block list. */

@@ -167,6 +167,7 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
   out->angle_uv = (bestUvMode == bestMode) ? bestDelta : 0;
   out->cfl_alpha_u = out->cfl_alpha_v = 0;
   out->tx_depth = 0;
+  out->interp_filter = 0;
   out->tx_types_lo = out->tx_types_hi = 0;
   out->mv_row = 0;
   out->mv_col = 0;

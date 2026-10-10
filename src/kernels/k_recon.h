@@ -280,6 +280,32 @@ INLINE void recon_block(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const u
   int MiRow = b->mi_row, MiCol = b->mi_col;
   int maxLumaW = 0, maxLumaH = 0;
   b->tx_depth = 0;
+  b->interp_filter = 0;
+  if (b->is_inter && fp->switchable_interp) {
+    /* dual filter search on the luma prediction: 3 vertical x 3 horizontal */
+    int w = Block_Width(bs), h = Block_Height(bs);
+    int x0 = MiCol * 4, y0 = MiRow * 4, stride = fp->stride[0];
+    DEV uint8_t *px = rec + fp->offset[0] + y0 * stride + x0;
+    DEV const uint8_t *sp = src + fp->offset[0] + y0 * stride + x0;
+    int vw = k_min(w, fp->frame_w - x0), vh = k_min(h, fp->frame_h - y0);
+    long best = -1;
+    for (int f = 0; f < 9; f++) {
+      int packed = (f % 3) | ((f / 3) << 2);
+      predict_inter_block(ref + fp->offset[0], stride, fp->frame_w, fp->frame_h, px, stride, x0, y0, w, h,
+                          b->mv_row, b->mv_col, 0, 0, packed, scratch + S_TMP);
+      long sse = 0;
+      for (int i = 0; i < vh; i++)
+        for (int j = 0; j < vw; j++) {
+          int d = (int)px[i * stride + j] - (int)sp[i * stride + j];
+          sse += d * d;
+        }
+      long c = sse * 16 + (long)fp->lambda * ((f % 3 != 0) + (f / 3 != 0));
+      if (best < 0 || c < best) {
+        best = c;
+        b->interp_filter = packed;
+      }
+    }
+  }
   for (int plane = 0; plane < 3; plane++) {
     int subX = plane > 0, subY = plane > 0;
     int stride = fp->stride[plane];
@@ -288,7 +314,7 @@ INLINE void recon_block(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const u
       predict_inter_block(ref + fp->offset[plane], stride, fp->frame_w, fp->frame_h,
                           rec + fp->offset[plane] + baseY * stride + baseX, stride, baseX, baseY,
                           Block_Width(bs) >> subX, Block_Height(bs) >> subY, b->mv_row, b->mv_col, subX, subY,
-                          EIGHTTAP, scratch + S_TMP);
+                          b->interp_filter, scratch + S_TMP);
     }
     if (fp->lossless) {
       code_plane(fp, b, src, rec, coefs, mats, scratch, bd, plane, TX_4X4, &maxLumaW, &maxLumaH);

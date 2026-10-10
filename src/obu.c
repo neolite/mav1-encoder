@@ -49,7 +49,7 @@ static void seq_header_payload(const struct Mav1Encoder *e, BitWriter *w) {
   bw_f(w, 1, 0);   /* enable_interintra_compound */
   bw_f(w, 1, 0);   /* enable_masked_compound */
   bw_f(w, 1, 0);   /* enable_warped_motion */
-  bw_f(w, 1, 0);   /* enable_dual_filter */
+  bw_f(w, 1, 1);   /* enable_dual_filter */
   bw_f(w, 1, 1);   /* enable_order_hint */
   bw_f(w, 1, 0);   /* enable_jnt_comp */
   bw_f(w, 1, 0);   /* enable_ref_frame_mvs */
@@ -110,8 +110,12 @@ static void frame_header(const struct Mav1Encoder *e, BitWriter *w) {
     for (int i = 0; i < REFS_PER_FRAME; i++) bw_f(w, 3, 0); /* ref_frame_idx */
     bw_f(w, 1, 0);               /* render_and_frame_size_different */
     bw_f(w, 1, 0);               /* allow_high_precision_mv */
-    bw_f(w, 1, 0);               /* is_filter_switchable */
-    bw_f(w, 2, EIGHTTAP);        /* interpolation_filter */
+    if (e->cfg.switchable_interp) {
+      bw_f(w, 1, 1);             /* is_filter_switchable: SWITCHABLE */
+    } else {
+      bw_f(w, 1, 0);             /* is_filter_switchable */
+      bw_f(w, 2, EIGHTTAP);      /* interpolation_filter */
+    }
     bw_f(w, 1, 0);               /* is_motion_mode_switchable */
   }
   bw_f(w, 1, 1);                 /* disable_frame_end_update_cdf */

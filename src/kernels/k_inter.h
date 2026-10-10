@@ -16,7 +16,8 @@
  */
 INLINE void predict_inter_block(DEV const uint8_t *ref, int refStride, int refW, int refH,
                                 DEV uint8_t *dst, int dstStride, int x, int y, int w, int h,
-                                int mvRow, int mvCol, int subX, int subY, int filter,
+                                int mvRow, int mvCol, int subX, int subY,
+                                int filter, /* InterpFilters: [0] (vertical) | [1] (horizontal) << 2 */
                                 DEV int32_t *tmp) {
   const int InterRound0 = 3, InterRound1 = 11;
   /* Motion vector scaling with xScale == yScale == 1 << REF_SCALE_SHIFT. */
@@ -35,7 +36,7 @@ INLINE void predict_inter_block(DEV const uint8_t *ref, int refStride, int refW,
   int lastY = ((refH + subY) >> subY) - 1;
   int intermediateHeight = (((h - 1) * yStep + (1 << SCALE_SUBPEL_BITS) - 1) >> SCALE_SUBPEL_BITS) + 8;
 
-  int fh = filter, fv = filter;
+  int fv = filter & 3, fh = (filter >> 2) & 3;
   if (w <= 4) { if (fh == EIGHTTAP || fh == EIGHTTAP_SHARP) fh = 4; else if (fh == EIGHTTAP_SMOOTH) fh = 5; }
   if (h <= 4) { if (fv == EIGHTTAP || fv == EIGHTTAP_SHARP) fv = 4; else if (fv == EIGHTTAP_SMOOTH) fv = 5; }
 

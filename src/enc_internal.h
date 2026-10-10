@@ -23,6 +23,7 @@ typedef struct {
   int8_t tx_size;   /* TxSizes (luma) */
   int16_t mv_row, mv_col; /* Mvs[0] */
   int8_t written;   /* decoded in the current frame */
+  int8_t interp[2]; /* InterpFilters */
 } MiInfo;
 
 /* Values signalled in the frame header. */

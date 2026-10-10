@@ -48,6 +48,7 @@ void mav1_default_config(Mav1Config *cfg, int width, int height) {
   cfg->tx_search = 1;
   cfg->tx_depth = 1;
   cfg->restoration = 1;
+  cfg->switchable_interp = 1;
   cfg->loop_filter = 1;
   cfg->cdef = 1;
   cfg->me_range = 32;
@@ -188,6 +189,7 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   fp->tx_search = e->cfg.tx_search;
   fp->lossless = q == 0;
   fp->tx_mode_select = q != 0 && e->cfg.tx_depth;
+  fp->switchable_interp = !isKey && e->cfg.switchable_interp;
   long acq = fp->ac_q[0];
   fp->lambda = (int32_t)(acq * acq * 256 / 430);
   fp->frame_w = e->w;

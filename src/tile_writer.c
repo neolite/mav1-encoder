@@ -331,7 +331,28 @@ static void write_block(Tile *t, const BlockInfo *b) {
     else if (availU || availL) ctx = 2 * (availU ? aboveIntra : leftIntra);
     else ctx = 0;
     ec_symbol(&t->ec, b->is_inter, t->cdf.is_inter[ctx], 2);
-    if (b->is_inter) interMode = write_inter_block(&t->ec, &t->cdf, e, b);
+    if (b->is_inter) {
+      interMode = write_inter_block(&t->ec, &t->cdf, e, b);
+      if (e->cfg.switchable_interp) {
+        /* enable_dual_filter = 1; single reference LAST, so RefFrame[1] = NONE.
+         * needs_interp_filter( ): no skip mode, SIMPLE motion; GLOBALMV with
+         * GmType IDENTITY (not TRANSLATION) on blocks >= 8x8 is not coded and
+         * uses EIGHTTAP (its zero MV makes the filter irrelevant). */
+        if (interMode == GLOBALMV) ((BlockInfo *)b)->interp_filter = 0;
+        for (int dir = 0; dir < 2 && interMode != GLOBALMV; dir++) {
+          int ctx = (dir & 1) * 2 * 4;
+          int leftType = 3, aboveType = 3;
+          if (availL && mi_at(e, r, c - 1)->ref0 == LAST_FRAME) leftType = mi_at(e, r, c - 1)->interp[dir];
+          if (availU && mi_at(e, r - 1, c)->ref0 == LAST_FRAME) aboveType = mi_at(e, r - 1, c)->interp[dir];
+          if (leftType == aboveType) ctx += leftType;
+          else if (leftType == 3) ctx += aboveType;
+          else if (aboveType == 3) ctx += leftType;
+          else ctx += 3;
+          int f = dir == 0 ? (b->interp_filter & 3) : ((b->interp_filter >> 2) & 3);
+          ec_symbol(&t->ec, f, t->cdf.interp_filter[ctx], INTERP_FILTERS);
+        }
+      }
+    }
     else write_intra_modes(t, b, availU, availL, 0);
   }
 
@@ -388,6 +409,8 @@ static void write_block(Tile *t, const BlockInfo *b) {
       m->skip = (int8_t)skip;
       m->y_mode = (int8_t)(b->is_inter ? interMode : b->y_mode);
       m->written = 1;
+      m->interp[0] = (int8_t)(b->interp_filter & 3);
+      m->interp[1] = (int8_t)((b->interp_filter >> 2) & 3);
       m->ref0 = (int8_t)(b->is_inter ? LAST_FRAME : INTRA_FRAME);
       m->tx_size = (int8_t)txSize; /* InterTxSizes */
       m->mv_row = (int16_t)(b->is_inter ? b->mv_row : 0);
