@@ -372,7 +372,7 @@ static void setup_params(Mav1Encoder *e, int isKey) {
    * NONE cost per sample is below depth_thr / 16, the threshold growing with
    * the quantizer (MAV1_DT: the value at qindex 128) */
   {
-    int dt = getenv("MAV1_DT") ? atoi(getenv("MAV1_DT")) : e->sb_rows >= 16 ? 288 : 352;
+    int dt = getenv("MAV1_DT") ? atoi(getenv("MAV1_DT")) : e->sb_rows >= 16 ? 320 : 352;
     int bias = getenv("MAV1_DTB") ? atoi(getenv("MAV1_DTB")) : 0;
     fp->depth_thr = e->cfg.turbo ? dt * (q + bias) / (128 + bias) : 0;
   }
