@@ -83,6 +83,7 @@ typedef struct {
 typedef struct {
   int32_t first_block, num_blocks;
   int32_t sb_row, sb_col;
+  int32_t part[85];                     /* partition per square node (-1 outside) */
 } SbInfo;
 
 #endif

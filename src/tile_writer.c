@@ -10,6 +10,7 @@
 #include "kernels/k_intra.h"
 #include "kernels/k_scan.h"
 #include "mvpred.h"
+#include "kernels/k_analysis.h"
 
 typedef struct {
   struct Mav1Encoder *e;
@@ -385,43 +386,50 @@ static void write_partition(Tile *t, int r, int c, int bSize, const BlockInfo *b
   int num4x4 = Num_4x4_Blocks_Wide[bSize];
   int half = num4x4 >> 1;
   int hasRows = (r + half) < e->mi_rows, hasCols = (c + half) < e->mi_cols;
-  int isNone = *k < n && blocks[*k].mi_row == r && blocks[*k].mi_col == c && blocks[*k].bsize == bSize;
+  int level = 4 - Mi_Width_Log2[bSize]; /* 64x64 -> 0 ... 8x8 -> 3 */
+  int nl = 1 << level;
+  int node = NODE_BASE(level) + ((r & 15) / num4x4) * nl + (c & 15) / num4x4;
+  int p = ENC_SBS(e)[(r >> 4) * e->sb_cols + (c >> 4)].part[node];
   int bsl = Mi_Width_Log2[bSize];
   int availU = r > 0, availL = c > 0;
   int above = availU && Mi_Width_Log2[mi_at(e, r - 1, c)->bsize] < bsl;
   int left = availL && Mi_Height_Log2[mi_at(e, r, c - 1)->bsize] < bsl;
   int ctx = left * 2 + above;
-  if (bSize < BLOCK_8X8) {
-    abort();
-  } else if (hasRows && hasCols) {
+  if (hasRows && hasCols) {
     int nsym = bsl == 1 ? 4 : 10;
-    ec_symbol(&t->ec, isNone ? PARTITION_NONE : PARTITION_SPLIT, partition_cdf(t, bsl, ctx), nsym);
+    ec_symbol(&t->ec, p, partition_cdf(t, bsl, ctx), nsym);
   } else if (hasCols) {
     const uint16_t *pc = partition_cdf(t, bsl, ctx);
     int psum = pprob(pc, PARTITION_VERT) + pprob(pc, PARTITION_SPLIT) + pprob(pc, PARTITION_HORZ_A) +
                pprob(pc, PARTITION_VERT_A) + pprob(pc, PARTITION_VERT_B) + pprob(pc, PARTITION_VERT_4);
     uint16_t tmp[3] = {(uint16_t)((1 << 15) - psum), 1 << 15, 0};
-    if (isNone) abort();
-    ec_symbol(&t->ec, 1, tmp, 2);
+    if (p != PARTITION_SPLIT && p != PARTITION_HORZ) abort();
+    ec_symbol(&t->ec, p == PARTITION_SPLIT, tmp, 2);
   } else if (hasRows) {
     const uint16_t *pc = partition_cdf(t, bsl, ctx);
     int psum = pprob(pc, PARTITION_HORZ) + pprob(pc, PARTITION_SPLIT) + pprob(pc, PARTITION_HORZ_A) +
                pprob(pc, PARTITION_HORZ_B) + pprob(pc, PARTITION_VERT_A) + pprob(pc, PARTITION_HORZ_4);
     uint16_t tmp[3] = {(uint16_t)((1 << 15) - psum), 1 << 15, 0};
-    if (isNone) abort();
-    ec_symbol(&t->ec, 1, tmp, 2);
-  } else {
-    if (isNone) abort();
+    if (p != PARTITION_SPLIT && p != PARTITION_VERT) abort();
+    ec_symbol(&t->ec, p == PARTITION_SPLIT, tmp, 2);
+  } else if (p != PARTITION_SPLIT) {
+    abort();
   }
-  if (isNone) {
-    write_block(t, &blocks[*k]);
-    (*k)++;
-  } else {
+  if (p == PARTITION_SPLIT) {
     int sub = Partition_Subsize[PARTITION_SPLIT][bSize];
     write_partition(t, r, c, sub, blocks, k, n);
     write_partition(t, r, c + half, sub, blocks, k, n);
     write_partition(t, r + half, c, sub, blocks, k, n);
     write_partition(t, r + half, c + half, sub, blocks, k, n);
+    return;
+  }
+  int nb = part_count(ENC_PARAMS(e), p, r, c, half);
+  for (int i = 0; i < nb; i++) {
+    int dr, dc;
+    int bs = part_block(p, bSize, i, half, &dr, &dc);
+    if (*k >= n || blocks[*k].mi_row != r + dr || blocks[*k].mi_col != c + dc || blocks[*k].bsize != bs) abort();
+    write_block(t, &blocks[*k]);
+    (*k)++;
   }
 }
 

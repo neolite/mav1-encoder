@@ -74,7 +74,7 @@ INLINE int block_satd(DEV const uint8_t *src, int stride, DEV const uint8_t *pre
 }
 
 INLINE int intra_satd(DEV const FrameParams *fp, DEV const uint8_t *plane, int stride, int planeIdx,
-                      int x, int y, int log2, int mode, int delta, DEV uint8_t *pred) {
+                      int x, int y, int log2W, int log2H, int mode, int delta, DEV uint8_t *pred) {
   int sub = planeIdx > 0;
   IntraArgs a;
   a.haveLeft = x > 0;
@@ -83,27 +83,29 @@ INLINE int intra_satd(DEV const FrameParams *fp, DEV const uint8_t *plane, int s
   a.haveBelowLeft = 0;
   a.mode = mode;
   a.angleDelta = delta;
-  a.log2W = log2;
-  a.log2H = log2;
+  a.log2W = log2W;
+  a.log2H = log2H;
   a.maxX = ((fp->mi_cols * 4) >> sub) - 1;
   a.maxY = ((fp->mi_rows * 4) >> sub) - 1;
   a.edgeFilter = 0;
   a.filterType = 0;
   predict_intra(plane, stride, x, y, a, pred, 64);
-  return block_satd(plane + y * stride + x, stride, pred, 1 << log2, 1 << log2);
+  return block_satd(plane + y * stride + x, stride, pred, 1 << log2W, 1 << log2H);
 }
 
 INLINE int mv_bits8(int mvr, int mvc) {
   return 8 * (2 + 2 * FloorLog2(k_abs(mvr) + 1) + 2 * FloorLog2(k_abs(mvc) + 1));
 }
 
-/* Evaluates one node; returns its cost and fills the decision in *out. */
-INLINE long eval_node(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
-                      DEV const int32_t *mvField, int level, int nodeIdx, int miRow, int miCol,
-                      DEV int32_t *scratch, THR BlockInfo *out) {
+/* Evaluates the block (miRow, miCol, bsize); the inter candidate uses the
+ * motion vector of square node `mvNode` of the superblock. Returns the cost
+ * and fills the decision in *out. */
+INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
+                       DEV const int32_t *mvField, int mvNode, int miRow, int miCol, int bsize,
+                       DEV int32_t *scratch, THR BlockInfo *out) {
   DEV uint8_t *pred = (DEV uint8_t *)(scratch + A_PRED);
-  int bsize = level_bsize(level);
-  int log2 = 6 - level;
+  int lw = Mi_Width_Log2[bsize] + 2, lh = Mi_Height_Log2[bsize] + 2;
+  int w = 1 << lw, h = 1 << lh;
   int x = miCol * 4, y = miRow * 4;
   int lam = fp->ac_q[0];
 
@@ -111,7 +113,7 @@ INLINE long eval_node(DEV const FrameParams *fp, DEV const uint8_t *src, DEV con
   long best = -1;
   int bestMode = DC_PRED, bestDelta = 0;
   for (int mode = DC_PRED; mode <= PAETH_PRED; mode++) {
-    long c = intra_satd(fp, src + fp->offset[0], fp->stride[0], 0, x, y, log2, mode, 0, pred) +
+    long c = intra_satd(fp, src + fp->offset[0], fp->stride[0], 0, x, y, lw, lh, mode, 0, pred) +
              (long)lam * mode_bits8(mode) / 8;
     if (best < 0 || c < best) { best = c; bestMode = mode; }
   }
@@ -119,38 +121,37 @@ INLINE long eval_node(DEV const FrameParams *fp, DEV const uint8_t *src, DEV con
     int base = bestMode;
     for (int d = -MAX_ANGLE_DELTA; d <= MAX_ANGLE_DELTA; d++) {
       if (d == 0) continue;
-      long c = intra_satd(fp, src + fp->offset[0], fp->stride[0], 0, x, y, log2, base, d, pred) +
+      long c = intra_satd(fp, src + fp->offset[0], fp->stride[0], 0, x, y, lw, lh, base, d, pred) +
                (long)lam * (mode_bits8(base) + 16) / 8;
       if (c < best) { best = c; bestDelta = d; }
     }
   }
   /* chroma intra */
-  int cx = x >> 1, cy = y >> 1, clog2 = log2 - 1;
+  int cx = x >> 1, cy = y >> 1, clw = lw - 1, clh = lh - 1;
   long bestUv = -1;
   int bestUvMode = DC_PRED;
   for (int m = DC_PRED; m <= PAETH_PRED; m++) {
     if (intra_is_directional(m) && m != V_PRED && m != H_PRED && m != bestMode) continue;
     int delta = (m == bestMode) ? bestDelta : 0;
-    long c = intra_satd(fp, src + fp->offset[1], fp->stride[1], 1, cx, cy, clog2, m, delta, pred) +
-             intra_satd(fp, src + fp->offset[2], fp->stride[2], 2, cx, cy, clog2, m, delta, pred) +
+    long c = intra_satd(fp, src + fp->offset[1], fp->stride[1], 1, cx, cy, clw, clh, m, delta, pred) +
+             intra_satd(fp, src + fp->offset[2], fp->stride[2], 2, cx, cy, clw, clh, m, delta, pred) +
              (long)lam * (m == DC_PRED ? 8 : 24) / 8;
     if (bestUv < 0 || c < bestUv) { bestUv = c; bestUvMode = m; }
   }
-  if (log2 <= 5) {
+  if (k_max(lw, lh) <= 5) {
     /* CfL estimated from source luma (recon picks the final alphas). */
     DEV int32_t *dc = scratch + A_TMP;
-    int cw = 1 << clog2;
+    int cw = 1 << clw, ch = 1 << clh;
     long c = (long)lam * 40 / 8;
     for (int p = 1; p < 3; p++) {
-      intra_satd(fp, src + fp->offset[p], fp->stride[p], p, cx, cy, clog2, DC_PRED, 0, pred);
-      for (int i = 0; i < cw; i++)
+      intra_satd(fp, src + fp->offset[p], fp->stride[p], p, cx, cy, clw, clh, DC_PRED, 0, pred);
+      for (int i = 0; i < ch; i++)
         for (int j = 0; j < cw; j++) dc[i * cw + j] = pred[i * 64 + j];
       DEV const uint8_t *sp = src + fp->offset[p] + cy * fp->stride[p] + cx;
-      int al = cfl_best_alpha(src + fp->offset[0], fp->stride[0], cx, cy, x + (1 << log2), y + (1 << log2), clog2,
-                              clog2, dc, sp, fp->stride[p], pred, 64, 0);
-      cfl_predict(src + fp->offset[0], fp->stride[0], cx, cy, x + (1 << log2), y + (1 << log2), clog2, clog2, al, dc,
-                  pred, 64);
-      c += block_satd(sp, fp->stride[p], pred, cw, cw);
+      int al = cfl_best_alpha(src + fp->offset[0], fp->stride[0], cx, cy, x + w, y + h, clw, clh, dc, sp,
+                              fp->stride[p], pred, 64, 0);
+      cfl_predict(src + fp->offset[0], fp->stride[0], cx, cy, x + w, y + h, clw, clh, al, dc, pred, 64);
+      c += block_satd(sp, fp->stride[p], pred, cw, ch);
     }
     if (c < bestUv) { bestUv = c; bestUvMode = UV_CFL_PRED; }
   }
@@ -171,17 +172,16 @@ INLINE long eval_node(DEV const FrameParams *fp, DEV const uint8_t *src, DEV con
 
   if (!fp->frame_is_intra) {
     int sbIdx = (miRow >> 4) * fp->sb_cols + (miCol >> 4);
-    DEV const int32_t *mvp = mvField + (sbIdx * NUM_NODES + NODE_BASE(level) + nodeIdx) * 2;
+    DEV const int32_t *mvp = mvField + (sbIdx * NUM_NODES + mvNode) * 2;
     int mvr = mvp[0], mvc = mvp[1];
     DEV int32_t *tmp = scratch + A_TMP;
-    int w = 1 << log2;
-    predict_inter_block(ref + fp->offset[0], fp->stride[0], fp->frame_w, fp->frame_h, pred, 64, x, y, w, w,
+    predict_inter_block(ref + fp->offset[0], fp->stride[0], fp->frame_w, fp->frame_h, pred, 64, x, y, w, h,
                         mvr, mvc, 0, 0, EIGHTTAP, tmp);
-    long interCost = block_satd(src + fp->offset[0] + y * fp->stride[0] + x, fp->stride[0], pred, w, w);
+    long interCost = block_satd(src + fp->offset[0] + y * fp->stride[0] + x, fp->stride[0], pred, w, h);
     for (int p = 1; p < 3; p++) {
       predict_inter_block(ref + fp->offset[p], fp->stride[p], fp->frame_w, fp->frame_h, pred, 64, cx, cy,
-                          w >> 1, w >> 1, mvr, mvc, 1, 1, EIGHTTAP, tmp);
-      interCost += block_satd(src + fp->offset[p] + cy * fp->stride[p] + cx, fp->stride[p], pred, w >> 1, w >> 1);
+                          w >> 1, h >> 1, mvr, mvc, 1, 1, EIGHTTAP, tmp);
+      interCost += block_satd(src + fp->offset[p] + cy * fp->stride[p] + cx, fp->stride[p], pred, w >> 1, h >> 1);
     }
     interCost += (long)lam * (4 + mv_bits8(mvr, mvc)) / 8;
     if (interCost < cost) {
@@ -198,58 +198,132 @@ INLINE long eval_node(DEV const FrameParams *fp, DEV const uint8_t *src, DEV con
   return cost;
 }
 
+/* Number of blocks of partition p and the k-th block's offset / size
+ * (decode order, spec decode_partition). half/quarter in mi units. */
+INLINE int part_block(int p, int bSize, int k, int half, THR int *dr, THR int *dc) {
+  int sub = Partition_Subsize[p][bSize], split = Partition_Subsize[PARTITION_SPLIT][bSize];
+  int q = half >> 1;
+  *dr = 0;
+  *dc = 0;
+  switch (p) {
+    case PARTITION_HORZ: *dr = k * half; return sub;
+    case PARTITION_VERT: *dc = k * half; return sub;
+    case PARTITION_HORZ_A:
+      if (k < 2) { *dc = k * half; return split; }
+      *dr = half; return sub;
+    case PARTITION_HORZ_B:
+      if (k == 0) return sub;
+      *dr = half; *dc = (k - 1) * half; return split;
+    case PARTITION_VERT_A:
+      if (k < 2) { *dr = k * half; return split; }
+      *dc = half; return sub;
+    case PARTITION_VERT_B:
+      if (k == 0) return sub;
+      *dc = half; *dr = (k - 1) * half; return split;
+    case PARTITION_HORZ_4: *dr = k * q; return sub;
+    case PARTITION_VERT_4: *dc = k * q; return sub;
+    default: return sub; /* NONE */
+  }
+}
+
+/* Blocks actually decoded for partition p at (r, c) (handles frame edges). */
+INLINE int part_count(DEV const FrameParams *fp, int p, int r, int c, int half) {
+  int hasRows = (r + half) < fp->mi_rows, hasCols = (c + half) < fp->mi_cols;
+  if (p == PARTITION_NONE) return 1;
+  if (p == PARTITION_HORZ) return hasRows ? 2 : 1;
+  if (p == PARTITION_VERT) return hasCols ? 2 : 1;
+  if (p == PARTITION_HORZ_4) return (r + (half >> 1) * 3 < fp->mi_rows) ? 4 : 3;
+  if (p == PARTITION_VERT_4) return (c + (half >> 1) * 3 < fp->mi_cols) ? 4 : 3;
+  return 3;
+}
+
+/* Cost of a rectangular block of the partition, memoised per call site. */
+INLINE long part_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
+                      DEV const int32_t *mvField, int node, int p, int r, int c, int bSize, int half,
+                      THR const long *noneCost, int childBase, int cn, int ci, DEV int32_t *scratch) {
+  long total = 0;
+  int n = part_count(fp, p, r, c, half);
+  for (int k = 0; k < n; k++) {
+    int dr, dc;
+    int bs = part_block(p, bSize, k, half, &dr, &dc);
+    if (bs == Partition_Subsize[PARTITION_SPLIT][bSize] && p != PARTITION_HORZ_4 && p != PARTITION_VERT_4 &&
+        p != PARTITION_HORZ && p != PARTITION_VERT) {
+      /* square quarter: reuse the child's NONE cost */
+      long cc = noneCost[childBase + ci + (dr ? cn : 0) + (dc ? 1 : 0)];
+      if (cc < 0) return -1;
+      total += cc;
+    } else {
+      BlockInfo b;
+      total += eval_block(fp, src, ref, mvField, node, r + dr, c + dc, bs, scratch, &b);
+    }
+  }
+  return total;
+}
+
 /*
  * Analyses superblock `sbIdx` and writes its blocks (decode order) to
- * blocks[sbIdx * MAX_BLOCKS_PER_SB ...]; returns the block count via sb.
+ * blocks[sbIdx * MAX_BLOCKS_PER_SB ...] and the partition of every square
+ * node to sbs[sbIdx].part.
  */
 INLINE void analyze_sb(DEV const FrameParams *fp, int sbIdx, DEV const uint8_t *src, DEV const uint8_t *ref,
                        DEV const int32_t *mvField, DEV BlockInfo *blocks, DEV SbInfo *sbs,
                        DEV int32_t *scratch) {
   int sbRow = sbIdx / fp->sb_cols, sbCol = sbIdx % fp->sb_cols;
   long cost[NUM_NODES];
-  uint8_t mode[NUM_NODES];   /* 0: absent, 1: NONE, 2: SPLIT */
-  BlockInfo dec[NUM_NODES];
+  long noneCost[NUM_NODES];
   int lam = fp->ac_q[0];
+  DEV SbInfo *sb = &sbs[sbIdx];
 
   for (int level = 3; level >= 0; level--) {
     int n = 1 << level;
     int size4 = 16 >> level;
+    int bSize = level_bsize(level);
     for (int i = 0; i < n * n; i++) {
       int node = NODE_BASE(level) + i;
       int r = sbRow * 16 + (i / n) * size4, c = sbCol * 16 + (i % n) * size4;
+      noneCost[node] = -1;
       if (r >= fp->mi_rows || c >= fp->mi_cols) {
         cost[node] = 0;
-        mode[node] = 0;
+        sb->part[node] = -1;
         continue;
       }
       int halfSz = size4 >> 1;
       int hasRows = (r + halfSz) < fp->mi_rows, hasCols = (c + halfSz) < fp->mi_cols;
-      long splitCost = -1;
+      int cn = n * 2, ci = (i / n) * 2 * cn + (i % n) * 2, cb = NODE_BASE(level + 1);
+      long bestC = -1;
+      int bestP = PARTITION_SPLIT;
       if (level < 3) {
-        int cn = n * 2;
-        int ci = (i / n) * 2 * cn + (i % n) * 2;
-        int cb = NODE_BASE(level + 1);
-        splitCost = cost[cb + ci] + cost[cb + ci + 1] + cost[cb + ci + cn] + cost[cb + ci + cn + 1] +
-                    (long)lam * 16 / 8;
+        bestC = cost[cb + ci] + cost[cb + ci + 1] + cost[cb + ci + cn] + cost[cb + ci + cn + 1] +
+                (long)lam * 16 / 8;
       }
-      long noneCost = -1;
-      if (level == 3 || (hasRows && hasCols)) {
-        BlockInfo b;
-        noneCost = eval_node(fp, src, ref, mvField, level, i, r, c, scratch, &b) + (long)lam * 8 / 8;
-        dec[node] = b;
+      for (int p = PARTITION_NONE; p <= PARTITION_VERT_4; p++) {
+        if (p == PARTITION_SPLIT) continue;
+        if (level == 3 && p != PARTITION_NONE) continue;          /* blocks stay >= 8x8 */
+        if (level == 0 && (p == PARTITION_HORZ_4 || p == PARTITION_VERT_4)) {
+          /* 64x16 / 16x64 are allowed */
+        }
+        if (level == 2 && (p == PARTITION_HORZ_4 || p == PARTITION_VERT_4)) continue; /* 16x4 */
+        if (!(hasRows && hasCols)) {
+          if (!((p == PARTITION_HORZ && hasCols && !hasRows) || (p == PARTITION_VERT && hasRows && !hasCols)))
+            continue;
+        }
+        long pc = part_cost(fp, src, ref, mvField, node, p, r, c, bSize, halfSz, noneCost, cb, cn, ci, scratch);
+        if (pc < 0) continue;
+        pc += (long)lam * (p == PARTITION_NONE ? 8 : 24) / 8;
+        if (p == PARTITION_NONE) noneCost[node] = pc;
+        if (bestC < 0 || pc <= bestC) {
+          bestC = pc;
+          bestP = p;
+        }
       }
-      if (noneCost >= 0 && (splitCost < 0 || noneCost <= splitCost)) {
-        cost[node] = noneCost;
-        mode[node] = 1;
-      } else {
-        cost[node] = splitCost;
-        mode[node] = 2;
-      }
+      cost[node] = bestC;
+      sb->part[node] = bestP;
     }
   }
 
-  /* Emit blocks in decode (Z) order: for each 8x8 position in Z order, find
-   * the chosen NONE ancestor; emit it when this position is its top-left. */
+  /* Emit blocks in decode order: walk 8x8 positions in Z order; the first
+   * non-SPLIT node on the path owns the position; its blocks are emitted
+   * when the walk reaches its top-left corner. */
   int count = 0;
   int coefOff = sbIdx * COEFS_PER_SB;
   for (int z = 0; z < 64; z++) {
@@ -262,31 +336,37 @@ INLINE void analyze_sb(DEV const FrameParams *fp, int sbIdx, DEV const uint8_t *
       int shift = 3 - level;
       int n = 1 << level;
       int node = NODE_BASE(level) + (zy >> shift) * n + (zx >> shift);
-      if (mode[node] == 0) break;
-      if (mode[node] == 1) {
-        if ((zx & ((1 << shift) - 1)) == 0 && (zy & ((1 << shift) - 1)) == 0) {
-          BlockInfo b = dec[node];
-          int w = 64 >> level;
+      int p = sb->part[node];
+      if (p < 0) break;
+      if (p == PARTITION_SPLIT) continue;
+      if ((zx & ((1 << shift) - 1)) == 0 && (zy & ((1 << shift) - 1)) == 0) {
+        int size4 = 16 >> level, half = size4 >> 1;
+        int r = sbRow * 16 + (zy >> shift) * size4, c = sbCol * 16 + (zx >> shift) * size4;
+        int nb = part_count(fp, p, r, c, half);
+        for (int k = 0; k < nb; k++) {
+          int dr, dc;
+          int bs = part_block(p, level_bsize(level), k, half, &dr, &dc);
+          BlockInfo b;
+          eval_block(fp, src, ref, mvField, node, r + dr, c + dc, bs, scratch, &b);
+          int w = Block_Width(bs), h = Block_Height(bs);
           b.coef_off[0] = coefOff;
-          coefOff += k_min(32, w) * k_min(32, w);
+          coefOff += k_min(32, w) * k_min(32, h);
           b.coef_off[1] = coefOff;
-          coefOff += (w >> 1) * (w >> 1);
+          coefOff += (w >> 1) * (h >> 1);
           b.coef_off[2] = coefOff;
-          coefOff += (w >> 1) * (w >> 1);
+          coefOff += (w >> 1) * (h >> 1);
           b.eob[0] = b.eob[1] = b.eob[2] = 0;
           blocks[sbIdx * MAX_BLOCKS_PER_SB + count] = b;
           count++;
         }
-        break;
       }
+      break;
     }
   }
-  SbInfo s;
-  s.first_block = sbIdx * MAX_BLOCKS_PER_SB;
-  s.num_blocks = count;
-  s.sb_row = sbRow;
-  s.sb_col = sbCol;
-  sbs[sbIdx] = s;
+  sb->first_block = sbIdx * MAX_BLOCKS_PER_SB;
+  sb->num_blocks = count;
+  sb->sb_row = sbRow;
+  sb->sb_col = sbCol;
 }
 
 #endif
