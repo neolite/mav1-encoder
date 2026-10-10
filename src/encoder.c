@@ -1,0 +1,247 @@
+/* Frame-level driver: buffer management, stage sequencing and bitstream
+ * assembly. */
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "backend.h"
+#include "enc_internal.h"
+#include "fwd_matrices.h"
+#include "kernels/k_analysis.h"
+#include "kernels/k_fwd.h"
+#include "kernels/k_recon.h"
+
+#define PAGE 16384
+
+static double now(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+static int buf_alloc(Buf *b, size_t size) {
+  size = (size + PAGE - 1) / PAGE * PAGE;
+  if (size == 0) size = PAGE;
+  void *p = NULL;
+  if (posix_memalign(&p, PAGE, size)) return -1;
+  memset(p, 0, size);
+  b->base = p;
+  b->size = size;
+  return 0;
+}
+
+static void buf_free(Buf *b) {
+  free(b->base);
+  b->base = NULL;
+}
+
+void mav1_default_config(Mav1Config *cfg, int width, int height) {
+  memset(cfg, 0, sizeof(*cfg));
+  cfg->width = width;
+  cfg->height = height;
+  cfg->qindex = 100;
+  cfg->use_metal = 1;
+  cfg->keyint = 0;
+  cfg->tx_search = 1;
+  cfg->loop_filter = 1;
+  cfg->cdef = 1;
+  cfg->me_range = 32;
+}
+
+Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
+  if (cfg->width < 16 || cfg->height < 16 || cfg->width > 65536 || cfg->height > 65536) {
+    snprintf(err, errlen, "unsupported frame size %dx%d", cfg->width, cfg->height);
+    return NULL;
+  }
+  Mav1Encoder *e = calloc(1, sizeof(*e));
+  e->cfg = *cfg;
+  if (e->cfg.qindex < 1) e->cfg.qindex = 1;
+  if (e->cfg.qindex > 255) e->cfg.qindex = 255;
+  e->w = cfg->width;
+  e->h = cfg->height;
+  e->mi_cols = 2 * ((e->w + 7) >> 3);
+  e->mi_rows = 2 * ((e->h + 7) >> 3);
+  e->sb_cols = (e->mi_cols + 15) >> 4;
+  e->sb_rows = (e->mi_rows + 15) >> 4;
+  e->num_sbs = e->sb_cols * e->sb_rows;
+  e->stride[0] = e->sb_cols * 64;
+  e->stride[1] = e->stride[2] = e->sb_cols * 32;
+  e->plane_h[0] = e->sb_rows * 64;
+  e->plane_h[1] = e->plane_h[2] = e->sb_rows * 32;
+  e->offset[0] = 0;
+  e->offset[1] = e->stride[0] * e->plane_h[0];
+  e->offset[2] = e->offset[1] + e->stride[1] * e->plane_h[1];
+  e->frame_bytes = (size_t)e->offset[2] + (size_t)e->stride[2] * e->plane_h[2];
+
+  int ok = 0;
+  ok |= buf_alloc(&e->src, e->frame_bytes);
+  ok |= buf_alloc(&e->rec, e->frame_bytes);
+  ok |= buf_alloc(&e->ref, e->frame_bytes);
+  ok |= buf_alloc(&e->params, sizeof(FrameParams));
+  ok |= buf_alloc(&e->blocks, sizeof(BlockInfo) * MAX_BLOCKS_PER_SB * e->num_sbs);
+  ok |= buf_alloc(&e->sbs, sizeof(SbInfo) * e->num_sbs);
+  ok |= buf_alloc(&e->coefs, sizeof(int32_t) * COEFS_PER_SB * e->num_sbs);
+  ok |= buf_alloc(&e->mats, sizeof(int32_t) * FWD_SLOT_SIZE * FWD_NUM_SLOTS);
+  ok |= buf_alloc(&e->mvfield, sizeof(int32_t) * 2 * NUM_NODES * e->num_sbs);
+  ok |= buf_alloc(&e->scratch, sizeof(int32_t) * SCRATCH_INTS * (size_t)e->num_sbs);
+  if (ok) {
+    snprintf(err, errlen, "out of memory");
+    mav1_destroy(e);
+    return NULL;
+  }
+  fwd_build_matrices((int32_t *)e->mats.base);
+  e->mi = calloc((size_t)e->mi_rows * e->mi_cols, sizeof(MiInfo));
+  e->cdef_idx = calloc((size_t)e->num_sbs, 1);
+
+  if (cfg->use_metal) {
+    e->be = backend_metal_create(e, err, errlen);
+    if (!e->be) {
+      mav1_destroy(e);
+      return NULL;
+    }
+  } else {
+    e->be = backend_cpu_create(e);
+  }
+  return e;
+}
+
+void mav1_destroy(Mav1Encoder *e) {
+  if (!e) return;
+  if (e->be) e->be->destroy(e->be);
+  buf_free(&e->src);
+  buf_free(&e->rec);
+  buf_free(&e->ref);
+  buf_free(&e->params);
+  buf_free(&e->blocks);
+  buf_free(&e->sbs);
+  buf_free(&e->coefs);
+  buf_free(&e->mats);
+  buf_free(&e->mvfield);
+  buf_free(&e->scratch);
+  free(e->mi);
+  free(e->cdef_idx);
+  free(e);
+}
+
+const char *mav1_backend_name(const Mav1Encoder *e) { return e->be->name; }
+const Mav1FrameStats *mav1_last_stats(const Mav1Encoder *e) { return &e->last; }
+
+size_t mav1_sequence_header(const Mav1Encoder *e, uint8_t *out) { return write_sequence_header(e, out); }
+
+/* Copies the input into the padded source buffer, replicating the right
+ * and bottom edges up to the superblock-aligned size. */
+static void load_source(Mav1Encoder *e, const uint8_t *const planes[3], const int strides[3]) {
+  for (int p = 0; p < 3; p++) {
+    int pw = p ? (e->w + 1) >> 1 : e->w;
+    int ph = p ? (e->h + 1) >> 1 : e->h;
+    int aw = e->stride[p], ah = e->plane_h[p];
+    uint8_t *dst = e->src.base + e->offset[p];
+    for (int y = 0; y < ah; y++) {
+      const uint8_t *s = planes[p] + (size_t)(y < ph ? y : ph - 1) * strides[p];
+      uint8_t *d = dst + (size_t)y * aw;
+      memcpy(d, s, pw);
+      memset(d + pw, s[pw - 1], aw - pw);
+    }
+  }
+}
+
+static void setup_params(Mav1Encoder *e, int isKey) {
+  FrameParams *fp = ENC_PARAMS(e);
+  memset(fp, 0, sizeof(*fp));
+  fp->mi_cols = e->mi_cols;
+  fp->mi_rows = e->mi_rows;
+  fp->sb_cols = e->sb_cols;
+  fp->sb_rows = e->sb_rows;
+  for (int p = 0; p < 3; p++) {
+    fp->plane_w[p] = e->stride[p];
+    fp->plane_h[p] = e->plane_h[p];
+    fp->stride[p] = e->stride[p];
+    fp->offset[p] = e->offset[p];
+  }
+  int q = e->cfg.qindex;
+  fp->base_q_idx = q;
+  for (int p = 0; p < 3; p++) {
+    fp->dc_q[p] = Dc_Qlookup[0][q];
+    fp->ac_q[p] = Ac_Qlookup[0][q];
+  }
+  fp->frame_is_intra = isKey;
+  fp->reduced_tx_set = 0;
+  fp->enable_intra_edge_filter = 0;
+  fp->tx_search = e->cfg.tx_search;
+  long acq = fp->ac_q[0];
+  fp->lambda = (int32_t)(acq * acq * 256 / 430);
+  fp->frame_w = e->w;
+  fp->frame_h = e->h;
+  fp->me_range = e->cfg.me_range;
+}
+
+int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int strides[3], uint8_t **out,
+                size_t *outSize) {
+  int isKey = e->frame_num == 0 || (e->cfg.keyint > 0 && e->frame_num % e->cfg.keyint == 0);
+  memset(&e->last, 0, sizeof(e->last));
+  e->last.frame_type = isKey ? 0 : 1;
+  load_source(e, planes, strides);
+  setup_params(e, isKey);
+
+  FrameHdr *h = &e->hdr;
+  memset(h, 0, sizeof(*h));
+  h->frame_type = isKey ? KEY_FRAME : INTER_FRAME;
+  h->base_q_idx = e->cfg.qindex;
+  if (isKey) e->order_hint = 0;
+  h->order_hint = e->order_hint;
+  h->refresh_frame_flags = isKey ? 0xFF : 0x01;
+
+  double t0 = now();
+  if (!isKey) e->be->motion_search(e->be, e);
+  e->be->analyze(e->be, e);
+  double t1 = now();
+  e->be->recon(e->be, e);
+  double t2 = now();
+  e->be->filter(e->be, e);
+  double t3 = now();
+
+  uint8_t *tile = NULL;
+  size_t tileSize = write_tile(e, &tile);
+  size_t cap = tileSize + 1024;
+  uint8_t *buf = malloc(cap);
+  size_t pos = write_temporal_delimiter(buf);
+  if (isKey) pos += write_sequence_header(e, buf + pos);
+  pos += write_frame_obu(e, tile, tileSize, buf + pos);
+  free(tile);
+  double t4 = now();
+
+  const SbInfo *sbs = ENC_SBS(e);
+  const BlockInfo *blocks = ENC_BLOCKS(e);
+  for (int i = 0; i < e->num_sbs; i++) {
+    e->last.num_blocks += sbs[i].num_blocks;
+    for (int k = 0; k < sbs[i].num_blocks; k++) e->last.num_inter_blocks += blocks[sbs[i].first_block + k].is_inter;
+  }
+  e->last.bytes = pos;
+  e->last.t_analysis = t1 - t0;
+  e->last.t_recon = t2 - t1;
+  e->last.t_filter = t3 - t2;
+  e->last.t_entropy = t4 - t3;
+
+  /* The reconstruction becomes the reference of the next frame. */
+  Buf tmp = e->ref;
+  e->ref = e->rec;
+  e->rec = tmp;
+  e->have_ref = 1;
+  e->frame_num++;
+  e->order_hint++;
+  *out = buf;
+  *outSize = pos;
+  return 0;
+}
+
+void mav1_get_recon(const Mav1Encoder *e, uint8_t *const planes[3], const int strides[3]) {
+  /* After mav1_encode the last reconstruction lives in `ref`. */
+  for (int p = 0; p < 3; p++) {
+    int pw = p ? (e->w + 1) >> 1 : e->w;
+    int ph = p ? (e->h + 1) >> 1 : e->h;
+    for (int y = 0; y < ph; y++)
+      memcpy(planes[p] + (size_t)y * strides[p], e->ref.base + e->offset[p] + (size_t)y * e->stride[p], pw);
+  }
+}

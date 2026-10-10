@@ -1,0 +1,458 @@
+/*
+ * Entropy coding of one tile (the whole frame). This mirrors the decoding
+ * process of spec sections 5.11 (syntax) and 8.3 (CDF selection), walking the
+ * blocks chosen by the analysis/reconstruction kernels in decode order.
+ */
+#include <stdlib.h>
+#include <string.h>
+
+#include "enc_internal.h"
+#include "kernels/k_intra.h"
+#include "kernels/k_scan.h"
+#include "mvpred.h"
+
+typedef struct {
+  struct Mav1Encoder *e;
+  EntEnc ec;
+  CdfContext cdf;
+  uint8_t *aboveLevel[3], *aboveDc[3], *leftLevel[3], *leftDc[3];
+  int qctx;
+} Tile;
+
+static MiInfo *mi_at(const struct Mav1Encoder *e, int r, int c) { return &e->mi[r * e->mi_cols + c]; }
+
+/* ------------------------------------------------------------------------ */
+/* Coefficients (5.11.39)                                                    */
+
+static int tx_class(int t) {
+  if (t == V_DCT || t == V_ADST || t == V_FLIPADST) return TX_CLASS_VERT;
+  if (t == H_DCT || t == H_ADST || t == H_FLIPADST) return TX_CLASS_HORIZ;
+  return TX_CLASS_2D;
+}
+
+static int coeff_base_ctx(int txSz, int txClass, const int32_t *quant, int pos) {
+  int adj = Adjusted_Tx_Size[txSz];
+  int bwl = Tx_Width_Log2[adj];
+  int width = 1 << bwl, height = Tx_Height[adj];
+  int row = pos >> bwl, col = pos - (row << bwl);
+  int mag = 0;
+  for (int idx = 0; idx < SIG_REF_DIFF_OFFSET_NUM; idx++) {
+    int rr = row + Sig_Ref_Diff_Offset[txClass][idx][0];
+    int cc = col + Sig_Ref_Diff_Offset[txClass][idx][1];
+    if (rr >= 0 && cc >= 0 && rr < height && cc < width) {
+      int q = abs(quant[(rr << bwl) + cc]);
+      mag += q < 3 ? q : 3;
+    }
+  }
+  int ctx = (mag + 1) >> 1;
+  if (ctx > 4) ctx = 4;
+  if (txClass == TX_CLASS_2D) {
+    if (row == 0 && col == 0) return 0;
+    return ctx + Coeff_Base_Ctx_Offset[txSz][row < 4 ? row : 4][col < 4 ? col : 4];
+  }
+  int idx = (txClass == TX_CLASS_VERT) ? row : col;
+  return ctx + Coeff_Base_Pos_Ctx_Offset[idx < 2 ? idx : 2];
+}
+
+static int coeff_base_eob_ctx(int txSz, int c) {
+  int adj = Adjusted_Tx_Size[txSz];
+  int area = Tx_Height[adj] << Tx_Width_Log2[adj];
+  if (c == 0) return 0;
+  if (c <= area / 8) return 1;
+  if (c <= area / 4) return 2;
+  return 3;
+}
+
+static int coeff_br_ctx(int txSz, int txClass, const int32_t *quant, int pos) {
+  int adj = Adjusted_Tx_Size[txSz];
+  int bwl = Tx_Width_Log2[adj];
+  int txw = Tx_Width[adj], txh = Tx_Height[adj];
+  int row = pos >> bwl, col = pos - (row << bwl);
+  int mag = 0;
+  for (int idx = 0; idx < 3; idx++) {
+    int rr = row + Mag_Ref_Offset_With_Tx_Class[txClass][idx][0];
+    int cc = col + Mag_Ref_Offset_With_Tx_Class[txClass][idx][1];
+    if (rr >= 0 && cc >= 0 && rr < txh && cc < (1 << bwl)) {
+      int q = quant[rr * txw + cc];
+      mag += q < COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1 ? q : COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1;
+    }
+  }
+  mag = (mag + 1) >> 1;
+  if (mag > 6) mag = 6;
+  if (pos == 0) return mag;
+  if (txClass == TX_CLASS_2D) return (row < 2 && col < 2) ? mag + 7 : mag + 14;
+  if (txClass == TX_CLASS_HORIZ) return col == 0 ? mag + 7 : mag + 14;
+  return row == 0 ? mag + 7 : mag + 14;
+}
+
+static int inv_index(KCONST int32_t *tab, int n, int v) {
+  for (int i = 0; i < n; i++)
+    if (tab[i] == v) return i;
+  abort();
+}
+
+static void write_tx_type(Tile *t, int txSz, int isInter, int yMode, int txType) {
+  int set = get_tx_set(txSz, isInter, 0);
+  if (set <= 0 || t->e->hdr.base_q_idx <= 0) return;
+  int sqr = Tx_Size_Sqr[txSz];
+  if (isInter) {
+    if (set == TX_SET_INTER_1)
+      ec_symbol(&t->ec, inv_index(Tx_Type_Inter_Inv_Set1, 16, txType), t->cdf.inter_tx_set1[sqr], 16);
+    else if (set == TX_SET_INTER_2)
+      ec_symbol(&t->ec, inv_index(Tx_Type_Inter_Inv_Set2, 12, txType), t->cdf.inter_tx_set2, 12);
+    else
+      ec_symbol(&t->ec, inv_index(Tx_Type_Inter_Inv_Set3, 2, txType), t->cdf.inter_tx_set3[sqr], 2);
+  } else {
+    if (set == TX_SET_INTRA_1)
+      ec_symbol(&t->ec, inv_index(Tx_Type_Intra_Inv_Set1, 7, txType), t->cdf.intra_tx_set1[sqr][yMode], 7);
+    else
+      ec_symbol(&t->ec, inv_index(Tx_Type_Intra_Inv_Set2, 5, txType), t->cdf.intra_tx_set2[sqr][yMode], 5);
+  }
+}
+
+static void write_golomb(EntEnc *ec, int x) {
+  /* x >= 1: (length-1) zero bits, a one bit, then the low length-1 bits. */
+  int length = 0;
+  while ((x >> length) > 1) length++;
+  length++;
+  for (int i = 0; i < length - 1; i++) ec_literal(ec, 1, 0);
+  ec_literal(ec, 1, 1);
+  for (int i = length - 2; i >= 0; i--) ec_literal(ec, 1, (x >> i) & 1);
+}
+
+/*
+ * coeffs( plane, startX, startY, txSz ) with the levels in `q` (layout
+ * i * tw + j) and the plane transform type.
+ */
+static void write_coeffs(Tile *t, int plane, int startX, int startY, int txSz, int bsize, const int32_t *q,
+                         int eob, int planeTxType, int isInter, int yMode) {
+  struct Mav1Encoder *e = t->e;
+  int x4 = startX >> 2, y4 = startY >> 2;
+  int w4 = Tx_Width[txSz] >> 2, h4 = Tx_Height[txSz] >> 2;
+  int txSzCtx = (Tx_Size_Sqr[txSz] + Tx_Size_Sqr_Up[txSz] + 1) >> 1;
+  int ptype = plane > 0;
+  int maxX4 = e->mi_cols, maxY4 = e->mi_rows;
+  if (plane > 0) { maxX4 >>= 1; maxY4 >>= 1; }
+
+  /* all_zero context */
+  int w = Tx_Width[txSz], h = Tx_Height[txSz];
+  int psz = Subsampled_Size[bsize][plane > 0][plane > 0];
+  int bw = Block_Width(psz), bh = Block_Height(psz);
+  int ctx;
+  if (plane == 0) {
+    int top = 0, left = 0;
+    for (int k = 0; k < w4; k++)
+      if (x4 + k < maxX4 && t->aboveLevel[plane][x4 + k] > top) top = t->aboveLevel[plane][x4 + k];
+    for (int k = 0; k < h4; k++)
+      if (y4 + k < maxY4 && t->leftLevel[plane][y4 + k] > left) left = t->leftLevel[plane][y4 + k];
+    int mx = top > left ? top : left, mn = top < left ? top : left;
+    if (bw == w && bh == h) ctx = 0;
+    else if (top == 0 && left == 0) ctx = 1;
+    else if (top == 0 || left == 0) ctx = 2 + (mx > 3);
+    else if (mx <= 3) ctx = 4;
+    else if (mn <= 3) ctx = 5;
+    else ctx = 6;
+  } else {
+    int above = 0, left = 0;
+    for (int i = 0; i < w4; i++)
+      if (x4 + i < maxX4) above |= t->aboveLevel[plane][x4 + i] | t->aboveDc[plane][x4 + i];
+    for (int i = 0; i < h4; i++)
+      if (y4 + i < maxY4) left |= t->leftLevel[plane][y4 + i] | t->leftDc[plane][y4 + i];
+    ctx = 7 + (above != 0) + (left != 0);
+    if (bw * bh > w * h) ctx += 3;
+  }
+  ec_symbol(&t->ec, eob == 0, t->cdf.txb_skip[txSzCtx][ctx], 2);
+
+  int culLevel = 0, dcCategory = 0;
+  if (eob > 0) {
+    if (plane == 0) write_tx_type(t, txSz, isInter, yMode, planeTxType);
+    KCONST int32_t *scan = get_scan(txSz, planeTxType);
+    int txClass = tx_class(planeTxType);
+    int eobMultisize = (Tx_Width_Log2[txSz] < 5 ? Tx_Width_Log2[txSz] : 5) +
+                       (Tx_Height_Log2[txSz] < 5 ? Tx_Height_Log2[txSz] : 5) - 4;
+    int eobPt = eob <= 2 ? eob : FloorLog2(eob - 1) + 2;
+    int ectx = txClass == TX_CLASS_2D ? 0 : 1;
+    int sym = eobPt - 1;
+    switch (eobMultisize) {
+      case 0: ec_symbol(&t->ec, sym, t->cdf.eob_pt_16[ptype][ectx], 5); break;
+      case 1: ec_symbol(&t->ec, sym, t->cdf.eob_pt_32[ptype][ectx], 6); break;
+      case 2: ec_symbol(&t->ec, sym, t->cdf.eob_pt_64[ptype][ectx], 7); break;
+      case 3: ec_symbol(&t->ec, sym, t->cdf.eob_pt_128[ptype][ectx], 8); break;
+      case 4: ec_symbol(&t->ec, sym, t->cdf.eob_pt_256[ptype][ectx], 9); break;
+      case 5: ec_symbol(&t->ec, sym, t->cdf.eob_pt_512[ptype], 10); break;
+      default: ec_symbol(&t->ec, sym, t->cdf.eob_pt_1024[ptype], 11); break;
+    }
+    int eobShift = eobPt - 3;
+    if (eobShift >= 0) {
+      int rem = eob - ((1 << (eobPt - 2)) + 1);
+      ec_symbol(&t->ec, (rem >> eobShift) & 1, t->cdf.eob_extra[txSzCtx][ptype][eobPt - 3], 2);
+      for (int i = 1; i < eobPt - 2; i++) {
+        int sh = eobPt - 2 - 1 - i;
+        ec_literal(&t->ec, 1, (rem >> sh) & 1);
+      }
+    }
+    /* Levels, from the last coefficient backwards. `lv` mirrors the
+     * decoder's Quant[] (levels of already decoded positions). */
+    int32_t lv[1024];
+    memset(lv, 0, sizeof(lv));
+    for (int c = eob - 1; c >= 0; c--) {
+      int pos = scan[c];
+      int level = abs(q[pos]);
+      int coded;
+      if (c == eob - 1) {
+        int cctx = coeff_base_eob_ctx(txSz, c);
+        coded = (level < 3 ? level : 3);
+        ec_symbol(&t->ec, coded - 1, t->cdf.coeff_base_eob[txSzCtx][ptype][cctx], 3);
+      } else {
+        int cctx = coeff_base_ctx(txSz, txClass, lv, pos);
+        coded = level < 3 ? level : 3;
+        ec_symbol(&t->ec, coded, t->cdf.coeff_base[txSzCtx][ptype][cctx], 4);
+      }
+      if (coded > NUM_BASE_LEVELS) {
+        int bctx = coeff_br_ctx(txSz, txClass, lv, pos);
+        for (int idx = 0; idx < COEFF_BASE_RANGE / (BR_CDF_SIZE - 1); idx++) {
+          int rem = level - coded;
+          int br = rem < BR_CDF_SIZE - 1 ? rem : BR_CDF_SIZE - 1;
+          ec_symbol(&t->ec, br, t->cdf.coeff_br[txSzCtx < TX_32X32 ? txSzCtx : TX_32X32][ptype][bctx], BR_CDF_SIZE);
+          coded += br;
+          if (br < BR_CDF_SIZE - 1) break;
+        }
+      }
+      lv[pos] = coded;
+    }
+    /* Signs and Golomb remainders, in forward scan order. */
+    int dctx = 0;
+    {
+      int dcSign = 0;
+      for (int k = 0; k < w4; k++)
+        if (x4 + k < maxX4) {
+          int s = t->aboveDc[plane][x4 + k];
+          dcSign += (s == 2) - (s == 1);
+        }
+      for (int k = 0; k < h4; k++)
+        if (y4 + k < maxY4) {
+          int s = t->leftDc[plane][y4 + k];
+          dcSign += (s == 2) - (s == 1);
+        }
+      dctx = dcSign < 0 ? 1 : dcSign > 0 ? 2 : 0;
+    }
+    for (int c = 0; c < eob; c++) {
+      int pos = scan[c];
+      int v = q[pos];
+      int level = abs(v);
+      if (level != 0) {
+        int sign = v < 0;
+        if (c == 0) ec_symbol(&t->ec, sign, t->cdf.dc_sign[ptype][dctx], 2);
+        else ec_literal(&t->ec, 1, sign);
+        if (level > NUM_BASE_LEVELS + COEFF_BASE_RANGE)
+          write_golomb(&t->ec, level - (NUM_BASE_LEVELS + COEFF_BASE_RANGE));
+        if (pos == 0) dcCategory = sign ? 1 : 2;
+        culLevel += level & 0xFFFFF;
+      }
+    }
+    if (culLevel > 63) culLevel = 63;
+  }
+  for (int i = 0; i < w4; i++) {
+    t->aboveLevel[plane][x4 + i] = (uint8_t)culLevel;
+    t->aboveDc[plane][x4 + i] = (uint8_t)dcCategory;
+  }
+  for (int i = 0; i < h4; i++) {
+    t->leftLevel[plane][y4 + i] = (uint8_t)culLevel;
+    t->leftDc[plane][y4 + i] = (uint8_t)dcCategory;
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Block syntax                                                              */
+
+static void write_intra_modes(Tile *t, const BlockInfo *b, int availU, int availL, int isKey) {
+  struct Mav1Encoder *e = t->e;
+  int bs = b->bsize;
+  if (isKey) {
+    int above = Intra_Mode_Context[availU ? mi_at(e, b->mi_row - 1, b->mi_col)->y_mode : DC_PRED];
+    int left = Intra_Mode_Context[availL ? mi_at(e, b->mi_row, b->mi_col - 1)->y_mode : DC_PRED];
+    ec_symbol(&t->ec, b->y_mode, t->cdf.intra_frame_y_mode[above][left], INTRA_MODES);
+  } else {
+    ec_symbol(&t->ec, b->y_mode, t->cdf.y_mode[Size_Group[bs]], INTRA_MODES);
+  }
+  if (intra_is_directional(b->y_mode))
+    ec_symbol(&t->ec, b->angle_y + MAX_ANGLE_DELTA, t->cdf.angle_delta[b->y_mode - V_PRED], 2 * MAX_ANGLE_DELTA + 1);
+  /* HasChroma: always for blocks of at least 8x8. */
+  int bw = Block_Width(bs), bh = Block_Height(bs);
+  if ((bw > bh ? bw : bh) <= 32)
+    ec_symbol(&t->ec, b->uv_mode, t->cdf.uv_mode_cfl_allowed[b->y_mode], UV_INTRA_MODES_CFL_ALLOWED);
+  else
+    ec_symbol(&t->ec, b->uv_mode, t->cdf.uv_mode_cfl_not_allowed[b->y_mode], UV_INTRA_MODES_CFL_NOT_ALLOWED);
+  if (intra_is_directional(b->uv_mode))
+    ec_symbol(&t->ec, b->angle_uv + MAX_ANGLE_DELTA, t->cdf.angle_delta[b->uv_mode - V_PRED], 2 * MAX_ANGLE_DELTA + 1);
+}
+
+static void write_block(Tile *t, const BlockInfo *b) {
+  struct Mav1Encoder *e = t->e;
+  int r = b->mi_row, c = b->mi_col, bs = b->bsize;
+  int bw4 = Num_4x4_Blocks_Wide[bs], bh4 = Num_4x4_Blocks_High[bs];
+  int availU = r > 0, availL = c > 0;
+  int isKey = e->hdr.frame_type == KEY_FRAME;
+  int skip = b->eob[0] == 0 && b->eob[1] == 0 && b->eob[2] == 0;
+
+  if (!isKey) {
+    /* inter_frame_mode_info: skip_mode is not present (reference_select = 0). */
+  }
+  int sctx = (availU ? mi_at(e, r - 1, c)->skip : 0) + (availL ? mi_at(e, r, c - 1)->skip : 0);
+  ec_symbol(&t->ec, skip, t->cdf.skip[sctx], 2);
+  if (e->cfg.cdef && !skip) {
+    int sbi = (r >> 4) * e->sb_cols + (c >> 4);
+    if (e->cdef_idx[sbi] == -1) {
+      e->cdef_idx[sbi] = 0;
+      ec_literal(&t->ec, e->hdr.cdef_bits, 0);
+    }
+  }
+  if (isKey) {
+    write_intra_modes(t, b, availU, availL, 1);
+  } else {
+    int ctx;
+    int aboveIntra = availU ? !mi_at(e, r - 1, c)->is_inter : 0;
+    int leftIntra = availL ? !mi_at(e, r, c - 1)->is_inter : 0;
+    if (availU && availL) ctx = (leftIntra && aboveIntra) ? 3 : (leftIntra || aboveIntra);
+    else if (availU || availL) ctx = 2 * (availU ? aboveIntra : leftIntra);
+    else ctx = 0;
+    ec_symbol(&t->ec, b->is_inter, t->cdf.is_inter[ctx], 2);
+    if (b->is_inter) write_inter_block(&t->ec, &t->cdf, e, b);
+    else write_intra_modes(t, b, availU, availL, 0);
+  }
+
+  /* Update the mode-info grid (used by later context derivations). */
+  for (int y = 0; y < bh4 && r + y < e->mi_rows; y++)
+    for (int x = 0; x < bw4 && c + x < e->mi_cols; x++) {
+      MiInfo *m = mi_at(e, r + y, c + x);
+      m->bsize = (int8_t)bs;
+      m->is_inter = (int8_t)b->is_inter;
+      m->skip = (int8_t)skip;
+      m->y_mode = (int8_t)(b->is_inter ? DC_PRED : b->y_mode);
+      m->ref0 = (int8_t)(b->is_inter ? LAST_FRAME : INTRA_FRAME);
+      m->tx_size = (int8_t)Max_Tx_Size_Rect[bs];
+      m->mv_row = (int16_t)(b->is_inter ? b->mv_row : 0);
+      m->mv_col = (int16_t)(b->is_inter ? b->mv_col : 0);
+    }
+
+  if (skip) {
+    for (int plane = 0; plane < 3; plane++) {
+      int sub = plane > 0;
+      for (int i = c >> sub; i < ((c + bw4) >> sub); i++) t->aboveLevel[plane][i] = t->aboveDc[plane][i] = 0;
+      for (int i = r >> sub; i < ((r + bh4) >> sub); i++) t->leftLevel[plane][i] = t->leftDc[plane][i] = 0;
+    }
+    return;
+  }
+  const int32_t *coefs = ENC_COEFS(e);
+  for (int plane = 0; plane < 3; plane++) {
+    int sub = plane > 0;
+    int txSz = plane == 0 ? Max_Tx_Size_Rect[bs] : uv_tx_size(bs, 1, 1);
+    int startX = (c >> sub) * 4, startY = (r >> sub) * 4;
+    int maxX = (e->mi_cols * 4) >> sub, maxY = (e->mi_rows * 4) >> sub;
+    if (startX >= maxX || startY >= maxY) continue;
+    int planeTxType = plane == 0 ? b->tx_type
+                                 : chroma_tx_type(txSz, b->is_inter, b->uv_mode, b->tx_type, 0);
+    write_coeffs(t, plane, startX, startY, txSz, bs, coefs + b->coef_off[plane], b->eob[plane], planeTxType,
+                 b->is_inter, b->y_mode);
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Partition (5.11.4)                                                        */
+
+static uint16_t *partition_cdf(Tile *t, int bsl, int ctx) {
+  if (bsl == 1) return t->cdf.partition_w8[ctx];
+  if (bsl == 2) return t->cdf.partition_w16[ctx];
+  if (bsl == 3) return t->cdf.partition_w32[ctx];
+  return t->cdf.partition_w64[ctx];
+}
+
+static int pprob(const uint16_t *cdf, int p) { return cdf[p] - (p > 0 ? cdf[p - 1] : 0); }
+
+static void write_partition(Tile *t, int r, int c, int bSize, const BlockInfo *blocks, int *k, int n) {
+  struct Mav1Encoder *e = t->e;
+  if (r >= e->mi_rows || c >= e->mi_cols) return;
+  int num4x4 = Num_4x4_Blocks_Wide[bSize];
+  int half = num4x4 >> 1;
+  int hasRows = (r + half) < e->mi_rows, hasCols = (c + half) < e->mi_cols;
+  int isNone = *k < n && blocks[*k].mi_row == r && blocks[*k].mi_col == c && blocks[*k].bsize == bSize;
+  int bsl = Mi_Width_Log2[bSize];
+  int availU = r > 0, availL = c > 0;
+  int above = availU && Mi_Width_Log2[mi_at(e, r - 1, c)->bsize] < bsl;
+  int left = availL && Mi_Height_Log2[mi_at(e, r, c - 1)->bsize] < bsl;
+  int ctx = left * 2 + above;
+  if (bSize < BLOCK_8X8) {
+    abort();
+  } else if (hasRows && hasCols) {
+    int nsym = bsl == 1 ? 4 : 10;
+    ec_symbol(&t->ec, isNone ? PARTITION_NONE : PARTITION_SPLIT, partition_cdf(t, bsl, ctx), nsym);
+  } else if (hasCols) {
+    const uint16_t *pc = partition_cdf(t, bsl, ctx);
+    int psum = pprob(pc, PARTITION_VERT) + pprob(pc, PARTITION_SPLIT) + pprob(pc, PARTITION_HORZ_A) +
+               pprob(pc, PARTITION_VERT_A) + pprob(pc, PARTITION_VERT_B) + pprob(pc, PARTITION_VERT_4);
+    uint16_t tmp[3] = {(uint16_t)((1 << 15) - psum), 1 << 15, 0};
+    if (isNone) abort();
+    ec_symbol(&t->ec, 1, tmp, 2);
+  } else if (hasRows) {
+    const uint16_t *pc = partition_cdf(t, bsl, ctx);
+    int psum = pprob(pc, PARTITION_HORZ) + pprob(pc, PARTITION_SPLIT) + pprob(pc, PARTITION_HORZ_A) +
+               pprob(pc, PARTITION_HORZ_B) + pprob(pc, PARTITION_VERT_A) + pprob(pc, PARTITION_HORZ_4);
+    uint16_t tmp[3] = {(uint16_t)((1 << 15) - psum), 1 << 15, 0};
+    if (isNone) abort();
+    ec_symbol(&t->ec, 1, tmp, 2);
+  } else {
+    if (isNone) abort();
+  }
+  if (isNone) {
+    write_block(t, &blocks[*k]);
+    (*k)++;
+  } else {
+    int sub = Partition_Subsize[PARTITION_SPLIT][bSize];
+    write_partition(t, r, c, sub, blocks, k, n);
+    write_partition(t, r, c + half, sub, blocks, k, n);
+    write_partition(t, r + half, c, sub, blocks, k, n);
+    write_partition(t, r + half, c + half, sub, blocks, k, n);
+  }
+}
+
+size_t write_tile(struct Mav1Encoder *e, uint8_t **out) {
+  Tile t;
+  memset(&t, 0, sizeof(t));
+  t.e = e;
+  ec_init(&t.ec);
+  cdf_init(&t.cdf, e->hdr.base_q_idx);
+  int aw = e->mi_cols + 32, lh = e->mi_rows + 32;
+  for (int p = 0; p < 3; p++) {
+    t.aboveLevel[p] = calloc(aw, 1);
+    t.aboveDc[p] = calloc(aw, 1);
+    t.leftLevel[p] = calloc(lh, 1);
+    t.leftDc[p] = calloc(lh, 1);
+  }
+  memset(e->mi, 0, sizeof(MiInfo) * e->mi_rows * e->mi_cols);
+  for (int i = 0; i < e->num_sbs; i++) e->cdef_idx[i] = -1;
+  mvpred_frame_start(e);
+
+  const BlockInfo *blocks = ENC_BLOCKS(e);
+  const SbInfo *sbs = ENC_SBS(e);
+  for (int sr = 0; sr < e->sb_rows; sr++) {
+    for (int p = 0; p < 3; p++) {
+      memset(t.leftLevel[p], 0, lh);
+      memset(t.leftDc[p], 0, lh);
+    }
+    for (int sc = 0; sc < e->sb_cols; sc++) {
+      const SbInfo *sb = &sbs[sr * e->sb_cols + sc];
+      int k = 0;
+      write_partition(&t, sr * 16, sc * 16, BLOCK_64X64, blocks + sb->first_block, &k, sb->num_blocks);
+      if (k != sb->num_blocks) abort();
+    }
+  }
+  size_t n = ec_finish(&t.ec, out);
+  ec_free(&t.ec);
+  for (int p = 0; p < 3; p++) {
+    free(t.aboveLevel[p]);
+    free(t.aboveDc[p]);
+    free(t.leftLevel[p]);
+    free(t.leftDc[p]);
+  }
+  return n;
+}
