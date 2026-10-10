@@ -58,6 +58,7 @@ typedef struct {
   int32_t num_blocks;
   int32_t frame_w, frame_h;           /* real (cropped) luma frame size */
   int32_t me_range;                   /* full-pel motion search range */
+  int32_t lossless;                   /* CodedLossless (base_q_idx == 0) */
   int32_t lf_level[4];                /* loop_filter_level[] */
   int32_t lf_sharpness;
   int32_t cdef_damping, cdef_bits;

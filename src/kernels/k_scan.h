@@ -106,4 +106,10 @@ INLINE int uv_tx_size(int miSize, int subX, int subY) {
   return uvTx;
 }
 
+/* uv_mode cdf selection (spec 8.3.2): whether UV_CFL_PRED may be coded. */
+INLINE int cfl_allowed(int miSize, int lossless) {
+  if (lossless) return Subsampled_Size[miSize][1][1] == BLOCK_4X4;
+  return k_max(Block_Width(miSize), Block_Height(miSize)) <= 32;
+}
+
 #endif

@@ -17,6 +17,7 @@
 #include "k_common.h"
 #include "k_intra.h"
 #include "k_inter.h"
+#include "k_scan.h"
 
 #define MAX_BLOCKS_PER_SB 64
 #define COEFS_PER_SB 6144
@@ -138,7 +139,7 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
              (long)lam * (m == DC_PRED ? 8 : 24) / 8;
     if (bestUv < 0 || c < bestUv) { bestUv = c; bestUvMode = m; }
   }
-  if (k_max(lw, lh) <= 5) {
+  if (cfl_allowed(bsize, fp->lossless)) {
     /* CfL estimated from source luma (recon picks the final alphas). */
     DEV int32_t *dc = scratch + A_TMP;
     int cw = 1 << clw, ch = 1 << clh;
@@ -350,7 +351,7 @@ INLINE void analyze_sb(DEV const FrameParams *fp, int sbIdx, DEV const uint8_t *
           eval_block(fp, src, ref, mvField, node, r + dr, c + dc, bs, scratch, &b);
           int w = Block_Width(bs), h = Block_Height(bs);
           b.coef_off[0] = coefOff;
-          coefOff += k_min(32, w) * k_min(32, h);
+          coefOff += fp->lossless ? w * h : k_min(32, w) * k_min(32, h);
           b.coef_off[1] = coefOff;
           coefOff += (w >> 1) * (h >> 1);
           b.coef_off[2] = coefOff;

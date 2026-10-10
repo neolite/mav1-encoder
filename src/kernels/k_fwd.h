@@ -101,4 +101,33 @@ INLINE void dequant_block(DEV const int32_t *quant, DEV int32_t *dq, int txSz, i
     }
 }
 
+/* Forward Walsh-Hadamard transform for lossless blocks: the exact inverse
+ * of the spec's inverse WHT (7.13.2.10) with shift 2. resid stride 64,
+ * out[i * 4 + j] holds Dequant[i][j] / 4, i.e. the coefficient level. */
+INLINE void fwht4x4(DEV const int32_t *resid, DEV int32_t *out) {
+  int t[16];
+  for (int j = 0; j < 4; j++) { /* columns */
+    int a1 = resid[0 * 64 + j], b1 = resid[1 * 64 + j], c1 = resid[2 * 64 + j], d1 = resid[3 * 64 + j];
+    a1 += b1;
+    d1 = d1 - c1;
+    int e1 = (a1 - d1) >> 1;
+    b1 = e1 - b1;
+    c1 = e1 - c1;
+    a1 -= c1;
+    d1 += b1;
+    t[0 * 4 + j] = a1; t[1 * 4 + j] = c1; t[2 * 4 + j] = d1; t[3 * 4 + j] = b1;
+  }
+  for (int i = 0; i < 4; i++) { /* rows */
+    int a1 = t[i * 4 + 0], b1 = t[i * 4 + 1], c1 = t[i * 4 + 2], d1 = t[i * 4 + 3];
+    a1 += b1;
+    d1 -= c1;
+    int e1 = (a1 - d1) >> 1;
+    b1 = e1 - b1;
+    c1 = e1 - c1;
+    a1 -= c1;
+    d1 += b1;
+    out[i * 4 + 0] = a1; out[i * 4 + 1] = c1; out[i * 4 + 2] = d1; out[i * 4 + 3] = b1;
+  }
+}
+
 #endif

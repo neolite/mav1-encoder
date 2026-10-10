@@ -57,7 +57,7 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
   }
   Mav1Encoder *e = calloc(1, sizeof(*e));
   e->cfg = *cfg;
-  if (e->cfg.qindex < 1) e->cfg.qindex = 1;
+  if (e->cfg.qindex < 0) e->cfg.qindex = 0;
   if (e->cfg.qindex > 255) e->cfg.qindex = 255;
   e->w = cfg->width;
   e->h = cfg->height;
@@ -177,6 +177,7 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   fp->reduced_tx_set = 0;
   fp->enable_intra_edge_filter = 0;
   fp->tx_search = e->cfg.tx_search;
+  fp->lossless = q == 0;
   long acq = fp->ac_q[0];
   fp->lambda = (int32_t)(acq * acq * 256 / 430);
   fp->frame_w = e->w;
@@ -186,7 +187,7 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   /* Loop filter level from q (libaom's LPF_PICK_FROM_Q rule for 8-bit). */
   FrameHdr *h = &e->hdr;
   int lvl = 0;
-  if (e->cfg.loop_filter) {
+  if (e->cfg.loop_filter && q > 0) {
     lvl = (int)((acq * 20723 + 1015158 + (1 << 17)) >> 18);
     if (!isKey) lvl -= 4;
     lvl = lvl < 0 ? 0 : (lvl > MAX_LOOP_FILTER ? MAX_LOOP_FILTER : lvl);
@@ -294,7 +295,7 @@ int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int stride
   double t2 = now();
   build_filter_info(e);
   e->be->filter(e->be, e);
-  if (e->cfg.cdef) cdef_select(e);
+  if (e->cfg.cdef && e->cfg.qindex > 0) cdef_select(e);
   double t3 = now();
 
   uint8_t *tile = NULL;

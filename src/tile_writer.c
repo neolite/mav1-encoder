@@ -11,6 +11,7 @@
 #include "kernels/k_scan.h"
 #include "mvpred.h"
 #include "kernels/k_analysis.h"
+#include "kernels/k_recon.h"
 
 typedef struct {
   struct Mav1Encoder *e;
@@ -280,7 +281,8 @@ static void write_intra_modes(Tile *t, const BlockInfo *b, int availU, int avail
     ec_symbol(&t->ec, b->angle_y + MAX_ANGLE_DELTA, t->cdf.angle_delta[b->y_mode - V_PRED], 2 * MAX_ANGLE_DELTA + 1);
   /* HasChroma: always for blocks of at least 8x8. */
   int bw = Block_Width(bs), bh = Block_Height(bs);
-  if ((bw > bh ? bw : bh) <= 32)
+  (void)bw; (void)bh;
+  if (cfl_allowed(bs, e->hdr.base_q_idx == 0))
     ec_symbol(&t->ec, b->uv_mode, t->cdf.uv_mode_cfl_allowed[b->y_mode], UV_INTRA_MODES_CFL_ALLOWED);
   else
     ec_symbol(&t->ec, b->uv_mode, t->cdf.uv_mode_cfl_not_allowed[b->y_mode], UV_INTRA_MODES_CFL_NOT_ALLOWED);
@@ -309,7 +311,7 @@ static void write_block(Tile *t, const BlockInfo *b) {
   }
   int sctx = (availU ? mi_at(e, r - 1, c)->skip : 0) + (availL ? mi_at(e, r, c - 1)->skip : 0);
   ec_symbol(&t->ec, skip, t->cdf.skip[sctx], 2);
-  if (e->cfg.cdef && !skip) {
+  if (e->cfg.cdef && !skip && e->hdr.base_q_idx > 0) {
     int sbi = (r >> 4) * e->sb_cols + (c >> 4);
     if (e->cdef_idx[sbi] == -1) {
       e->cdef_idx[sbi] = e->cdef_choice[sbi];
@@ -355,16 +357,27 @@ static void write_block(Tile *t, const BlockInfo *b) {
     return;
   }
   const int32_t *coefs = ENC_COEFS(e);
+  int lossless = e->hdr.base_q_idx == 0;
   for (int plane = 0; plane < 3; plane++) {
     int sub = plane > 0;
-    int txSz = plane == 0 ? Max_Tx_Size_Rect[bs] : uv_tx_size(bs, 1, 1);
-    int startX = (c >> sub) * 4, startY = (r >> sub) * 4;
+    int txSz = lossless ? TX_4X4 : (plane == 0 ? Max_Tx_Size_Rect[bs] : uv_tx_size(bs, 1, 1));
     int maxX = (e->mi_cols * 4) >> sub, maxY = (e->mi_rows * 4) >> sub;
+    int planeSz = Subsampled_Size[bs][sub][sub];
+    int tw = Tx_Width[txSz], th = Tx_Height[txSz];
+    int txIdx = 0;
+    for (int y = 0; y < Block_Height(planeSz); y += th)
+      for (int x = 0; x < Block_Width(planeSz); x += tw) {
+    int startX = (c >> sub) * 4 + x, startY = (r >> sub) * 4 + y;
     if (startX >= maxX || startY >= maxY) continue;
-    int planeTxType = plane == 0 ? b->tx_type
-                                 : chroma_tx_type(txSz, b->is_inter, b->uv_mode, b->tx_type, 0);
-    write_coeffs(t, plane, startX, startY, txSz, bs, coefs + b->coef_off[plane], b->eob[plane], planeTxType,
+    const int32_t *q = coefs + b->coef_off[plane] + txIdx * tw * th;
+    txIdx++;
+    int planeTxType = lossless ? DCT_DCT
+                      : plane == 0 ? b->tx_type
+                                   : chroma_tx_type(txSz, b->is_inter, b->uv_mode, b->tx_type, 0);
+    int eob = lossless ? find_eob(q, get_scan(txSz, DCT_DCT), 16) : b->eob[plane];
+    write_coeffs(t, plane, startX, startY, txSz, bs, q, eob, planeTxType,
                  b->is_inter, b->y_mode);
+      }
   }
 }
 

@@ -73,6 +73,29 @@ INLINE int code_tx_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV 
   long bestCost = -1;
   int bestType = DCT_DCT, bestEob = 0;
 
+  if (fp->lossless) {
+    for (int i = 0; i < 4; i++)
+      for (int j = 0; j < 4; j++) {
+        int o = (y + i) * stride + x + j;
+        resid[i * 64 + j] = (int)src[o] - (int)rec[o];
+      }
+    fwht4x4(resid, qbest);
+    KCONST int32_t *scan = get_scan(TX_4X4, DCT_DCT);
+    bestEob = find_eob(qbest, scan, 16);
+    for (int k = 0; k < 16; k++) coefOut[k] = qbest[k];
+    if (bestEob > 0) {
+      dequant_block(qbest, dq, TX_4X4, dcQ, acQ);
+      itx_2d(dq, res, TX_4X4, DCT_DCT, 1);
+      for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+          int o = (y + i) * stride + x + j;
+          rec[o] = (uint8_t)Clip1((int)rec[o] + res[i * 64 + j]);
+        }
+    }
+    *outType = DCT_DCT;
+    return bestEob;
+  }
+
   for (int ci = 0; ci < numCands; ci++) {
     int t = cands[ci];
     int fud = itx_flip_ud(t), flr = itx_flip_lr(t);
@@ -138,7 +161,7 @@ INLINE void recon_block(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const u
   int lumaTxType = DCT_DCT;
   for (int plane = 0; plane < 3; plane++) {
     int subX = plane > 0, subY = plane > 0;
-    int txSz = plane == 0 ? Max_Tx_Size_Rect[bs] : uv_tx_size(bs, subX, subY);
+    int txSz = fp->lossless ? TX_4X4 : (plane == 0 ? Max_Tx_Size_Rect[bs] : uv_tx_size(bs, subX, subY));
     int planeSz = Subsampled_Size[bs][subX][subY];
     int num4x4W = Num_4x4_Blocks_Wide[planeSz], num4x4H = Num_4x4_Blocks_High[planeSz];
     int baseX = (MiCol >> subX) * 4, baseY = (MiRow >> subY) * 4;
@@ -156,7 +179,7 @@ INLINE void recon_block(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const u
     int isInter = b->is_inter;
     if (plane == 0) {
       int set = get_tx_set(txSz, isInter, fp->reduced_tx_set);
-      if (!fp->tx_search || set == TX_SET_DCTONLY) {
+      if (!fp->tx_search || set == TX_SET_DCTONLY || fp->lossless) {
         cands[numCands++] = DCT_DCT;
       } else {
         for (int t = 0; t < 16; t++)
@@ -165,9 +188,12 @@ INLINE void recon_block(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const u
     } else {
       cands[numCands++] = chroma_tx_type(txSz, isInter, b->uv_mode, lumaTxType, fp->reduced_tx_set);
     }
+    int txIdx = 0, anyNz = 0;
     for (int y = 0; y < num4x4H; y += stepY) {
       for (int x = 0; x < num4x4W; x += stepX) {
         int startX = baseX + 4 * x, startY = baseY + 4 * y;
+        /* transform_block( ) returns early for blocks outside the frame */
+        if (startX >= ((fp->mi_cols * 4) >> subX) || startY >= ((fp->mi_rows * 4) >> subY)) continue;
         int row = (startY << subY) >> 2, col = (startX << subX) >> 2;
         int sbr = row & 15, sbc = col & 15;
         if (!isInter) {
@@ -190,6 +216,10 @@ INLINE void recon_block(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const u
             /* MaxLumaW/H: end of the (single) luma transform block. */
             int lw = Tx_Width[Max_Tx_Size_Rect[bs]], lh = Tx_Height[Max_Tx_Size_Rect[bs]];
             int maxLumaW = MiCol * 4 + lw, maxLumaH = MiRow * 4 + lh;
+            if (fp->lossless) { /* end of the last decoded 4x4 luma transform */
+              maxLumaW = k_min(MiCol * 4 + Block_Width(bs), fp->mi_cols * 4);
+              maxLumaH = k_min(MiRow * 4 + Block_Height(bs), fp->mi_rows * 4);
+            }
             DEV int32_t *dc = scratch + S_TMP;
             DEV uint8_t *d = px + startY * stride + startX;
             int tw = Tx_Width[txSz], th = Tx_Height[txSz];
@@ -197,7 +227,9 @@ INLINE void recon_block(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const u
               for (int j = 0; j < tw; j++) dc[i * tw + j] = d[i * stride + j];
             DEV const uint8_t *luma = rec + fp->offset[0];
             int alpha;
-            if (plane == 1) {
+            if (txIdx > 0) {
+              alpha = plane == 1 ? b->cfl_alpha_u : b->cfl_alpha_v; /* one alpha per block */
+            } else if (plane == 1) {
               alpha = cfl_best_alpha(luma, fp->stride[0], startX, startY, maxLumaW, maxLumaH, a.log2W, a.log2H, dc,
                                      spx + startY * stride + startX, stride, d, stride, 0);
               b->cfl_alpha_u = alpha;
@@ -213,8 +245,13 @@ INLINE void recon_block(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const u
         }
         int t = DCT_DCT;
         int eob = code_tx_block(fp, spx, px, stride, startX, startY, txSz, plane, cands, numCands,
-                                coefs + b->coef_off[plane], mats, scratch, &t);
-        b->eob[plane] = eob;
+                                coefs + b->coef_off[plane] + txIdx * Tx_Width[txSz] * Tx_Height[txSz], mats,
+                                scratch, &t);
+        txIdx++;
+        anyNz |= eob > 0;
+        /* eob[] is the eob of the single transform, or a non-zero flag when
+         * the plane has several (lossless) */
+        b->eob[plane] = fp->lossless ? anyNz : eob;
         if (plane == 0) { lumaTxType = t; b->tx_type = t; }
         for (int i = 0; i < stepY; i++)
           for (int j = 0; j < stepX; j++) BD(plane, (sbr >> subY) + i, (sbc >> subX) + j) = 1;

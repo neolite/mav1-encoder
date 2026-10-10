@@ -138,9 +138,11 @@ static void frame_header(const struct Mav1Encoder *e, BitWriter *w) {
   bw_f(w, 1, 0);                 /* DeltaQUAc */
   bw_f(w, 1, 0);                 /* using_qmatrix */
   bw_f(w, 1, 0);                 /* segmentation_enabled */
-  bw_f(w, 1, 0);                 /* delta_q_present (base_q_idx > 0) */
+  if (h->base_q_idx > 0) bw_f(w, 1, 0); /* delta_q_present */
+  int codedLossless = h->base_q_idx == 0;
 
-  /* loop_filter_params */
+  /* loop_filter_params (absent when CodedLossless) */
+  if (!codedLossless) {
   bw_f(w, 6, h->lf_level[0]);
   bw_f(w, 6, h->lf_level[1]);
   if (h->lf_level[0] || h->lf_level[1]) {
@@ -149,9 +151,10 @@ static void frame_header(const struct Mav1Encoder *e, BitWriter *w) {
   }
   bw_f(w, 3, h->lf_sharpness);
   bw_f(w, 1, 0);                 /* loop_filter_delta_enabled */
+  }
 
   /* cdef_params */
-  if (e->cfg.cdef) {
+  if (e->cfg.cdef && !codedLossless) {
     bw_f(w, 2, h->cdef_damping - 3);
     bw_f(w, 2, h->cdef_bits);
     for (int i = 0; i < (1 << h->cdef_bits); i++) {
@@ -161,7 +164,7 @@ static void frame_header(const struct Mav1Encoder *e, BitWriter *w) {
       bw_f(w, 2, h->cdef_uv_sec[i] == 4 ? 3 : h->cdef_uv_sec[i]);
     }
   }
-  bw_f(w, 1, 0);                 /* tx_mode_select -> TX_MODE_LARGEST */
+  if (!codedLossless) bw_f(w, 1, 0); /* tx_mode_select -> TX_MODE_LARGEST */
   if (!intra) bw_f(w, 1, 0);     /* reference_select */
   bw_f(w, 1, 0);                 /* reduced_tx_set */
   if (!intra)

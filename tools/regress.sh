@@ -4,7 +4,7 @@
 enc=$1; shift
 fail=0
 for clip in media/ts352.y4m media/mb203.y4m; do
-  for q in 1 40 100 180 255; do
+  for q in 0 1 40 100 180 255; do
     $enc -i $clip -o r_cpu.ivf -r r_rec.y4m -n 5 --cpu -q $q "$@" >/dev/null 2>&1 || { echo "$clip q=$q encode FAILED"; fail=1; continue; }
     $enc -i $clip -o r_mtl.ivf -n 5 --metal -q $q "$@" >/dev/null 2>&1
     dav1d -q -i r_cpu.ivf -o r_d.y4m 2>/dev/null
