@@ -71,6 +71,21 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
   e->sb_cols = (e->mi_cols + 15) >> 4;
   e->sb_rows = (e->mi_rows + 15) >> 4;
   e->num_sbs = e->sb_cols * e->sb_rows;
+  /* tile_info: uniform spacing, tile columns only (one tile row) */
+  {
+    int k = 0;
+    while (((MAX_TILE_WIDTH >> 6) << k) < e->sb_cols) k++;
+    e->min_log2_tile_cols = k;
+    int maxCols = e->sb_cols < MAX_TILE_COLS ? e->sb_cols : MAX_TILE_COLS;
+    for (k = 0; (1 << k) < maxCols; k++) {}
+    e->max_log2_tile_cols = k;
+    int l = e->cfg.tile_cols_log2;
+    if (l < e->min_log2_tile_cols) l = e->min_log2_tile_cols;
+    if (l > e->max_log2_tile_cols) l = e->max_log2_tile_cols;
+    e->tile_cols_log2 = l;
+    e->tile_w_sb = (e->sb_cols + (1 << l) - 1) >> l;
+    e->tile_cols = (e->sb_cols + e->tile_w_sb - 1) / e->tile_w_sb;
+  }
   e->stride[0] = e->sb_cols * 64;
   e->stride[1] = e->stride[2] = e->sb_cols * 32;
   e->plane_h[0] = e->sb_rows * 64;
@@ -194,6 +209,7 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   fp->tx_mode_select = q != 0 && e->cfg.tx_depth;
   fp->switchable_interp = !isKey && e->cfg.switchable_interp;
   fp->fast = e->cfg.fast;
+  fp->tile_w_sb = e->tile_w_sb;
   long acq = fp->ac_q[0];
   fp->lambda = (int32_t)(acq * acq * 256 / 430);
   fp->frame_w = e->w;

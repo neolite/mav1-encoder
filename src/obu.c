@@ -131,9 +131,18 @@ static void frame_header(const struct Mav1Encoder *e, BitWriter *w) {
   if (minLog2TileCols > minLog2Tiles) minLog2Tiles = minLog2TileCols;
   bw_f(w, 1, 1);                 /* uniform_tile_spacing_flag */
   int tileColsLog2 = minLog2TileCols;
-  if (tileColsLog2 < maxLog2TileCols) bw_f(w, 1, 0);
+  while (tileColsLog2 < maxLog2TileCols) {
+    int inc = tileColsLog2 < e->tile_cols_log2;
+    bw_f(w, 1, inc); /* increment_tile_cols_log2 */
+    if (!inc) break;
+    tileColsLog2++;
+  }
   int minLog2TileRows = minLog2Tiles - tileColsLog2 > 0 ? minLog2Tiles - tileColsLog2 : 0;
   if (minLog2TileRows < maxLog2TileRows) bw_f(w, 1, 0);
+  if (tileColsLog2 + minLog2TileRows > 0) {
+    bw_f(w, tileColsLog2 + minLog2TileRows, 0); /* context_update_tile_id */
+    bw_f(w, 2, 3);                              /* tile_size_bytes_minus_1: 4 bytes */
+  }
 
   /* quantization_params */
   bw_f(w, 8, h->base_q_idx);
@@ -196,6 +205,12 @@ size_t write_frame_obu(const struct Mav1Encoder *e, const uint8_t *tile, size_t 
   bw_init(&w);
   frame_header(e, &w);
   bw_byte_align(&w);
+  /* tile_group_obu( ): with several tiles, tile_start_and_end_present_flag
+   * = 0 then byte_alignment( ); the tile sizes are part of `tile`. */
+  if (e->tile_cols > 1) {
+    bw_f(&w, 1, 0);
+    bw_byte_align(&w);
+  }
   bw_bytes_append(&w, tile, tileSize);
   size_t n = wrap_obu(6 /* OBU_FRAME */, w.buf, bw_bytes(&w), out);
   bw_free(&w);

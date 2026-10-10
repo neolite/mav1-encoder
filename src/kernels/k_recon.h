@@ -175,7 +175,7 @@ INLINE long code_plane(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const ui
                        int plane, int txSz, THR int *maxLumaW, THR int *maxLumaH) {
   int bs = b->bsize;
   int MiRow = b->mi_row, MiCol = b->mi_col;
-  int AvailU = MiRow > 0, AvailL = MiCol > 0;
+  int AvailU = MiRow > 0, AvailL = MiCol > tile_col_start(fp, MiCol);
   int subX = plane > 0, subY = plane > 0;
   int planeSz = Subsampled_Size[bs][subX][subY];
   int num4x4W = Num_4x4_Blocks_Wide[planeSz], num4x4H = Num_4x4_Blocks_High[planeSz];
@@ -367,10 +367,10 @@ INLINE void recon_sb(DEV const FrameParams *fp, SbInfo sb, DEV BlockInfo *blocks
   uint8_t bd[3 * BD_DIM * BD_DIM];
   int r = sb.sb_row * 16, c = sb.sb_col * 16;
   int sbSize4 = 16;
-  /* clear_block_decoded_flags( r, c, sbSize4 ) with a single tile. */
+  /* clear_block_decoded_flags( r, c, sbSize4 ) */
   for (int plane = 0; plane < 3; plane++) {
     int subX = plane > 0, subY = plane > 0;
-    int sbWidth4 = (fp->mi_cols - c) >> subX;
+    int sbWidth4 = (tile_col_end(fp, c) - c) >> subX;
     int sbHeight4 = (fp->mi_rows - r) >> subY;
     for (int y = -1; y <= (sbSize4 >> subY); y++)
       for (int x = -1; x <= (sbSize4 >> subX); x++) {

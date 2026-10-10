@@ -60,6 +60,7 @@ typedef struct {
   int32_t me_range;                   /* full-pel motion search range */
   int32_t lossless;                   /* CodedLossless (base_q_idx == 0) */
   int32_t tx_mode_select;             /* TxMode == TX_MODE_SELECT */
+  int32_t tile_w_sb;                  /* uniform tile column width in SBs */
   int32_t fast;                       /* reduced analysis search */
   int32_t switchable_interp;          /* interpolation_filter == SWITCHABLE (dual filter) */
   int32_t lf_level[4];                /* loop_filter_level[] */
@@ -69,6 +70,15 @@ typedef struct {
   /* loop restoration: FrameRestorationType and the unit grid of each plane */
   int32_t lr_type[3], lr_unit_size[3], lr_unit_rows[3], lr_unit_cols[3], lr_unit_off[3];
 } FrameParams;
+
+/* Tile columns (uniform spacing, one tile row): MiColStart / MiColEnd of
+ * the tile containing miCol. */
+INLINE int tile_col_start(DEV const FrameParams *fp, int miCol) {
+  return ((miCol >> 4) / fp->tile_w_sb) * fp->tile_w_sb * 16;
+}
+INLINE int tile_col_end(DEV const FrameParams *fp, int miCol) {
+  return k_min(fp->mi_cols, tile_col_start(fp, miCol) + fp->tile_w_sb * 16);
+}
 
 /* One coded block, in decode order. Filled by the CPU mode decision, then
  * completed by the reconstruction kernel. */

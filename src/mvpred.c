@@ -24,7 +24,9 @@ void mvpred_frame_start(struct Mav1Encoder *e) {
 }
 
 static int is_inside(const MvStack *s, int r, int c) {
-  return c >= 0 && c < s->e->mi_cols && r >= 0 && r < s->e->mi_rows;
+  const FrameParams *fp = ENC_PARAMS(s->e);
+  int cs = tile_col_start(fp, s->miCol);
+  return c >= cs && c < tile_col_end(fp, s->miCol) && r >= 0 && r < s->e->mi_rows;
 }
 
 static void lower_precision(int *mv) {
@@ -259,7 +261,7 @@ int write_inter_block(EntEnc *ec, CdfContext *cdf, struct Mav1Encoder *e, const 
    * All three contexts reduce to ref_count_ctx(lastCount, 0). */
   int lastCount = 0;
   if (r > 0) lastCount += mi_at(e, r - 1, c)->ref0 == LAST_FRAME;
-  if (c > 0) lastCount += mi_at(e, r, c - 1)->ref0 == LAST_FRAME;
+  if (c > tile_col_start(ENC_PARAMS(e), c)) lastCount += mi_at(e, r, c - 1)->ref0 == LAST_FRAME;
   int rctx = lastCount == 0 ? 1 : 2;
   ec_symbol(ec, 0, cdf->single_ref[rctx][0], 2);
   ec_symbol(ec, 0, cdf->single_ref[rctx][2], 2);

@@ -48,6 +48,7 @@ struct Mav1Encoder {
   Mav1Config cfg;
   int w, h;
   int mi_cols, mi_rows, sb_cols, sb_rows, num_sbs;
+  int tile_cols_log2, tile_cols, tile_w_sb, min_log2_tile_cols, max_log2_tile_cols;
   int stride[3], offset[3], plane_h[3];
   size_t frame_bytes;
 

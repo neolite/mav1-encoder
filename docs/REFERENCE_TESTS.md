@@ -40,7 +40,7 @@ Full list: `ref/aom/test/test_vectors.cc` (176 entries).
 |---|---|---|
 | Entropy coder | `build/test_entropy` | Spec decoder transcription |
 | Transforms | `build/test_txfm` | Spec inverse transform |
-| Bit-exact regression (2 clips × 6 q incl. lossless × 5 frames, I and P frames; run in parallel) | `tools/regress.sh build/mav1enc [--lr-test] [--no-lf --no-cdef ...]` | dav1d, aomdec (libaom), Metal vs CPU byte compare |
+| Bit-exact regression (2 clips × 6 q incl. lossless × 5 frames, I and P frames; run in parallel) | `tools/regress.sh build/mav1enc [--lr-test] [--fast] [--tiles 2] [--no-lf --no-cdef ...]` | dav1d, aomdec (libaom), Metal vs CPU byte compare |
 | FFmpeg integration | `ffmpeg -c:v libmav1` into ivf, mkv, mp4 and webm; `-metal 0/1` | Packets identical to `mav1enc`; decoded output equals encoder recon |
 | Speed and quality | `tools/bench.py` | Metal vs CPU, plus libaom, SVT-AV1 and rav1e |
 
@@ -61,6 +61,7 @@ Full list: `ref/aom/test/test_vectors.cc` (176 entries).
 | Deblocking loop filter 7.14 (including transform-split edges) | ✅ |
 | CDEF 7.15 with per-SB selection over 4 strength sets | ✅ |
 | Loop restoration 7.17: Wiener and self-guided, 64x64 units, least-squares parameter search, RD per unit | ✅ (`--lr-test` forces both filters for syntax coverage) |
-| Superres, film grain, segmentation, tiles >1, 10/12-bit, 4:4:4, 128x128 SB, palette, intrabc, compound, multiple references | ❌ not emitted |
+| Tiles: uniform tile columns (`--tiles LOG2`, up to 64), coded in parallel; tile-bounded availability, MV stack, contexts, CDFs, LR refs | ✅ (tile rows >1 not emitted) |
+| Superres, film grain, segmentation, 10/12-bit, 4:4:4, 128x128 SB, palette, intrabc, compound, multiple references | ❌ not emitted |
 
 Every bitstream mav1 emits is verified bit-exact against two independent decoders.

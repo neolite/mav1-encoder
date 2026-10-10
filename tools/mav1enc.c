@@ -10,7 +10,7 @@
 static void usage(void) {
   fprintf(stderr,
           "usage: mav1enc -i in.y4m -o out.ivf [-r recon.y4m] [-q qindex] [-n frames]\n"
-          "               [--cpu|--metal] [--keyint N] [--no-lf] [--no-cdef] [--no-txsearch] [--no-txdepth] [--no-lr] [--lr-test] [--no-switchable] [--fast]\n"
+          "               [--cpu|--metal] [--keyint N] [--no-lf] [--no-cdef] [--no-txsearch] [--no-txdepth] [--no-lr] [--lr-test] [--no-switchable] [--fast] [--tiles LOG2]\n"
           "               [--me-range N] [-v]\n");
   exit(2);
 }
@@ -28,7 +28,7 @@ static double psnr(const uint8_t *a, const uint8_t *b, size_t n) {
 
 int main(int argc, char **argv) {
   const char *in = NULL, *outp = NULL, *recp = NULL;
-  int q = 100, nframes = 1 << 30, metal = 1, keyint = 0, lf = 1, cdef = 1, txs = 1, txd = 1, lr = 1, lrt = 0, sw = 1, fast = 0, verbose = 0, mer = 32;
+  int q = 100, nframes = 1 << 30, metal = 1, keyint = 0, lf = 1, cdef = 1, txs = 1, txd = 1, lr = 1, lrt = 0, sw = 1, fast = 0, tiles = -1, verbose = 0, mer = 32;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "-i") && i + 1 < argc) in = argv[++i];
     else if (!strcmp(argv[i], "-o") && i + 1 < argc) outp = argv[++i];
@@ -47,6 +47,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--lr-test")) lrt = 1;
     else if (!strcmp(argv[i], "--no-switchable")) sw = 0;
     else if (!strcmp(argv[i], "--fast")) fast = 1;
+    else if (!strcmp(argv[i], "--tiles") && i + 1 < argc) tiles = atoi(argv[++i]);
     else if (!strcmp(argv[i], "-v")) verbose = 1;
     else usage();
   }
@@ -76,6 +77,7 @@ int main(int argc, char **argv) {
   cfg.switchable_interp = sw;
   cfg.me_range = mer;
   cfg.fast = fast;
+  cfg.tile_cols_log2 = tiles >= 0 ? tiles : fast ? 3 : 0;
   if (fast) cfg.tx_search = cfg.tx_depth = cfg.restoration = cfg.switchable_interp = 0;
   char err[256];
   Mav1Encoder *e = mav1_create(&cfg, err, sizeof err);
