@@ -69,14 +69,15 @@ void cpu_backend_analyze(Backend *b, struct Mav1Encoder *e) {
   });
 }
 
-/* Superblock (r, c) needs its left and above-right neighbours (the
- * wavefront order of the GPU recon, tiles ignored): each finished SB
- * releases the SBs waiting on it, so no global wave barrier idles the
- * cores. */
+/* Superblock (r, c) needs its left and above-right neighbours inside its
+ * tile column (above when it is the tile's last column): intra edges never
+ * cross tile columns. Each finished SB releases the SBs waiting on it, so
+ * no global wave barrier idles the cores and the tile columns proceed in
+ * parallel. */
 static int recon_prereq(const struct Mav1Encoder *e, int r, int c, int *pre) {
-  int n = 0;
-  if (c > 0) pre[n++] = r * e->sb_cols + c - 1;
-  if (r > 0) pre[n++] = (r - 1) * e->sb_cols + k_min(c + 1, e->sb_cols - 1);
+  int ts = (c / e->tile_w_sb) * e->tile_w_sb, te = k_min(e->sb_cols, ts + e->tile_w_sb), n = 0;
+  if (c > ts) pre[n++] = r * e->sb_cols + c - 1;
+  if (r > 0) pre[n++] = (r - 1) * e->sb_cols + (c + 1 < te ? c + 1 : c);
   return n;
 }
 

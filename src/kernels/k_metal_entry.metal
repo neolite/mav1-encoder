@@ -141,7 +141,7 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
   }
   int dy = 0, dx = 0;
   for (int stage = 0; stage < m.stages; stage++) {
-    if (stage > 0) me_refine_stage(&m, dy, dx);
+    if (stage > 0) me_refine_stage(fp, &m, dy, dx);
     int best = INT_MAX, bestK = INT_MAX;
     for (int k = (int)lane; k < m.count; k += 32) {
       int cy, cx;

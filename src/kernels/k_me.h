@@ -50,6 +50,7 @@ typedef struct {
 #define T_ME_KEEP 8    /* children keep the parent's sub-pel vector when the full-pel winner is the parent's */
 #define T_ME_HPEL 16   /* sub-pel refinement on precomputed quarter-pel planes */
 #define T_ME_CR2 64    /* children search +-2 full-pel around the parent */
+#define T_ME_REF2 512  /* 64x64 full-pel refinement +-2 around the coarse winner (instead of +-3) */
 #define T_ME_DEC 32    /* 64x64 coarse grid (step 4) on 4x4-decimated planes */
 
 /* Decimated planes (T_ME_DEC): 4x4 means of the source (d = 0) and of the
@@ -125,12 +126,12 @@ INLINE MeNode me_node(DEV const FrameParams *fp, int sbIdx, int level, int i, DE
 }
 
 /* Second stage of level 0: +-3 full-pel around the coarse winner. */
-INLINE void me_refine_stage(THR MeNode *m, int wy, int wx) {
+INLINE void me_refine_stage(DEV const FrameParams *fp, THR MeNode *m, int wy, int wx) {
   m->cy = wy;
   m->cx = wx;
-  m->range = ME_REFINE;
+  m->range = (fp->turbo & T_ME_REF2) ? 2 : ME_REFINE;
   m->step = 1;
-  int side = 2 * ME_REFINE + 1;
+  int side = 2 * m->range + 1;
   m->count = 1 + side * side;
 }
 
@@ -281,7 +282,7 @@ INLINE void me_node_serial(DEV const FrameParams *fp, int sbIdx, int level, int 
     return;
   }
   for (int stage = 0; stage < m.stages; stage++) {
-    if (stage > 0) me_refine_stage(&m, by, bx);
+    if (stage > 0) me_refine_stage(fp, &m, by, bx);
     int best = -1;
     for (int k = 0; k < m.count; k++) {
       int dy, dx;

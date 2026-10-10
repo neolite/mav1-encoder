@@ -554,8 +554,12 @@ INLINE void slot_part(int slot, THR int *p, THR int *k) {
   else { *p = PARTITION_VERT_4; *k = slot - 9; }
 }
 
-/* Turbo: square partitions only (NONE / SPLIT) on inter frames. */
-INLINE int turbo_square(DEV const FrameParams *fp) { return (fp->turbo & 1) && !fp->frame_is_intra; }
+/* Turbo: square partitions only (NONE / SPLIT) on inter frames (and key
+ * frames with bit 256). */
+#define T_KEY_SQUARE 256
+INLINE int turbo_square(DEV const FrameParams *fp) {
+  return (fp->turbo & 1) && (!fp->frame_is_intra || (fp->turbo & T_KEY_SQUARE));
+}
 
 /* Partition p is searched at this node (the conditions of analyze_sb). */
 INLINE int part_allowed(DEV const FrameParams *fp, int level, int p, int hasRows, int hasCols) {

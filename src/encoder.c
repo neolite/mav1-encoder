@@ -314,8 +314,9 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   /* turbo savings (testing knob MAV1_TURBO): 1 square partitions only on
    * inter frames; motion search bits T_ME_* of k_me.h (2, 4, 8 cost
    * quality, off by default; 16 quarter-pel planes, 32 decimated coarse grid,
-   * 64 children +-2); 128 reduced intra search in inter frames */
-  fp->turbo = e->cfg.turbo ? (getenv("MAV1_TURBO") ? (int)strtol(getenv("MAV1_TURBO"), NULL, 0) : 0xF1) : 0;
+   * 64 children +-2, 512 64x64 refinement +-2); 128 reduced intra search in
+   * inter frames; 256 square partitions on key frames too */
+  fp->turbo = e->cfg.turbo ? (getenv("MAV1_TURBO") ? (int)strtol(getenv("MAV1_TURBO"), NULL, 0) : 0x3F1) : 0;
   fp->leaf = e->cfg.leaf ? (e->leafopt & 1) : e->nonref && !getenv("MAV1_LEAFINTRA");
   if (e->leafopt & 16) fp->tx_search = 0;
   fp->depth_thr = getenv("MAV1_DT") ? atoi(getenv("MAV1_DT")) : 0;
