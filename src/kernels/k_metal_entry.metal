@@ -117,6 +117,8 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
                     constant int2 &band [[buffer(9)]],
                     device const uint8_t *hpGold [[buffer(10)]],
                     device const uint8_t *ds [[buffer(11)]],
+                    device const long *costs [[buffer(12)]],
+                    constant int &prune [[buffer(13)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint lane [[thread_index_in_simdgroup]]) {
   /* groups [0, nodes): LAST, [nodes, 2 * nodes): GOLDEN */
@@ -132,8 +134,10 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
   }
   DEV const uint8_t *dr = qp_dec(fp, hp);
   int sbIdx = band.x + g / nn, i = g % nn;
-  MeNode m = me_node(fp, sbIdx, level, i, mvField);
   device int32_t *out = mvField + (sbIdx * NUM_NODES + NODE_BASE(level) + i) * 2;
+  /* depth-pruned node (analysis of the levels above done): its vector is unused */
+  if (prune && depth_pruned(fp, costs, sbIdx, level, i)) return;
+  MeNode m = me_node(fp, sbIdx, level, i, mvField);
   if (!m.valid) {
     if (lane == 0) out[0] = out[1] = 0;
     return;
@@ -1165,6 +1169,8 @@ kernel void mav1_me_tg(device const FrameParams *fp [[buffer(0)]],
                        constant int2 &band [[buffer(9)]],
                        device const uint8_t *hpGold [[buffer(10)]],
                        device const uint8_t *ds [[buffer(11)]],
+                       device const long *costs [[buffer(12)]],
+                       constant int &prune [[buffer(13)]],
                        uint tgi [[threadgroup_position_in_grid]],
                        uint tid [[thread_index_in_threadgroup]],
                        uint tpg [[threads_per_threadgroup]]) {
@@ -1180,8 +1186,10 @@ kernel void mav1_me_tg(device const FrameParams *fp [[buffer(0)]],
   }
   DEV const uint8_t *dr = qp_dec(fp, hp);
   int sbIdx = band.x + g / nn, i = g % nn;
-  MeNode m = me_node(fp, sbIdx, level, i, mvField);
   device int32_t *out = mvField + (sbIdx * NUM_NODES + NODE_BASE(level) + i) * 2;
+  /* depth-pruned node (analysis of the levels above done): its vector is unused */
+  if (prune && depth_pruned(fp, costs, sbIdx, level, i)) return;
+  MeNode m = me_node(fp, sbIdx, level, i, mvField);
   if (!m.valid) {
     if (tid == 0) out[0] = out[1] = 0;
     return;

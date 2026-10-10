@@ -600,11 +600,16 @@ INLINE int analysis_slot_ints(int level) {
  * done first, so levels run 0 -> 3. */
 INLINE int depth_pruned(DEV const FrameParams *fp, DEV const long *costs, int sbIdx, int level, int i) {
   if (!fp->fast || level == 0 || fp->depth_thr == 0) return 0;
-  int n = 1 << level;
-  int pi = ((i / n) >> 1) * (n >> 1) + ((i % n) >> 1);
-  long pc = costs[(long)sbIdx * A_ITEMS + (NODE_BASE(level - 1) + pi) * A_SLOTS];
-  int pw = 128 >> level;
-  return pc >= 0 && pc * 16 < (long)pw * pw * fp->depth_thr;
+  /* any cheap ancestor prunes the node (a pruned node has no cost) */
+  int y = i >> level, x = i & ((1 << level) - 1);
+  for (int a = level - 1; a >= 0; a--) {
+    y >>= 1;
+    x >>= 1;
+    long pc = costs[(long)sbIdx * A_ITEMS + (NODE_BASE(a) + (y << a) + x) * A_SLOTS];
+    int pw = 64 >> a;
+    if (pc >= 0 && pc * 16 < (long)pw * pw * fp->depth_thr) return 1;
+  }
+  return 0;
 }
 
 INLINE void analyze_item(DEV const FrameParams *fp, int sbIdx, int level, int i, int slot, DEV const uint8_t *src,

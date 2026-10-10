@@ -367,7 +367,13 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   fp->turbo = e->cfg.turbo ? (getenv("MAV1_TURBO") ? (int)strtol(getenv("MAV1_TURBO"), NULL, 0) : 0xBF1) : 0;
   fp->leaf = e->cfg.leaf ? (e->leafopt & 1) : e->nonref && !getenv("MAV1_LEAFINTRA");
   if (e->leafopt & 16) fp->tx_search = 0;
-  fp->depth_thr = getenv("MAV1_DT") ? atoi(getenv("MAV1_DT")) : 0;
+  /* turbo depth pruning (SVT-style): a node is not split when an ancestor's
+   * NONE cost per sample is below depth_thr / 16, the threshold growing with
+   * the quantizer (MAV1_DT: the value at qindex 128) */
+  {
+    int dt = getenv("MAV1_DT") ? atoi(getenv("MAV1_DT")) : e->sb_rows >= 16 ? 288 : 352;
+    fp->depth_thr = e->cfg.turbo ? dt * q / 128 : 0;
+  }
   fp->tile_w_sb = e->tile_w_sb;
   long acq = fp->ac_q[0];
   fp->lambda = (int32_t)(acq * acq * 256 / 430);

@@ -110,8 +110,10 @@ static void enc_qpel(Backend *b, id<MTLComputeCommandEncoder> enc, struct Mav1En
   [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
+/* prune: the analysis of the levels above is done; depth-pruned nodes are
+ * skipped (frame core) */
 static void enc_me(Backend *b, id<MTLComputeCommandEncoder> enc, struct Mav1Encoder *e, int level, int sb0,
-                   int nsb) {
+                   int nsb, int prune) {
   MetalBackend *mb = (MetalBackend *)b;
   Mav1MetalState *s = ST(b);
   long eb = qp_entry_bytes(ENC_PARAMS(e));
@@ -128,6 +130,8 @@ static void enc_me(Backend *b, id<MTLComputeCommandEncoder> enc, struct Mav1Enco
   [enc setBuffer:wrap(s, &e->hpel) offset:(NSUInteger)(ME_QP_ENTRIES * eb) atIndex:11];
   int band[2] = {sb0, nsb};
   [enc setBytes:band length:sizeof band atIndex:9];
+  [enc setBuffer:wrap(s, &e->acosts) offset:0 atIndex:12];
+  [enc setBytes:&prune length:sizeof prune atIndex:13];
   int nref = ENC_PARAMS(e)->golden ? 2 : 1;
   /* one SIMD group per node and reference */
   [enc setBytes:&level length:sizeof level atIndex:5];
@@ -186,7 +190,7 @@ static void mtl_motion_search(Backend *b, struct Mav1Encoder *e) {
   run(s, ^(id<MTLComputeCommandEncoder> enc) {
     if ((ENC_PARAMS(e)->turbo & T_ME_HPEL) && L == 0 && !one) enc_qpel(b, enc, e);
     /* levels depend on their parents: one dispatch each */
-    for (int level = one ? L : 0; level < (one ? L + 1 : 4); level++) enc_me(b, enc, e, level, 0, e->num_sbs);
+    for (int level = one ? L : 0; level < (one ? L + 1 : 4); level++) enc_me(b, enc, e, level, 0, e->num_sbs, 0);
   });
 }
 
@@ -231,6 +235,7 @@ static void mtl_frame_core(Backend *b, struct Mav1Encoder *e) {
   int rowsPer = getenv("MAV1_BAND") ? atoi(getenv("MAV1_BAND")) : e->sb_rows >= 16 ? 4 : 2; /* bigger bands from 1080p on */
   if (rowsPer < 1) rowsPer = 1;
   int nb = (e->sb_rows + rowsPer - 1) / rowsPer;
+  int pr = fp->fast && fp->depth_thr > 0;
   NSMutableArray<dispatch_semaphore_t> *done = [NSMutableArray arrayWithCapacity:(NSUInteger)nb + 1];
   for (int k = 0; k <= nb; k++) [done addObject:dispatch_semaphore_create(0)];
   @autoreleasepool {
@@ -239,12 +244,17 @@ static void mtl_frame_core(Backend *b, struct Mav1Encoder *e) {
       id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
       if (k < 0) {
         if (inter && (fp->turbo & T_ME_HPEL)) enc_qpel(b, enc, e);
-        for (int l = 0; l < 2; l++) if (inter) enc_me(b, enc, e, l, 0, e->num_sbs);
-        for (int l = 0; l < 2; l++) enc_ana(s, enc, e, l, 0, e->num_sbs);
+        /* each level's analysis before the next level's search (depth pruning) */
+        for (int l = 0; l < 2; l++) {
+          if (inter) enc_me(b, enc, e, l, 0, e->num_sbs, pr);
+          enc_ana(s, enc, e, l, 0, e->num_sbs);
+        }
       } else {
         int sb0 = k * rowsPer * e->sb_cols, nsb = k_min(e->num_sbs - sb0, rowsPer * e->sb_cols);
-        for (int l = 2; l < 4; l++) if (inter) enc_me(b, enc, e, l, sb0, nsb);
-        for (int l = 2; l < 4; l++) enc_ana(s, enc, e, l, sb0, nsb);
+        for (int l = 2; l < 4; l++) {
+          if (inter) enc_me(b, enc, e, l, sb0, nsb, pr);
+          enc_ana(s, enc, e, l, sb0, nsb);
+        }
       }
       [enc endEncoding];
       dispatch_semaphore_t d = done[k + 1];

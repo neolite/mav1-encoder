@@ -95,7 +95,8 @@ int main(int argc, char **argv) {
   cfg.leaf = leaf;
   cfg.nonref_odd = getenv("MAV1_NREF") ? 1 : 0;
   cfg.intra_edge_filter = edge;
-  cfg.tile_cols_log2 = tiles >= 0 ? tiles : fast ? 3 : 0;
+  /* turbo: 2 tile columns (BD -2..-3% vs 8 at the same speed) */
+  cfg.tile_cols_log2 = tiles >= 0 ? tiles : turbo ? 1 : fast ? 3 : 0;
   if (fast) cfg.tx_search = cfg.tx_depth = cfg.restoration = cfg.switchable_interp = 0;
   char err[256];
   Mav1Encoder *e = mav1_create(&cfg, err, sizeof err);
