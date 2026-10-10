@@ -203,8 +203,8 @@ INLINE void analyze_sb(DEV const FrameParams *fp, int sbIdx, DEV const uint8_t *
         mode[node] = 0;
         continue;
       }
-      int half = size4 >> 1;
-      int hasRows = (r + half) < fp->mi_rows, hasCols = (c + half) < fp->mi_cols;
+      int halfSz = size4 >> 1;
+      int hasRows = (r + halfSz) < fp->mi_rows, hasCols = (c + halfSz) < fp->mi_cols;
       long splitCost = -1;
       if (level < 3) {
         int cn = n * 2;
