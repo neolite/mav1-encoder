@@ -82,6 +82,7 @@ typedef struct {
 #define T_ME_L3SUB 4096 /* 8x8 nodes: no full-pel search, sub-pel steps around the parent's vector */
 #define T_ME_REF2 512  /* 64x64 full-pel refinement +-2 around the coarse winner (instead of +-3) */
 #define T_ME_DEC 32    /* 64x64 coarse grid (step 4) on 4x4-decimated planes */
+#define T_ME_CROSS 8192 /* sub-pel steps try the 4 axial neighbours only */
 
 /* Plane buffer of the turbo motion search: ME_QP_ENTRIES entries, each the
  * 16 quarter-pel planes of one reference followed by its 4x4-decimated
@@ -216,6 +217,12 @@ INLINE void me_neighbour(int k, int step, THR int *dr, THR int *dc) {
   *dc = (k == 0 || k == 3 || k == 5) ? -step : ((k == 1 || k == 6) ? 0 : step);
 }
 
+/* Sub-pel neighbour j (0 .. me_nb_count - 1) of the turbo set. */
+INLINE int me_nb_count(DEV const FrameParams *fp) { return (fp->turbo & T_ME_CROSS) ? 4 : 8; }
+INLINE void me_nb(DEV const FrameParams *fp, int j, int step, THR int *dr, THR int *dc) {
+  me_neighbour((fp->turbo & T_ME_CROSS) ? (j == 0 ? 1 : j == 1 ? 3 : j == 2 ? 4 : 6) : j, step, dr, dc);
+}
+
 INLINE int me_unit_satd_hp(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
                            DEV const uint8_t *hp, THR const MeNode *m, int mvr, int mvc, int u);
 INLINE int me_subpel_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
@@ -239,9 +246,9 @@ INLINE void me_finish(DEV const FrameParams *fp, DEV const uint8_t *src, DEV con
   int bestS = me_subpel_cost(fp, src, ref, hp, m, mvr, mvc, scratch);
   for (int step = 4; step >= 2; step >>= 1) {
     int cr = mvr, cc = mvc;
-    for (int k = 0; k < 8; k++) {
+    for (int k = 0; k < me_nb_count(fp); k++) {
       int dr, dc;
-      me_neighbour(k, step, &dr, &dc);
+      me_nb(fp, k, step, &dr, &dc);
       int c = me_subpel_cost(fp, src, ref, hp, m, cr + dr, cc + dc, scratch);
       if (c < bestS) {
         bestS = c;

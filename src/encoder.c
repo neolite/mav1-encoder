@@ -1,5 +1,6 @@
 /* Frame-level driver: buffer management, stage sequencing and bitstream
  * assembly. */
+#include <sys/mman.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,16 +29,16 @@ static double now(void) {
 static int buf_alloc(Buf *b, size_t size) {
   size = (size + PAGE - 1) / PAGE * PAGE;
   if (size == 0) size = PAGE;
-  void *p = NULL;
-  if (posix_memalign(&p, PAGE, size)) return -1;
-  memset(p, 0, size);
+  /* zero-filled pages, faulted in on first use */
+  void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (p == MAP_FAILED) return -1;
   b->base = p;
   b->size = size;
   return 0;
 }
 
 static void buf_free(Buf *b) {
-  free(b->base);
+  if (b->base) munmap(b->base, b->size);
   b->base = NULL;
 }
 

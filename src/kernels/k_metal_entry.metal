@@ -173,15 +173,15 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
     int sums[ME_LANES];
     for (int k = 0; k < ME_LANES; k++) sums[k] = 0;
     int first = step == 4 ? 0 : 1; /* the quarter step reuses the centre cost */
-    for (int w = (int)lane; w < (ME_LANES - first) * nUnits; w += 32) {
+    for (int w = (int)lane; w < (1 + me_nb_count(fp) - first) * nUnits; w += 32) {
       int k = first + w / nUnits, u = w % nUnits;
       int dr = 0, dc = 0;
-      if (k > 0) me_neighbour(k - 1, step, &dr, &dc);
+      if (k > 0) me_nb(fp, k - 1, step, &dr, &dc);
       sums[k] += (fp->turbo & T_ME_HPEL) ? me_unit_satd_hp(fp, src, ref, hp, &m, mvr + dr, mvc + dc, u)
                                          : me_unit_satd(fp, src, ref, &m, mvr + dr, mvc + dc, u);
     }
     int bc = INT_MAX, bk = 0;
-    for (int k = 0; k < ME_LANES; k++) {
+    for (int k = 0; k < 1 + me_nb_count(fp); k++) {
       int c = (k == 0 && step == 2) ? bestS : simd_sum(sums[k]);
       if (k >= first || step == 2) {
         if (c < bc) { bc = c; bk = k; }
@@ -190,7 +190,7 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
     bestS = bc;
     if (bk > 0) {
       int dr, dc;
-      me_neighbour(bk - 1, step, &dr, &dc);
+      me_nb(fp, bk - 1, step, &dr, &dc);
       mvr += dr;
       mvc += dc;
     }
@@ -1251,13 +1251,13 @@ kernel void mav1_me_tg(device const FrameParams *fp [[buffer(0)]],
   int nUnits = (m.w >> 2) * (m.w >> 2);
   for (int step = 4; step >= 2; step >>= 1) {
     int bc = INT_MAX, bk = 0;
-    for (int k = 0; k < ME_LANES; k++) {
+    for (int k = 0; k < 1 + me_nb_count(fp); k++) {
       int c;
       if (k == 0 && step == 2) {
         c = bestS;
       } else {
         int r0 = 0, c0 = 0;
-        if (k > 0) me_neighbour(k - 1, step, &r0, &c0);
+        if (k > 0) me_nb(fp, k - 1, step, &r0, &c0);
         int s = 0;
         for (int u = (int)tid; u < nUnits; u += (int)tpg)
           s += (fp->turbo & T_ME_HPEL) ? me_unit_satd_hp(fp, src, ref, hp, &m, mvr + r0, mvc + c0, u)
@@ -1269,7 +1269,7 @@ kernel void mav1_me_tg(device const FrameParams *fp [[buffer(0)]],
     bestS = bc;
     if (bk > 0) {
       int r0, c0;
-      me_neighbour(bk - 1, step, &r0, &c0);
+      me_nb(fp, bk - 1, step, &r0, &c0);
       mvr += r0;
       mvc += c0;
     }
