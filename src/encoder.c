@@ -66,6 +66,11 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
   if (e->cfg.altref == 1) e->cfg.altref = 0;
   if (e->cfg.altref > 16) e->cfg.altref = 16;
   if (e->cfg.altref) e->cfg.multi_ref = e->cfg.nonref_odd = 0; /* the second reference is ALTREF */
+  if (!e->cfg.altref) e->cfg.leaf = 0;
+  /* savings on leaf frames (testing knob MAV1_LEAFOPT, default all): 1 inter
+   * only, 2 no deblocking, 4 no CDEF, 8 no LR, 16 no tx type search, 32 ME
+   * range 16 */
+  e->leafopt_cfg = getenv("MAV1_LEAFOPT") ? (int)strtol(getenv("MAV1_LEAFOPT"), NULL, 0) : 0x3F;
   if (e->cfg.qindex < 0) e->cfg.qindex = 0;
   if (e->cfg.qindex > 255) e->cfg.qindex = 255;
   e->w = cfg->width;
@@ -109,6 +114,8 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
     ok |= buf_alloc(&e->slot[0], e->frame_bytes);
     ok |= buf_alloc(&e->slot[2], e->frame_bytes);
     ok |= buf_alloc(&e->slot[3], e->frame_bytes);
+    if (e->cfg.leaf)
+      for (int i = 4; i < 8; i++) ok |= buf_alloc(&e->slot[i], e->frame_bytes);
     e->inq = calloc((size_t)e->cfg.altref + 1, sizeof *e->inq);
   }
   ok |= buf_alloc(&e->params, sizeof(FrameParams));
@@ -284,12 +291,13 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   fp->golden = !isKey && e->cfg.multi_ref && e->gold_id != e->last_id;
   fp->ref2_frame = GOLDEN_FRAME;
   if (e->cfg.altref) { /* frames inside a mini-GOP: ALTREF */
-    fp->golden = !isKey && e->frame_kind == 2;
+    fp->golden = !isKey && e->frame_kind >= 2;
     fp->ref2_frame = ALTREF_FRAME;
     fp->compound = e->hdr.reference_select; /* LAST + ALTREF */
   }
   fp->fast = e->cfg.fast;
-  fp->leaf = e->nonref && !getenv("MAV1_LEAFINTRA");
+  fp->leaf = e->cfg.leaf ? (e->leafopt & 1) : e->nonref && !getenv("MAV1_LEAFINTRA");
+  if (e->leafopt & 16) fp->tx_search = 0;
   fp->depth_thr = getenv("MAV1_DT") ? atoi(getenv("MAV1_DT")) : 0;
   fp->tile_w_sb = e->tile_w_sb;
   long acq = fp->ac_q[0];
@@ -297,11 +305,12 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   fp->frame_w = e->w;
   fp->frame_h = e->h;
   fp->me_range = e->cfg.me_range;
+  if ((e->leafopt & 32) && fp->me_range > 16) fp->me_range = 16;
 
   /* Loop filter level from q (libaom's LPF_PICK_FROM_Q rule for 8-bit). */
   FrameHdr *h = &e->hdr;
   int lvl = 0;
-  if (e->cfg.loop_filter && q > 0 && !(e->nonref && !getenv("MAV1_LEAFLF"))) {
+  if (e->cfg.loop_filter && q > 0 && !(e->cfg.leaf ? (e->leafopt & 2) : e->nonref && !getenv("MAV1_LEAFLF"))) {
     lvl = (int)((acq * 20723 + 1015158 + (1 << 17)) >> 18);
     if (!isKey) lvl -= 4;
     lvl = lvl < 0 ? 0 : (lvl > MAX_LOOP_FILTER ? MAX_LOOP_FILTER : lvl);
@@ -312,6 +321,10 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   static const int presets[4][4] = {{0, 0, 0, 0}, {2, 1, 1, 0}, {4, 2, 2, 1}, {8, 4, 4, 2}};
   h->cdef_damping = fp->cdef_damping = 3 + (q >> 6);
   h->cdef_bits = fp->cdef_bits = 2;
+  if (e->leafopt & 4) { /* CDEF off for this frame: one all-zero strength */
+    h->cdef_damping = fp->cdef_damping = 3;
+    h->cdef_bits = fp->cdef_bits = 0;
+  }
   for (int i = 0; i < 4; i++) {
     h->cdef_y_pri[i] = fp->cdef_y_pri[i] = presets[i][0];
     h->cdef_y_sec[i] = fp->cdef_y_sec[i] = presets[i][1];
@@ -410,6 +423,8 @@ static int frame_qindex(const Mav1Encoder *e, int isKey) {
   int off = isKey ? env_or("MAV1_QK", -24) : (e->order_hint % 4 == 0 ? env_or("MAV1_Q4", -8) : env_or("MAV1_QP", 4));
   if (!isKey && e->nonref) off = env_or("MAV1_QN", 12);
   if (!isKey && e->cfg.altref) off = e->frame_kind == 1 ? env_or("MAV1_QA", -8) : env_or("MAV1_QP", 4);
+  if (!isKey && e->cfg.leaf && e->frame_kind == 3) off = env_or("MAV1_QM", 0); /* pyramid middle frame */
+  if (!isKey && e->cfg.leaf && e->nonref) off = env_or("MAV1_QL", 8);
   q += off;
   return q < 1 ? 1 : q > 255 ? 255 : q;
 }
@@ -428,10 +443,16 @@ static size_t run_frame(Mav1Encoder *e, int isKey, uint8_t **tile) {
   e->be->recon(e->be, e);
   double t2 = now();
   build_filter_info(e);
+  int cdefOff = (e->leafopt & 4) != 0, nPresets = e->num_cdef_presets;
+  if (cdefOff) { /* the filter stage skips CDEF; every superblock codes index 0 */
+    e->num_cdef_presets = 0;
+    memset(e->cdef_choice, 0, (size_t)e->num_sbs);
+  }
   e->be->filter(e->be, e);
-  int useLr = e->cfg.restoration && e->cfg.qindex > 0; /* AllLossless disables it */
+  e->num_cdef_presets = nPresets;
+  int useLr = e->cfg.restoration && e->cfg.qindex > 0 && !(e->leafopt & 8); /* AllLossless disables it */
   if (useLr) memcpy(e->dbk.base, e->rec.base, e->frame_bytes); /* UpscaledCurrFrame */
-  if (e->cfg.cdef && e->cfg.qindex > 0) cdef_select(e);
+  if (e->cfg.cdef && e->cfg.qindex > 0 && !cdefOff) cdef_select(e);
   if (useLr) {
     lr_select(e);
     memcpy(e->lrout.base, e->rec.base, e->frame_bytes);
@@ -573,13 +594,14 @@ static int rel_dist(int a, int b) {
  * Appends the frame OBU (and, for key frames, the TD and sequence header)
  * to *buf. */
 static void alt_code(Mav1Encoder *e, const uint8_t *frame, int disp, int isKey, int kind, int lastSlot, int arfSlot,
-                     int refresh, uint8_t **buf, size_t *pos, size_t *cap) {
+                     int refresh, int hidden, uint8_t **buf, size_t *pos, size_t *cap) {
   int cw = (e->w + 1) >> 1, ch = (e->h + 1) >> 1;
   const uint8_t *pl[3] = {frame, frame + (size_t)e->w * e->h, frame + (size_t)e->w * e->h + (size_t)cw * ch};
   int st[3] = {e->w, cw, cw};
   load_source(e, pl, st);
   if (isKey) e->key_disp = disp;
-  e->nonref = 0;
+  e->nonref = e->cfg.leaf && !isKey && refresh == 0;
+  e->leafopt = e->nonref ? e->leafopt_cfg : 0;
   e->frame_kind = isKey ? 0 : kind;
   e->order_hint = disp - e->key_disp;
   FrameHdr *h = &e->hdr;
@@ -587,8 +609,8 @@ static void alt_code(Mav1Encoder *e, const uint8_t *frame, int disp, int isKey, 
   h->frame_type = isKey ? KEY_FRAME : INTER_FRAME;
   h->base_q_idx = frame_qindex(e, isKey);
   h->order_hint = e->order_hint;
-  h->show_frame = kind != 1;
-  h->showable_frame = kind == 1;
+  h->show_frame = !hidden;
+  h->showable_frame = hidden;
   h->refresh_frame_flags = isKey ? 0xFF : refresh;
   memset(e->sign_bias, 0, sizeof e->sign_bias);
   if (!isKey) {
@@ -599,7 +621,7 @@ static void alt_code(Mav1Encoder *e, const uint8_t *frame, int disp, int isKey, 
     /* compound LAST + ALTREF (BIDIR, COMPOUND_AVERAGE) inside the mini-GOP;
      * skip_mode_params( ): LAST is a forward and ALTREF a backward
      * reference, so skip_mode_present is coded */
-    h->reference_select = kind == 2 && arfSlot >= 0 && !getenv("MAV1_NOCOMP");
+    h->reference_select = kind >= 2 && arfSlot >= 0 && !getenv("MAV1_NOCOMP");
     h->skip_mode_allowed = h->reference_select;
     memcpy(e->ref.base, e->slot[lastSlot].base, e->frame_bytes);
     if (arfSlot >= 0) memcpy(e->gold.base, e->slot[arfSlot].base, e->frame_bytes);
@@ -648,6 +670,58 @@ static void stats_add(Mav1FrameStats *a, const Mav1FrameStats *b) {
   a->t_entropy += b->t_entropy;
 }
 
+/* Pyramid mini-GOP (cfg.leaf): the temporal unit being assembled. Hidden
+ * frames are appended to it; a shown frame (or show_existing_frame header)
+ * completes it. Statistics of hidden frames go with the next shown frame. */
+typedef struct { uint8_t *buf; size_t pos, cap; Mav1FrameStats st; } PyrTu;
+
+static void pyr_open(PyrTu *t) {
+  if (t->buf) return;
+  t->cap = 1024;
+  t->buf = malloc(t->cap);
+  t->pos = write_temporal_delimiter(t->buf);
+}
+
+static void pyr_close(Mav1Encoder *e, PyrTu *t, uint8_t *recon) {
+  t->st.frame_type = 1;
+  alt_push(e, t->buf, t->pos, recon, &t->st);
+  memset(t, 0, sizeof *t);
+}
+
+static void pyr_show_existing(Mav1Encoder *e, PyrTu *t, int slot, uint8_t *recon) {
+  pyr_open(t);
+  if (t->pos + 64 > t->cap) t->buf = realloc(t->buf, t->cap = t->pos + 64);
+  t->pos += write_show_existing(slot, t->buf + t->pos);
+  pyr_close(e, t, recon);
+}
+
+/* Codes the display frames strictly between a (slot as) and b (slot bs),
+ * both already coded. With 3 or more frames the middle one is coded first
+ * as a hidden reference (slot 4 + depth, predicting from a and b), then each
+ * half recursively; otherwise the frames are non-reference leaf frames. */
+static void pyr_code(Mav1Encoder *e, PyrTu *t, int a, int as, int b, int bs, int depth) {
+  int d0 = e->in_disp - e->inq_n;
+  if (b - a - 1 >= 3 && depth < 4) {
+    int m = (a + b) / 2, ms = 4 + depth;
+    memset(&e->last, 0, sizeof e->last);
+    pyr_open(t);
+    alt_code(e, e->inq[m - d0], m, 0, 3, as, bs, 1 << ms, 1, &t->buf, &t->pos, &t->cap);
+    uint8_t *rec = pack_frame(e, e->rec.base);
+    stats_add(&t->st, &e->last);
+    pyr_code(e, t, a, as, m, ms, depth + 1);
+    pyr_show_existing(e, t, ms, rec);
+    pyr_code(e, t, m, ms, b, bs, depth + 1);
+    return;
+  }
+  for (int d = a + 1; d < b; d++) {
+    memset(&e->last, 0, sizeof e->last);
+    pyr_open(t);
+    alt_code(e, e->inq[d - d0], d, 0, 2, as, bs, 0, 0, &t->buf, &t->pos, &t->cap);
+    stats_add(&t->st, &e->last);
+    pyr_close(e, t, pack_frame(e, e->rec.base));
+  }
+}
+
 /* Codes the queued frames that can be coded (all of them when flushing). */
 static void alt_drain(Mav1Encoder *e, int flush) {
   int N = e->cfg.altref;
@@ -671,9 +745,21 @@ static void alt_drain(Mav1Encoder *e, int flush) {
       }
       memset(&e->last, 0, sizeof e->last);
       e->last.frame_type = !isKey;
-      alt_code(e, e->inq[0], d0, isKey, 0, e->anchor_slot, -1, 0x01, &buf, &pos, &cap);
+      alt_code(e, e->inq[0], d0, isKey, 0, e->anchor_slot, -1, 0x01, 0, &buf, &pos, &cap);
       e->anchor_slot = 0;
       alt_push(e, buf, pos, pack_frame(e, e->rec.base), &e->last);
+    } else if (e->cfg.leaf) {
+      int arfSlot = e->anchor_slot == 2 ? 3 : 2;
+      PyrTu tu = {0};
+      memset(&e->last, 0, sizeof e->last);
+      e->last.frame_type = 1;
+      pyr_open(&tu);
+      alt_code(e, e->inq[L - 1], d0 + L - 1, 0, 1, e->anchor_slot, -1, 1 << arfSlot, 1, &tu.buf, &tu.pos, &tu.cap);
+      uint8_t *arfRecon = pack_frame(e, e->rec.base);
+      stats_add(&tu.st, &e->last);
+      pyr_code(e, &tu, d0 - 1, e->anchor_slot, d0 + L - 1, arfSlot, 0);
+      pyr_show_existing(e, &tu, arfSlot, arfRecon);
+      e->anchor_slot = arfSlot;
     } else {
       int arfSlot = e->anchor_slot == 2 ? 3 : 2;
       Mav1FrameStats arfSt;
@@ -681,7 +767,7 @@ static void alt_drain(Mav1Encoder *e, int flush) {
       size_t pos = write_temporal_delimiter(buf), cap = 1024;
       memset(&e->last, 0, sizeof e->last);
       e->last.frame_type = 1;
-      alt_code(e, e->inq[L - 1], d0 + L - 1, 0, 1, e->anchor_slot, -1, 1 << arfSlot, &buf, &pos, &cap);
+      alt_code(e, e->inq[L - 1], d0 + L - 1, 0, 1, e->anchor_slot, -1, 1 << arfSlot, 1, &buf, &pos, &cap);
       uint8_t *arfRecon = pack_frame(e, e->rec.base);
       arfSt = e->last;
       for (int i = 0; i < L - 1; i++) {
@@ -692,7 +778,7 @@ static void alt_drain(Mav1Encoder *e, int flush) {
         }
         memset(&e->last, 0, sizeof e->last);
         e->last.frame_type = 1;
-        alt_code(e, e->inq[i], d0 + i, 0, 2, i == 0 ? e->anchor_slot : 0, arfSlot, 0x01, &buf, &pos, &cap);
+        alt_code(e, e->inq[i], d0 + i, 0, 2, i == 0 ? e->anchor_slot : 0, arfSlot, 0x01, 0, &buf, &pos, &cap);
         if (i == 0) stats_add(&e->last, &arfSt);
         alt_push(e, buf, pos, pack_frame(e, e->rec.base), &e->last);
       }

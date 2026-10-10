@@ -33,6 +33,7 @@ typedef struct {
   int fast;              /* reduced mode/partition search */
   int multi_ref;         /* GOLDEN reference (slot 1, refreshed every 4th frame) besides LAST */
   int altref;            /* ALTREF mini-GOP length (0: off): hidden future frame, shown by show_existing_frame */
+  int leaf;              /* with altref: pyramid mini-GOPs, non-reference leaf frames coded cheaply */
   int switchable_interp; /* per-block dual interpolation filter choice */
   int lr_test;         /* testing: force Wiener / self-guided on alternate units, ignoring rate */
   int me_range;        /* full-pel motion search range */

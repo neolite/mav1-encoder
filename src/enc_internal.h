@@ -69,6 +69,7 @@ struct Mav1Encoder {
   FrameHdr hdr;
   int frame_num;
   int nonref; /* current frame is not kept as a reference */
+  int leafopt, leafopt_cfg; /* leaf-frame savings of the current frame / of leaf frames (cfg.leaf) */
   int order_hint;
   int have_ref;
   int last_id, gold_id; /* frame_num of the frames held in the LAST / GOLDEN slots */

@@ -11,7 +11,7 @@ static void usage(void) {
   fprintf(stderr,
           "usage: mav1enc -i in.y4m -o out.ivf [-r recon.y4m] [-q qindex] [-n frames]\n"
           "               [--cpu|--metal] [--keyint N] [--no-lf] [--no-cdef] [--no-txsearch] [--no-txdepth] [--no-lr] [--lr-test] [--no-switchable] [--fast] [--golden] [--altref N] [--no-edge] [--tiles LOG2]\n"
-          "               [--me-range N] [-v]\n");
+          "               [--me-range N] [--leaf] [-v]\n");
   exit(2);
 }
 
@@ -28,7 +28,7 @@ static double psnr(const uint8_t *a, const uint8_t *b, size_t n) {
 
 int main(int argc, char **argv) {
   const char *in = NULL, *outp = NULL, *recp = NULL;
-  int q = 100, nframes = 1 << 30, metal = 1, keyint = 0, lf = 1, cdef = 1, txs = 1, txd = 1, lr = 1, lrt = 0, sw = 1, fast = 0, gold = 0, altref = 0, edge = 1, tiles = -1, verbose = 0, mer = 32;
+  int leaf = 0, q = 100, nframes = 1 << 30, metal = 1, keyint = 0, lf = 1, cdef = 1, txs = 1, txd = 1, lr = 1, lrt = 0, sw = 1, fast = 0, gold = 0, altref = 0, edge = 1, tiles = -1, verbose = 0, mer = 32;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "-i") && i + 1 < argc) in = argv[++i];
     else if (!strcmp(argv[i], "-o") && i + 1 < argc) outp = argv[++i];
@@ -49,6 +49,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--fast")) fast = 1;
     else if (!strcmp(argv[i], "--golden")) gold = 1;
     else if (!strcmp(argv[i], "--altref") && i + 1 < argc) altref = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--leaf")) leaf = 1;
     else if (!strcmp(argv[i], "--no-edge")) edge = 0;
     else if (!strcmp(argv[i], "--tiles") && i + 1 < argc) tiles = atoi(argv[++i]);
     else if (!strcmp(argv[i], "-v")) verbose = 1;
@@ -82,6 +83,7 @@ int main(int argc, char **argv) {
   cfg.fast = fast;
   cfg.multi_ref = gold;
   cfg.altref = altref;
+  cfg.leaf = leaf;
   cfg.nonref_odd = getenv("MAV1_NREF") ? 1 : 0;
   cfg.intra_edge_filter = edge;
   cfg.tile_cols_log2 = tiles >= 0 ? tiles : fast ? 3 : 0;
