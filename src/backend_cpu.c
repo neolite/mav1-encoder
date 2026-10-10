@@ -31,7 +31,7 @@ static void cpu_motion_search(Backend *b, struct Mav1Encoder *e) {
   }
 }
 
-static void cpu_analyze(Backend *b, struct Mav1Encoder *e) {
+void cpu_backend_analyze(Backend *b, struct Mav1Encoder *e) {
   (void)b;
   const FrameParams *fp = ENC_PARAMS(e);
   dispatch_apply((size_t)e->num_sbs, DISPATCH_APPLY_AUTO, ^(size_t i) {
@@ -99,7 +99,7 @@ Backend *backend_cpu_create(struct Mav1Encoder *e) {
   CpuBackend *c = calloc(1, sizeof(*c));
   c->base.name = "cpu";
   c->base.motion_search = cpu_motion_search;
-  c->base.analyze = cpu_analyze;
+  c->base.analyze = cpu_backend_analyze;
   c->base.recon = cpu_backend_recon;
   c->base.filter = cpu_filter;
   c->base.restore = cpu_restore;

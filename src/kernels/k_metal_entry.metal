@@ -60,23 +60,50 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
     if (lane == 0) out[0] = out[1] = 0;
     return;
   }
-  int best = INT_MAX, bestK = INT_MAX;
-  for (int k = (int)lane; k < m.count; k += 32) {
-    int dy, dx;
-    me_candidate(&m, k, &dy, &dx);
-    int c = me_cost(fp, src, ref, &m, dy, dx);
-    if (c < best) {
-      best = c;
-      bestK = k;
+  int dy = 0, dx = 0;
+  for (int stage = 0; stage < m.stages; stage++) {
+    if (stage > 0) me_refine_stage(&m, dy, dx);
+    int best = INT_MAX, bestK = INT_MAX;
+    for (int k = (int)lane; k < m.count; k += 32) {
+      int cy, cx;
+      me_candidate(&m, k, &cy, &cx);
+      int c = me_cost(fp, src, ref, &m, cy, cx);
+      if (c < best) {
+        best = c;
+        bestK = k;
+      }
+    }
+    /* lexicographic (cost, k) minimum = the serial first minimum */
+    int gmin = simd_min(best);
+    int kmin = simd_min(best == gmin ? bestK : INT_MAX);
+    me_candidate(&m, kmin, &dy, &dx);
+  }
+  /* sub-pel: lane 0 holds the centre, lanes 1..8 the neighbours; the
+   * (cost, index) minimum equals the serial first minimum of me_finish */
+  device int32_t *ls = scratch + (long)sbIdx * ME_SB_INTS + ((long)i * ME_LANES + lane) * me_slot(level);
+  int mvr = dy * 8, mvc = dx * 8, bestS = 0;
+  for (int step = 4; step >= 2; step >>= 1) {
+    int c = INT_MAX;
+    if (lane == 0) {
+      c = step == 4 ? me_subpel_cost(fp, src, ref, &m, mvr, mvc, ls) : bestS;
+    } else if (lane < ME_LANES) {
+      int dr, dc;
+      me_neighbour((int)lane - 1, step, &dr, &dc);
+      c = me_subpel_cost(fp, src, ref, &m, mvr + dr, mvc + dc, ls);
+    }
+    int gmin = simd_min(c);
+    int kmin = simd_min(c == gmin ? (int)lane : INT_MAX);
+    bestS = gmin;
+    if (kmin > 0) {
+      int dr, dc;
+      me_neighbour(kmin - 1, step, &dr, &dc);
+      mvr += dr;
+      mvc += dc;
     }
   }
-  /* lexicographic (cost, k) minimum = the serial first minimum */
-  int gmin = simd_min(best);
-  int kmin = simd_min(best == gmin ? bestK : INT_MAX);
   if (lane == 0) {
-    int dy, dx;
-    me_candidate(&m, kmin, &dy, &dx);
-    me_finish(fp, src, ref, &m, dy, dx, out, scratch + (long)sbIdx * SCRATCH_INTS + me_node_scratch(level, i));
+    out[0] = mvr;
+    out[1] = mvc;
   }
 }
 

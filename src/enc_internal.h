@@ -52,7 +52,7 @@ struct Mav1Encoder {
   size_t frame_bytes;
 
   /* Shared (CPU/GPU) buffers. */
-  Buf src, rec, ref, params, blocks, sbs, coefs, mats, mvfield, scratch, lfmask, cdefbuf;
+  Buf src, rec, ref, params, blocks, sbs, coefs, mats, mvfield, scratch, lfmask, cdefbuf, mescratch;
   Buf dbk, lrout, lrunits;  /* deblocked copy, LR output, LrUnit per unit */
 
   MiInfo *mi;               /* mi_rows * mi_cols */

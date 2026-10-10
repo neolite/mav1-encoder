@@ -11,6 +11,7 @@
 #include "kernels/k_lr.h"
 #include "fwd_matrices.h"
 #include "kernels/k_analysis.h"
+#include "kernels/k_me.h"
 #include "kernels/k_fwd.h"
 #include "kernels/k_recon.h"
 
@@ -89,6 +90,7 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
   ok |= buf_alloc(&e->coefs, sizeof(int32_t) * COEFS_PER_SB * e->num_sbs);
   ok |= buf_alloc(&e->mats, sizeof(int32_t) * FWD_SLOT_SIZE * FWD_NUM_SLOTS);
   ok |= buf_alloc(&e->mvfield, sizeof(int32_t) * 2 * NUM_NODES * e->num_sbs);
+  ok |= buf_alloc(&e->mescratch, sizeof(int32_t) * ME_SB_INTS * (size_t)e->num_sbs);
   ok |= buf_alloc(&e->scratch, sizeof(int32_t) * SCRATCH_INTS * (size_t)e->num_sbs);
   ok |= buf_alloc(&e->lfmask, (size_t)e->mi_rows * e->mi_cols);
   ok |= buf_alloc(&e->dbk, e->frame_bytes);
@@ -131,6 +133,7 @@ void mav1_destroy(Mav1Encoder *e) {
   buf_free(&e->mats);
   buf_free(&e->mvfield);
   buf_free(&e->scratch);
+  buf_free(&e->mescratch);
   free(e->mi);
   free(e->cdef_idx);
   free(e->cdef_choice);

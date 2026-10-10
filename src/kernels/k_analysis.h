@@ -60,18 +60,23 @@ INLINE int satd4x4(THR const int32_t *d) {
   return s;
 }
 
-/* SATD between a source block and a prediction stored with stride 64. */
-INLINE int block_satd(DEV const uint8_t *src, int stride, DEV const uint8_t *pred, int w, int h) {
+/* SATD between a source block and a prediction stored with stride predStride. */
+INLINE int block_satd_s(DEV const uint8_t *src, int stride, DEV const uint8_t *pred, int predStride, int w, int h) {
   int total = 0;
   int32_t d[16];
   for (int by = 0; by < h; by += 4)
     for (int bx = 0; bx < w; bx += 4) {
       for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++)
-          d[i * 4 + j] = (int)src[(by + i) * stride + bx + j] - (int)pred[(by + i) * 64 + bx + j];
+          d[i * 4 + j] = (int)src[(by + i) * stride + bx + j] - (int)pred[(by + i) * predStride + bx + j];
       total += satd4x4(d);
     }
   return total;
+}
+
+/* SATD against a prediction stored with stride 64. */
+INLINE int block_satd(DEV const uint8_t *src, int stride, DEV const uint8_t *pred, int w, int h) {
+  return block_satd_s(src, stride, pred, 64, w, h);
 }
 
 INLINE int intra_satd(DEV const FrameParams *fp, DEV const uint8_t *plane, int stride, int planeIdx,

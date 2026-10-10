@@ -59,7 +59,7 @@ static void mtl_motion_search(Backend *b, struct Mav1Encoder *e) {
     [enc setBuffer:wrap(s, &e->src) offset:0 atIndex:1];
     [enc setBuffer:wrap(s, &e->ref) offset:0 atIndex:2];
     [enc setBuffer:wrap(s, &e->mvfield) offset:0 atIndex:3];
-    [enc setBuffer:wrap(s, &e->scratch) offset:0 atIndex:4];
+    [enc setBuffer:wrap(s, &e->mescratch) offset:0 atIndex:4];
     /* levels depend on their parents: one dispatch each, one SIMD group per node */
     for (int level = 0; level < 4; level++) {
       [enc setBytes:&level length:sizeof level atIndex:5];
@@ -199,7 +199,7 @@ Backend *backend_metal_create(struct Mav1Encoder *e, char *err, size_t errlen) {
     MetalBackend *m = calloc(1, sizeof(*m));
     m->base.name = "metal";
     m->base.motion_search = mtl_motion_search;
-    m->base.analyze = mtl_analyze;
+    m->base.analyze = getenv("MAV1_GPU_ANALYZE") ? mtl_analyze : cpu_backend_analyze; /* GPU version: one thread per SB, slower until candidate-parallel */
     /* Hybrid: GPU for the massively parallel stages (motion search,
    * analysis, filters), CPU for the wavefront reconstruction. MAV1_GPU_RECON=1
    * keeps the GPU wavefront (for the backend comparison tests). */
