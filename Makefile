@@ -1,7 +1,7 @@
 # mav1 build. `make` builds the library, CLI and tests; `make asan` builds a
 # CPU-only sanitizer variant of the CLI.
 CC      ?= clang
-CFLAGS  ?= -O2 -g
+CFLAGS  ?= -O3 -mcpu=apple-m1 -g
 CFLAGS  += -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Isrc -std=gnu11
 BUILD   := build
 

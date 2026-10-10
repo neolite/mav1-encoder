@@ -115,23 +115,6 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
   int x = miCol * 4, y = miRow * 4;
   int lam = fp->ac_q[0] / 16; /* SATD-domain lambda (tuned on crowd_run) */
 
-  /* luma intra */
-  long best = -1;
-  int bestMode = DC_PRED, bestDelta = 0;
-  for (int mode = DC_PRED; mode <= PAETH_PRED; mode++) {
-    long c = intra_satd(fp, src + fp->offset[0], fp->stride[0], 0, x, y, lw, lh, mode, 0, pred) +
-             (long)lam * mode_bits8(mode) / 8;
-    if (best < 0 || c < best) { best = c; bestMode = mode; }
-  }
-  if (intra_is_directional(bestMode) && !fp->fast) {
-    int base = bestMode;
-    for (int d = -MAX_ANGLE_DELTA; d <= MAX_ANGLE_DELTA; d++) {
-      if (d == 0) continue;
-      long c = intra_satd(fp, src + fp->offset[0], fp->stride[0], 0, x, y, lw, lh, base, d, pred) +
-               (long)lam * (mode_bits8(base) + 16) / 8;
-      if (c < best) { best = c; bestDelta = d; }
-    }
-  }
   int cx = x >> 1, cy = y >> 1, clw = lw - 1, clh = lh - 1;
   long interCost = -1;
   int mvr = 0, mvc = 0;
@@ -150,6 +133,27 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
       interCost += block_satd(src + fp->offset[p] + cy * fp->stride[p] + cx, fp->stride[p], pred, w >> 1, h >> 1);
     }
     interCost += (long)lam * (4 + mv_bits8(mvr, mvc)) / 8;
+  }
+  /* luma intra */
+  long best = -1;
+  int bestMode = DC_PRED, bestDelta = 0;
+  /* fast preset, inter frames: when inter prediction is already good
+   * (SATD per pixel below a lambda-scaled bound) intra is not evaluated */
+  int skipIntra = fp->fast && interCost >= 0 && interCost * 16 < (long)w * h * lam * 16; /* T64 */
+  for (int mode = DC_PRED; mode <= PAETH_PRED && !skipIntra; mode++) {
+    long c = intra_satd(fp, src + fp->offset[0], fp->stride[0], 0, x, y, lw, lh, mode, 0, pred) +
+             (long)lam * mode_bits8(mode) / 8;
+    if (best < 0 || c < best) { best = c; bestMode = mode; }
+  }
+  if (skipIntra) best = 1L << 40;
+  if (intra_is_directional(bestMode) && !fp->fast) {
+    int base = bestMode;
+    for (int d = -MAX_ANGLE_DELTA; d <= MAX_ANGLE_DELTA; d++) {
+      if (d == 0) continue;
+      long c = intra_satd(fp, src + fp->offset[0], fp->stride[0], 0, x, y, lw, lh, base, d, pred) +
+               (long)lam * (mode_bits8(base) + 16) / 8;
+      if (c < best) { best = c; bestDelta = d; }
+    }
   }
   /* chroma costs are >= 0: if luma intra alone already loses to inter, the
    * chroma search cannot change the decision (fast preset prunes it) */
