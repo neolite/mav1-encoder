@@ -16,7 +16,7 @@
 @interface Mav1MetalState : NSObject
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
-@property(nonatomic, strong) id<MTLComputePipelineState> analyze, recon, me, lf, cdef, lr;
+@property(nonatomic, strong) id<MTLComputePipelineState> analyze, analyzeCoop, recon, me, lf, cdef, lr;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, id<MTLBuffer>> *buffers;
 @end
 @implementation Mav1MetalState
@@ -77,6 +77,8 @@ static void mtl_motion_search(Backend *b, struct Mav1Encoder *e) {
 
 static void mtl_analyze(Backend *b, struct Mav1Encoder *e) {
   Mav1MetalState *s = ST(b);
+  int one = getenv("MAV1_ALEVEL") ? 1 : 0; /* profiling: one command buffer per level */
+  for (int L = 3; L >= (one ? 0 : 3); L--) {
   run(s, ^(id<MTLComputeCommandEncoder> enc) {
     [enc setComputePipelineState:s.analyze];
     [enc setBuffer:wrap(s, &e->params) offset:0 atIndex:0];
@@ -90,13 +92,21 @@ static void mtl_analyze(Backend *b, struct Mav1Encoder *e) {
     const FrameParams *fp = ENC_PARAMS(e);
     /* levels are independent; they share the scratch buffer, so they run as
      * consecutive (serial) dispatches */
-    for (int level = 3; level >= 0; level--) {
+    for (int level = one ? L : 3; level >= (one ? L : 0); level--) {
       [enc setBytes:&level length:sizeof level atIndex:7];
       NSUInteger n = (NSUInteger)e->num_sbs * (1u << (2 * level)) * level_slots(fp, level);
-      [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+      if (level <= 1) {
+        /* big blocks: one SIMD group per candidate block */
+        [enc setComputePipelineState:s.analyzeCoop];
+        [enc dispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+      } else {
+        [enc setComputePipelineState:s.analyze];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+      }
       [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     }
   });
+  }
   /* pass 2 (partition decision on the table) on the CPU cores */
   const FrameParams *fp = ENC_PARAMS(e);
   if (getenv("MAV1_DBG")) {
@@ -216,12 +226,13 @@ Backend *backend_metal_create(struct Mav1Encoder *e, char *err, size_t errlen) {
     s.queue = [dev newCommandQueue];
     s.buffers = [NSMutableDictionary new];
     s.analyze = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_analyze"] error:&nerr];
+    s.analyzeCoop = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_analyze_coop"] error:&nerr];
     s.recon = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_recon"] error:&nerr];
     s.me = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_me"] error:&nerr];
     s.lf = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_lf"] error:&nerr];
     s.cdef = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_cdef"] error:&nerr];
     s.lr = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_lr"] error:&nerr];
-    if (!s.analyze || !s.recon || !s.me || !s.lf || !s.cdef || !s.lr) {
+    if (!s.analyze || !s.analyzeCoop || !s.recon || !s.me || !s.lf || !s.cdef || !s.lr) {
       snprintf(err, errlen, "pipeline creation failed: %s", nerr.localizedDescription.UTF8String);
       return NULL;
     }

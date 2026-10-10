@@ -187,3 +187,328 @@ kernel void mav1_recon(device const FrameParams *fp [[buffer(0)]],
   int idx = r * fp->sb_cols + c;
   recon_sb(fp, sbs[idx], blocks, src, rec, ref, coefs, mats, scratch + (long)idx * SCRATCH_INTS);
 }
+
+/* ------------------------------------------------------------------------ */
+/* Cooperative analysis: one SIMD group per candidate block. Every cost is  */
+/* the same integer eval_block( ) computes (same predictions, SATD summed   */
+/* per 4x4 unit in any order), so the table equals the CPU one.             */
+
+/* SATD of 4x4 unit u of a bw x bh block at (bx, by) of plane p against its
+ * EIGHTTAP inter prediction (predict_inter_block( ) evaluated per sample). */
+INLINE int coop_inter_unit(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref, int p,
+                           int bx, int by, int bw, int bh, int mvr, int mvc, int u) {
+  int sub = p > 0;
+  int stride = fp->stride[p];
+  DEV const uint8_t *rp = ref + fp->offset[p];
+  int nu = bw >> 2;
+  int ux = (u % nu) * 4, uy = (u / nu) * 4;
+  int startX = (((bx << SUBPEL_BITS) + ((2 * mvc) >> sub)) << (SCALE_SUBPEL_BITS - SUBPEL_BITS)) + 32;
+  int startY = (((by << SUBPEL_BITS) + ((2 * mvr) >> sub)) << (SCALE_SUBPEL_BITS - SUBPEL_BITS)) + 32;
+  int lastX = ((fp->frame_w + sub) >> sub) - 1, lastY = ((fp->frame_h + sub) >> sub) - 1;
+  int fhi = bw <= 4 ? 4 : EIGHTTAP, fvi = bh <= 4 ? 4 : EIGHTTAP;
+  KCONST int32_t *fh = Subpel_Filters[fhi][(startX >> 6) & SUBPEL_MASK];
+  KCONST int32_t *fv = Subpel_Filters[fvi][(startY >> 6) & SUBPEL_MASK];
+  int hrow[11][4];
+  for (int rr = 0; rr < 11; rr++) {
+    int ry = Clip3(0, lastY, (startY >> 10) + uy + rr - 3);
+    DEV const uint8_t *row = rp + ry * stride;
+    for (int c = 0; c < 4; c++) {
+      int sum = 0;
+      int x0 = (startX >> 10) + ux + c - 3;
+      for (int t = 0; t < 8; t++) sum += fh[t] * row[Clip3(0, lastX, x0 + t)];
+      hrow[rr][c] = Round2(sum, 3);
+    }
+  }
+  int32_t d[16];
+  DEV const uint8_t *sp = src + fp->offset[p] + (by + uy) * stride + bx + ux;
+  for (int r = 0; r < 4; r++)
+    for (int c = 0; c < 4; c++) {
+      int sum = 0;
+      for (int t = 0; t < 8; t++) sum += fv[t] * hrow[r + t][c];
+      d[r * 4 + c] = (int)sp[r * stride + c] - Clip1(Round2(sum, 11));
+    }
+  return satd4x4(d);
+}
+
+INLINE int coop_inter_satd(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref, int p,
+                           int bx, int by, int bw, int bh, int mvr, int mvc, uint lane) {
+  int n = (bw >> 2) * (bh >> 2), s = 0;
+  for (int u = (int)lane; u < n; u += 32) s += coop_inter_unit(fp, src, ref, p, bx, by, bw, bh, mvr, mvc, u);
+  return simd_sum(s);
+}
+
+/* Edges of predict_intra( ) as the analysis calls it (haveLeft = x > 0,
+ * haveAbove = y > 0, no above-right / below-left, no edge filter). */
+INLINE void coop_edges(DEV const FrameParams *fp, DEV const uint8_t *px, int stride, int planeIdx, int x, int y,
+                       int w, int h, threadgroup int *A, threadgroup int *L, uint lane) {
+  int sub = planeIdx > 0;
+  int maxX = ((fp->mi_cols * 4) >> sub) - 1, maxY = ((fp->mi_rows * 4) >> sub) - 1;
+  int haveLeft = x > 0, haveAbove = y > 0;
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  for (int i = (int)lane; i < w + h; i += 32) {
+    if (!haveAbove && haveLeft) A[i] = px[y * stride + x - 1];
+    else if (!haveAbove && !haveLeft) A[i] = (1 << 7) - 1;
+    else A[i] = px[(y - 1) * stride + k_min(k_min(maxX, x + w - 1), x + i)];
+    if (!haveLeft && haveAbove) L[i] = px[(y - 1) * stride + x];
+    else if (!haveLeft && !haveAbove) L[i] = (1 << 7) + 1;
+    else L[i] = px[k_min(k_min(maxY, y + h - 1), y + i) * stride + x - 1];
+  }
+  if (lane == 0) {
+    int c;
+    if (haveAbove && haveLeft) c = px[(y - 1) * stride + x - 1];
+    else if (haveAbove) c = px[(y - 1) * stride + x];
+    else if (haveLeft) c = px[y * stride + x - 1];
+    else c = 1 << 7;
+    A[-1] = c;
+    L[-1] = c;
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+/* One predicted sample (i, j) of predict_intra( ) without edge upsampling. */
+INLINE int coop_intra_px(int mode, int pAngle, int dx, int dy, int dcAvg, int i, int j, int w, int h, int log2W,
+                         int log2H, threadgroup const int *A, threadgroup const int *L) {
+  if (intra_is_directional(mode)) {
+    if (pAngle < 90) {
+      int idx = (i + 1) * dx;
+      int base = (idx >> 6) + j;
+      int shift = (idx >> 1) & 0x1F;
+      int maxBaseX = w + h - 1;
+      return base < maxBaseX ? Round2(A[base] * (32 - shift) + A[base + 1] * shift, 5) : A[maxBaseX];
+    } else if (pAngle > 90 && pAngle < 180) {
+      int idx = (j << 6) - (i + 1) * dx;
+      int base = idx >> 6;
+      if (base >= -1) {
+        int shift = (idx >> 1) & 0x1F;
+        return Round2(A[base] * (32 - shift) + A[base + 1] * shift, 5);
+      }
+      idx = (i << 6) - (j + 1) * dy;
+      base = idx >> 6;
+      int shift = (idx >> 1) & 0x1F;
+      return Round2(L[base] * (32 - shift) + L[base + 1] * shift, 5);
+    } else if (pAngle > 180) {
+      int idx = (j + 1) * dy;
+      int base = (idx >> 6) + i;
+      int shift = (idx >> 1) & 0x1F;
+      return Round2(L[base] * (32 - shift) + L[base + 1] * shift, 5);
+    } else if (pAngle == 90) {
+      return A[j];
+    }
+    return L[i];
+  } else if (mode == SMOOTH_PRED) {
+    KCONST int32_t *wX = intra_sm_weights(log2W);
+    KCONST int32_t *wY = intra_sm_weights(log2H);
+    return Round2(wY[i] * A[j] + (256 - wY[i]) * L[h - 1] + wX[j] * L[i] + (256 - wX[j]) * A[w - 1], 9);
+  } else if (mode == SMOOTH_V_PRED) {
+    KCONST int32_t *wY = intra_sm_weights(log2H);
+    return Round2(wY[i] * A[j] + (256 - wY[i]) * L[h - 1], 8);
+  } else if (mode == SMOOTH_H_PRED) {
+    KCONST int32_t *wX = intra_sm_weights(log2W);
+    return Round2(wX[j] * L[i] + (256 - wX[j]) * A[w - 1], 8);
+  } else if (mode == DC_PRED) {
+    return dcAvg;
+  }
+  int base = A[j] + L[i] - A[-1];
+  int pLeft = k_abs(base - L[i]), pTop = k_abs(base - A[j]), pTopLeft = k_abs(base - A[-1]);
+  if (pLeft <= pTop && pLeft <= pTopLeft) return L[i];
+  return pTop <= pTopLeft ? A[j] : A[-1];
+}
+
+/* intra_satd( ) with the work spread over the lanes (edges prebuilt). */
+INLINE int coop_intra_satd(DEV const uint8_t *px, int stride, int x, int y, int log2W, int log2H, int mode,
+                           int delta, threadgroup const int *A, threadgroup const int *L, uint lane) {
+  int w = 1 << log2W, h = 1 << log2H;
+  int haveLeft = x > 0, haveAbove = y > 0;
+  int pAngle = 0, dx = 0, dy = 0, dcAvg = 0;
+  if (intra_is_directional(mode)) {
+    pAngle = Mode_To_Angle[mode] + delta * ANGLE_STEP;
+    if (pAngle < 90) dx = Dr_Intra_Derivative[pAngle];
+    else if (pAngle > 90 && pAngle < 180) dx = Dr_Intra_Derivative[180 - pAngle];
+    if (pAngle > 90 && pAngle < 180) dy = Dr_Intra_Derivative[pAngle - 90];
+    else if (pAngle > 180) dy = Dr_Intra_Derivative[270 - pAngle];
+  } else if (mode == DC_PRED) {
+    int sum = 0;
+    if (haveLeft && haveAbove) {
+      for (int k = 0; k < h; k++) sum += L[k];
+      for (int k = 0; k < w; k++) sum += A[k];
+      dcAvg = (sum + ((w + h) >> 1)) / (w + h);
+    } else if (haveLeft) {
+      for (int k = 0; k < h; k++) sum += L[k];
+      dcAvg = Clip1((sum + (h >> 1)) >> log2H);
+    } else if (haveAbove) {
+      for (int k = 0; k < w; k++) sum += A[k];
+      dcAvg = Clip1((sum + (w >> 1)) >> log2W);
+    } else {
+      dcAvg = 1 << 7;
+    }
+  }
+  int nu = w >> 2, n = nu * (h >> 2), s = 0;
+  for (int u = (int)lane; u < n; u += 32) {
+    int ux = (u % nu) * 4, uy = (u / nu) * 4;
+    int32_t d[16];
+    for (int r = 0; r < 4; r++)
+      for (int c = 0; c < 4; c++)
+        d[r * 4 + c] = (int)px[(y + uy + r) * stride + x + ux + c] -
+                       coop_intra_px(mode, pAngle, dx, dy, dcAvg, uy + r, ux + c, w, h, log2W, log2H, A, L);
+    s += satd4x4(d);
+  }
+  return simd_sum(s);
+}
+
+/* eval_block( ) for one SIMD group. */
+INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
+                            DEV const int32_t *mvField, int mvNode, int miRow, int miCol, int bsize,
+                            DEV int32_t *scratch, int ps, THR BlockInfo *out, threadgroup int *A,
+                            threadgroup int *L, uint lane) {
+  DEV uint8_t *pred = (DEV uint8_t *)scratch;
+  DEV int32_t *tmpArea = scratch + (ps * ps + 3) / 4;
+  int lw = Mi_Width_Log2[bsize] + 2, lh = Mi_Height_Log2[bsize] + 2;
+  int w = 1 << lw, h = 1 << lh;
+  int x = miCol * 4, y = miRow * 4;
+  int lam = fp->ac_q[0] / 16;
+  int cx = x >> 1, cy = y >> 1, clw = lw - 1, clh = lh - 1;
+  long interCost = -1;
+  int mvr = 0, mvc = 0;
+  if (!fp->frame_is_intra) {
+    int sbIdx = (miRow >> 4) * fp->sb_cols + (miCol >> 4);
+    DEV const int32_t *mvp = mvField + (sbIdx * NUM_NODES + mvNode) * 2;
+    mvr = mvp[0];
+    mvc = mvp[1];
+    interCost = coop_inter_satd(fp, src, ref, 0, x, y, w, h, mvr, mvc, lane);
+    for (int p = 1; p < 3; p++) interCost += coop_inter_satd(fp, src, ref, p, cx, cy, w >> 1, h >> 1, mvr, mvc, lane);
+    interCost += (long)lam * (4 + mv_bits8(mvr, mvc)) / 8;
+  }
+  long best = -1;
+  int bestMode = DC_PRED, bestDelta = 0;
+  int skipIntra = fp->fast && interCost >= 0 && interCost * 16 < (long)w * h * lam * 16;
+  if (!skipIntra) {
+    DEV const uint8_t *py = src + fp->offset[0];
+    coop_edges(fp, py, fp->stride[0], 0, x, y, w, h, A, L, lane);
+    for (int mode = DC_PRED; mode <= PAETH_PRED; mode++) {
+      long c = coop_intra_satd(py, fp->stride[0], x, y, lw, lh, mode, 0, A, L, lane) + (long)lam * mode_bits8(mode) / 8;
+      if (best < 0 || c < best) { best = c; bestMode = mode; }
+    }
+    if (intra_is_directional(bestMode) && !fp->fast) {
+      int base = bestMode;
+      for (int d = -MAX_ANGLE_DELTA; d <= MAX_ANGLE_DELTA; d++) {
+        if (d == 0) continue;
+        long c = coop_intra_satd(py, fp->stride[0], x, y, lw, lh, base, d, A, L, lane) +
+                 (long)lam * (mode_bits8(base) + 16) / 8;
+        if (c < best) { best = c; bestDelta = d; }
+      }
+    }
+  } else {
+    best = 1L << 40;
+  }
+  int skipUv = fp->fast && interCost >= 0 && best + (long)lam * 16 / 8 >= interCost;
+  long bestUv = skipUv ? 0 : -1;
+  int bestUvMode = DC_PRED;
+  if (!skipUv) {
+    long cu[PAETH_PRED + 1];
+    for (int m = DC_PRED; m <= PAETH_PRED; m++) cu[m] = 0;
+    for (int p = 1; p < 3; p++) {
+      DEV const uint8_t *pp = src + fp->offset[p];
+      coop_edges(fp, pp, fp->stride[p], p, cx, cy, w >> 1, h >> 1, A, L, lane);
+      for (int m = DC_PRED; m <= PAETH_PRED; m++) {
+        if (intra_is_directional(m) && m != V_PRED && m != H_PRED && m != bestMode) continue;
+        int delta = (m == bestMode) ? bestDelta : 0;
+        cu[m] += coop_intra_satd(pp, fp->stride[p], cx, cy, clw, clh, m, delta, A, L, lane);
+      }
+    }
+    for (int m = DC_PRED; m <= PAETH_PRED; m++) {
+      if (intra_is_directional(m) && m != V_PRED && m != H_PRED && m != bestMode) continue;
+      long c = cu[m] + (long)lam * (m == DC_PRED ? 8 : 24) / 8;
+      if (bestUv < 0 || c < bestUv) { bestUv = c; bestUvMode = m; }
+    }
+    if (cfl_allowed(bsize, fp->lossless)) {
+      /* CfL: serial on lane 0 (the eval_block code), broadcast */
+      long c = 0;
+      if (lane == 0) {
+        DEV int32_t *dc = tmpArea;
+        int cw = 1 << clw, ch = 1 << clh;
+        c = (long)lam * 40 / 8;
+        for (int p = 1; p < 3; p++) {
+          intra_satd(fp, src + fp->offset[p], fp->stride[p], p, cx, cy, clw, clh, DC_PRED, 0, pred, ps);
+          for (int i = 0; i < ch; i++)
+            for (int j = 0; j < cw; j++) dc[i * cw + j] = pred[i * ps + j];
+          DEV const uint8_t *sp = src + fp->offset[p] + cy * fp->stride[p] + cx;
+          int al = cfl_best_alpha(src + fp->offset[0], fp->stride[0], cx, cy, x + w, y + h, clw, clh, dc, sp,
+                                  fp->stride[p], pred, ps, 0);
+          cfl_predict(src + fp->offset[0], fp->stride[0], cx, cy, x + w, y + h, clw, clh, al, dc, pred, ps);
+          c += block_satd_s(sp, fp->stride[p], pred, ps, cw, ch);
+        }
+      }
+      int lo = simd_broadcast_first((int)(c & 0xFFFFFFFF)), hi = simd_broadcast_first((int)(c >> 32));
+      c = ((long)hi << 32) | (long)(uint)lo;
+      if (c < bestUv) { bestUv = c; bestUvMode = UV_CFL_PRED; }
+    }
+  }
+  out->mi_row = miRow;
+  out->mi_col = miCol;
+  out->bsize = bsize;
+  out->is_inter = 0;
+  out->y_mode = bestMode;
+  out->angle_y = bestDelta;
+  out->uv_mode = bestUvMode;
+  out->angle_uv = (bestUvMode == bestMode) ? bestDelta : 0;
+  out->cfl_alpha_u = out->cfl_alpha_v = 0;
+  out->tx_depth = 0;
+  out->interp_filter = 0;
+  out->tx_types_lo = out->tx_types_hi = 0;
+  out->mv_row = 0;
+  out->mv_col = 0;
+  out->tx_type = DCT_DCT;
+  long cost = best + bestUv + (long)lam * (fp->frame_is_intra ? 0 : 16) / 8;
+  if (interCost >= 0 && interCost < cost) {
+    cost = interCost;
+    out->is_inter = 1;
+    out->y_mode = NEWMV;
+    out->uv_mode = DC_PRED;
+    out->angle_y = 0;
+    out->angle_uv = 0;
+    out->mv_row = mvr;
+    out->mv_col = mvc;
+  }
+  return cost;
+}
+
+/* Pass 1, cooperative: one SIMD group (threadgroup of 32) per item. */
+kernel void mav1_analyze_coop(device const FrameParams *fp [[buffer(0)]],
+                              device const uint8_t *src [[buffer(1)]],
+                              device const uint8_t *ref [[buffer(2)]],
+                              device const int32_t *mvField [[buffer(3)]],
+                              device long *costs [[buffer(4)]],
+                              device BlockInfo *infos [[buffer(5)]],
+                              device int32_t *scratch [[buffer(6)]],
+                              constant int &level [[buffer(7)]],
+                              uint gid [[threadgroup_position_in_grid]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup int eA[EDGE_LEN], eL[EDGE_LEN];
+  int ns = level_slots(fp, level), nn = 1 << (2 * level);
+  if ((int)gid >= fp->sb_cols * fp->sb_rows * nn * ns) return;
+  int sbIdx = (int)gid / (nn * ns), rem = (int)gid % (nn * ns);
+  int i = rem / ns, slot = rem % ns;
+  int sbRow = sbIdx / fp->sb_cols, sbCol = sbIdx % fp->sb_cols;
+  int n = 1 << level, size4 = 16 >> level, halfSz = size4 >> 1;
+  int node = NODE_BASE(level) + i;
+  int r = sbRow * 16 + (i / n) * size4, c = sbCol * 16 + (i % n) * size4;
+  long idx = (long)sbIdx * A_ITEMS + node * A_SLOTS + slot;
+  if (r >= fp->mi_rows || c >= fp->mi_cols) { if (lane == 0) costs[idx] = -1; return; }
+  int hasRows = (r + halfSz) < fp->mi_rows, hasCols = (c + halfSz) < fp->mi_cols;
+  int p, k;
+  slot_part(slot, &p, &k);
+  if (!part_allowed(fp, level, p, hasRows, hasCols) || k >= part_count(fp, p, r, c, halfSz)) {
+    if (lane == 0) costs[idx] = -1;
+    return;
+  }
+  int dr, dc;
+  int bs = part_block(p, level_bsize(level), k, halfSz, &dr, &dc);
+  BlockInfo b;
+  long cost = coop_eval_block(fp, src, ref, mvField, node, r + dr, c + dc, bs,
+                              scratch + (long)gid * analysis_slot_ints(level), 64 >> level, &b, eA + EDGE_OFF,
+                              eL + EDGE_OFF, lane);
+  if (lane == 0) {
+    costs[idx] = cost;
+    infos[idx] = b;
+  }
+}
