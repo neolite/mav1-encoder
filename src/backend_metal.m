@@ -200,7 +200,10 @@ Backend *backend_metal_create(struct Mav1Encoder *e, char *err, size_t errlen) {
     m->base.name = "metal";
     m->base.motion_search = mtl_motion_search;
     m->base.analyze = mtl_analyze;
-    m->base.recon = mtl_recon;
+    /* Hybrid: GPU for the massively parallel stages (motion search,
+   * analysis, filters), CPU for the wavefront reconstruction. MAV1_GPU_RECON=1
+   * keeps the GPU wavefront (for the backend comparison tests). */
+  m->base.recon = getenv("MAV1_GPU_RECON") ? mtl_recon : cpu_backend_recon;
     m->base.filter = mtl_filter;
   m->base.restore = mtl_restore;
     m->base.destroy = mtl_destroy;

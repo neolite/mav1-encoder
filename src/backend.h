@@ -21,6 +21,9 @@ typedef struct Backend {
 } Backend;
 
 Backend *backend_cpu_create(struct Mav1Encoder *e);
+/* The serial-dependency stage (wavefront reconstruction) runs best on the
+ * CPU cores; the Metal backend uses it too (unified memory, no copies). */
+void cpu_backend_recon(Backend *b, struct Mav1Encoder *e);
 Backend *backend_metal_create(struct Mav1Encoder *e, char *err, size_t errlen);
 
 #endif

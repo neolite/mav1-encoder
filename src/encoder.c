@@ -313,6 +313,7 @@ int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int stride
 
   double t0 = now();
   if (!isKey) e->be->motion_search(e->be, e);
+  if (getenv("MAV1_TIMING")) fprintf(stderr, "me %.1fms\n", (now() - t0) * 1000);
   e->be->analyze(e->be, e);
   double t1 = now();
   e->be->recon(e->be, e);

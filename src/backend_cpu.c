@@ -40,7 +40,7 @@ static void cpu_analyze(Backend *b, struct Mav1Encoder *e) {
   });
 }
 
-static void cpu_recon(Backend *b, struct Mav1Encoder *e) {
+void cpu_backend_recon(Backend *b, struct Mav1Encoder *e) {
   (void)b;
   const FrameParams *fp = ENC_PARAMS(e);
   int waves = e->sb_cols + 2 * (e->sb_rows - 1);
@@ -100,7 +100,7 @@ Backend *backend_cpu_create(struct Mav1Encoder *e) {
   c->base.name = "cpu";
   c->base.motion_search = cpu_motion_search;
   c->base.analyze = cpu_analyze;
-  c->base.recon = cpu_recon;
+  c->base.recon = cpu_backend_recon;
   c->base.filter = cpu_filter;
   c->base.restore = cpu_restore;
   c->base.destroy = cpu_destroy;
