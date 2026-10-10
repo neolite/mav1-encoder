@@ -188,7 +188,8 @@ static Mav1Encoder *create_enc(const Mav1Config *cfg, int isEngine, char *err, s
     e->be = backend_cpu_create(e);
   }
   if (drv) {
-    for (int i = 0; i < 2; i++) {
+    e->eng_next = 1;
+    for (int i = 0; i < NUM_ENG; i++) {
       e->eng[i] = create_enc(cfg, 1, err, errlen);
       if (!e->eng[i]) {
         mav1_destroy(e);
@@ -197,7 +198,7 @@ static Mav1Encoder *create_enc(const Mav1Config *cfg, int isEngine, char *err, s
       e->eng_q[i] = (void *)dispatch_queue_create("mav1.engine", DISPATCH_QUEUE_SERIAL);
       e->eng_busy[i] = (void *)dispatch_group_create();
     }
-    for (int k = 0; k < 8; k++) e->slot_grp[k] = (void *)dispatch_group_create();
+    e->inflight = (void *)dispatch_semaphore_create(6);
   }
   return e;
 }
@@ -207,15 +208,18 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) { retu
 void mav1_destroy(Mav1Encoder *e) {
   if (!e) return;
   wctx_free(e);
-  for (int i = 0; i < 2; i++)
+  for (int i = 0; i < NUM_ENG; i++)
     if (e->eng[i]) {
       dispatch_group_wait((dispatch_group_t)e->eng_busy[i], DISPATCH_TIME_FOREVER);
       mav1_destroy(e->eng[i]);
       dispatch_release((dispatch_queue_t)e->eng_q[i]);
       dispatch_release((dispatch_group_t)e->eng_busy[i]);
     }
-  for (int k = 0; k < 8; k++)
-    if (e->slot_grp[k]) dispatch_release((dispatch_group_t)e->slot_grp[k]);
+  for (int k = 0; k < 8; k++) {
+    if (e->slot_ver[k]) dispatch_release((dispatch_group_t)e->slot_ver[k]);
+    if (e->slot_rd[k]) dispatch_release((dispatch_group_t)e->slot_rd[k]);
+  }
+  if (e->inflight) dispatch_release((dispatch_semaphore_t)e->inflight);
   if (e->be) e->be->destroy(e->be);
   buf_free(&e->src);
   buf_free(&e->rec);
@@ -540,6 +544,10 @@ static void run_frame_core(Mav1Encoder *e, int isKey) {
     e->rec = e->lrout;
     e->lrout = t;
   }
+  if (e->gate_out) {
+    dispatch_semaphore_signal((dispatch_semaphore_t)e->gate_out);
+    e->gate_out = NULL;
+  }
   double t3 = now();
   e->last.t_analysis = t1 - t0;
   e->last.t_recon = t2 - t1;
@@ -833,7 +841,7 @@ static void stats_add(Mav1FrameStats *a, const Mav1FrameStats *b) {
  * coded by an engine, concurrently with the driver and the other engine.
  * Returns the packed reconstruction (complete once the frame's OBU is
  * appended). */
-static uint8_t *alt_code(Mav1Encoder *e, const uint8_t *frame, int disp, int isKey, int kind, int lastSlot,
+static uint8_t *alt_code(Mav1Encoder *e, uint8_t **framep, int disp, int isKey, int kind, int lastSlot,
                          int arfSlot, int refresh, int hidden, Tu *t) {
   if (isKey) e->key_disp = disp;
   e->nonref = e->cfg.leaf && !isKey && refresh == 0;
@@ -864,49 +872,88 @@ static uint8_t *alt_code(Mav1Encoder *e, const uint8_t *frame, int disp, int isK
   static double tl0;
   int tl = getenv("MAV1_TL") != NULL;
   if (tl && !tl0) tl0 = now();
-  if (tl) fprintf(stderr, "%7.1f drv  d%d k%d wait\n", (now() - tl0) * 1e3, disp, kind);
-  int ei = e->eng_next;
+  if (tl) fprintf(stderr, "%7.1f drv  d%d k%d\n", (now() - tl0) * 1e3, disp, kind);
+  /* reference frames on engine 0 (they form a chain), the others
+   * alternately on engines 1 and 2 */
+  int ei = h->refresh_frame_flags ? 0 : e->eng_next;
   Mav1Encoder *E = e->eng[0] ? e->eng[ei] : e;
-  if (e->eng[0]) {
-    e->eng_next ^= 1;
-    dispatch_group_wait((dispatch_group_t)e->eng_busy[ei], DISPATCH_TIME_FOREVER);
-    if (!isKey) { /* the references are written */
-      dispatch_group_wait((dispatch_group_t)e->slot_grp[lastSlot], DISPATCH_TIME_FOREVER);
-      if (arfSlot >= 0) dispatch_group_wait((dispatch_group_t)e->slot_grp[arfSlot], DISPATCH_TIME_FOREVER);
-    }
-    for (int k = 0; k < 8; k++) /* earlier writes of the refreshed slots done */
-      if ((h->refresh_frame_flags >> k) & 1) dispatch_group_wait((dispatch_group_t)e->slot_grp[k], DISPATCH_TIME_FOREVER);
-    E->hdr = e->hdr;
-    memcpy(E->sign_bias, e->sign_bias, sizeof e->sign_bias);
-    E->key_disp = e->key_disp;
-    E->nonref = e->nonref;
-    E->leafopt = e->leafopt;
-    E->frame_kind = e->frame_kind;
-    E->order_hint = e->order_hint;
-  }
-  int cw = (e->w + 1) >> 1, ch = (e->h + 1) >> 1;
-  const uint8_t *pl[3] = {frame, frame + (size_t)e->w * e->h, frame + (size_t)e->w * e->h + (size_t)cw * ch};
-  int st[3] = {e->w, cw, cw};
-  load_source(E, pl, st);
-  if (!isKey) {
-    memcpy(E->ref.base, e->slot[lastSlot].base, e->frame_bytes);
-    if (arfSlot >= 0) memcpy(E->gold.base, e->slot[arfSlot].base, e->frame_bytes);
-    E->ref_gen = e->slot_gen[lastSlot];
-    E->gold_gen = arfSlot >= 0 ? e->slot_gen[arfSlot] : 0;
-  }
+  if (e->eng[0] && ei) e->eng_next = 3 - ei;
   int rf = h->refresh_frame_flags;
+  FrameHdr hdr = *h;
+  struct { int v[8]; } sb;
+  memcpy(sb.v, e->sign_bias, sizeof sb.v);
+  int keyDisp = e->key_disp, nonref = e->nonref, leafopt = e->leafopt, frameKind = e->frame_kind,
+      orderHint = e->order_hint;
+  unsigned refGen = isKey ? 0 : e->slot_gen[lastSlot], goldGen = !isKey && arfSlot >= 0 ? e->slot_gen[arfSlot] : 0;
   if (rf) e->gen++;
   for (int k = 0; k < 8; k++)
     if ((rf >> k) & 1) {
       e->slot_gen[k] = e->gen;
       e->slot_hint[k] = h->order_hint;
     }
+  uint8_t *frame = *framep;
+  *framep = NULL;
+  int cw = (e->w + 1) >> 1, ch = (e->h + 1) >> 1;
   uint8_t *recon = malloc(packed_size(e));
-  /* the frame's core; then the slot writes and the writer job's inputs */
   typedef struct { Mav1Encoder *s; WCtx *c; Mav1FrameStats st; } Job;
   Job *job = calloc(1, sizeof *job);
+  /* slot dependencies (engines): the versions read and their reader
+   * groups; for each refreshed slot the previous version, its readers and
+   * the new version */
+  int nr = isKey ? 0 : arfSlot >= 0 ? 2 : 1, rs_[2] = {lastSlot, arfSlot};
+  struct { void *ver[2], *rd[2], *pver[8], *prd[8], *nver[8]; } dep;
+  memset(&dep, 0, sizeof dep);
+  if (e->eng[0]) {
+    for (int i = 0; i < nr; i++) {
+      int k = rs_[i];
+      if (e->slot_ver[k]) dispatch_retain((dispatch_group_t)(dep.ver[i] = e->slot_ver[k]));
+      if (!e->slot_rd[k]) e->slot_rd[k] = (void *)dispatch_group_create();
+      dispatch_group_enter((dispatch_group_t)e->slot_rd[k]);
+      dispatch_retain((dispatch_group_t)(dep.rd[i] = e->slot_rd[k]));
+    }
+    for (int k = 0; k < 8; k++)
+      if ((rf >> k) & 1) {
+        dep.pver[k] = e->slot_ver[k]; /* the references move to dep */
+        dep.prd[k] = e->slot_rd[k];
+        dispatch_group_t g = dispatch_group_create();
+        dispatch_group_enter(g);
+        dispatch_retain(g);
+        dep.nver[k] = (void *)g;
+        e->slot_ver[k] = (void *)g;
+        e->slot_rd[k] = NULL;
+      }
+  }
+  void (^setup)(void) = ^{
+    for (int i = 0; i < nr; i++) /* the references are written */
+      if (dep.ver[i]) {
+        dispatch_group_wait((dispatch_group_t)dep.ver[i], DISPATCH_TIME_FOREVER);
+        dispatch_release((dispatch_group_t)dep.ver[i]);
+      }
+    E->hdr = hdr;
+    memcpy(E->sign_bias, sb.v, sizeof sb.v);
+    E->key_disp = keyDisp;
+    E->nonref = nonref;
+    E->leafopt = leafopt;
+    E->frame_kind = frameKind;
+    E->order_hint = orderHint;
+    const uint8_t *pl[3] = {frame, frame + (size_t)e->w * e->h, frame + (size_t)e->w * e->h + (size_t)cw * ch};
+    int st[3] = {e->w, cw, cw};
+    load_source(E, pl, st);
+    free(frame);
+    if (!isKey) {
+      memcpy(E->ref.base, e->slot[lastSlot].base, e->frame_bytes);
+      if (arfSlot >= 0) memcpy(E->gold.base, e->slot[arfSlot].base, e->frame_bytes);
+      E->ref_gen = refGen;
+      E->gold_gen = goldGen;
+    }
+    for (int i = 0; i < nr; i++)
+      if (dep.rd[i]) {
+        dispatch_group_leave((dispatch_group_t)dep.rd[i]);
+        dispatch_release((dispatch_group_t)dep.rd[i]);
+      }
+  };
+  /* the frame's core; then the slot writes and the writer job's inputs */
   dispatch_semaphore_t coreDone = e->eng[0] ? dispatch_semaphore_create(0) : NULL;
-  if (tl) fprintf(stderr, "%7.1f drv  d%d setup done\n", (now() - tl0) * 1e3, disp);
   void (^core)(void) = ^{
     if (tl) fprintf(stderr, "%7.1f e%d   d%d core start\n", (now() - tl0) * 1e3, ei, disp);
     memset(&E->last, 0, sizeof E->last);
@@ -915,22 +962,55 @@ static uint8_t *alt_code(Mav1Encoder *e, const uint8_t *frame, int disp, int isK
     job->st = E->last;
     job->s = E->wq ? snap_take(E, &job->c) : E;
     for (int k = 0; k < 8; k++)
-      if (((rf >> k) & 1) && e->slot[k].base) memcpy(e->slot[k].base, E->rec.base, e->frame_bytes);
+      if ((rf >> k) & 1) {
+        /* the previous picture's write and its readers are done */
+        if (dep.pver[k]) {
+          dispatch_group_wait((dispatch_group_t)dep.pver[k], DISPATCH_TIME_FOREVER);
+          dispatch_release((dispatch_group_t)dep.pver[k]);
+        }
+        if (dep.prd[k]) {
+          dispatch_group_wait((dispatch_group_t)dep.prd[k], DISPATCH_TIME_FOREVER);
+          dispatch_release((dispatch_group_t)dep.prd[k]);
+        }
+        if (e->slot[k].base) memcpy(e->slot[k].base, E->rec.base, e->frame_bytes);
+      }
+    for (int k = 0; k < 8; k++)
+      if (dep.nver[k]) {
+        dispatch_group_leave((dispatch_group_t)dep.nver[k]);
+        dispatch_release((dispatch_group_t)dep.nver[k]);
+      }
     uint8_t *rp[3] = {recon, recon + (size_t)e->w * e->h, recon + (size_t)e->w * e->h + (size_t)cw * ch};
     int rs[3] = {e->w, cw, cw};
     copy_out(E, E->rec.base, rp, rs);
   };
   if (e->eng[0]) {
-    for (int k = 0; k < 8; k++)
-      if ((rf >> k) & 1) dispatch_group_enter((dispatch_group_t)e->slot_grp[k]);
-    void **sg = e->slot_grp;
+    /* GPU priority: a reference frame releases the pending non-reference
+     * frame when its GPU stages are done; a non-reference frame waits */
+    dispatch_semaphore_t gateIn = NULL;
+    if (!getenv("MAV1_NOGATE")) {
+      if (rf) {
+        void *g = e->gate_pending;
+        e->gate_pending = NULL;
+        /* handed over inside the job (E->gate_out belongs to the engine) */
+        dispatch_group_async((dispatch_group_t)e->eng_busy[ei], (dispatch_queue_t)e->eng_q[ei], ^{ E->gate_out = g; });
+      } else {
+        if (e->gate_pending) dispatch_semaphore_signal((dispatch_semaphore_t)e->gate_pending);
+        gateIn = dispatch_semaphore_create(0);
+        e->gate_pending = (void *)gateIn;
+      }
+    }
+    dispatch_semaphore_wait((dispatch_semaphore_t)e->inflight, DISPATCH_TIME_FOREVER);
     dispatch_group_async((dispatch_group_t)e->eng_busy[ei], (dispatch_queue_t)e->eng_q[ei], ^{
+      setup();
+      if (gateIn) {
+        dispatch_semaphore_wait(gateIn, DISPATCH_TIME_FOREVER);
+        dispatch_release(gateIn);
+      }
       core();
-      for (int k = 0; k < 8; k++)
-        if ((rf >> k) & 1) dispatch_group_leave((dispatch_group_t)sg[k]);
       dispatch_semaphore_signal(coreDone);
     });
   } else {
+    setup();
     core();
   }
   q_run(e, ^{
@@ -954,6 +1034,7 @@ static uint8_t *alt_code(Mav1Encoder *e, const uint8_t *frame, int disp, int isK
     stats_add(&t->st, &st2);
     if (job->c) dispatch_semaphore_signal((dispatch_semaphore_t)job->c->free);
     free(job);
+    if (e->inflight) dispatch_semaphore_signal((dispatch_semaphore_t)e->inflight);
     if (tl) fprintf(stderr, "%7.1f wq   d%d written\n", (now() - tl0) * 1e3, disp);
   });
   return recon;
@@ -968,7 +1049,7 @@ static Tu *pyr_code(Mav1Encoder *e, Tu *t, int a, int as, int b, int bs, int dep
   if (b - a - 1 >= 3 && depth < 4) {
     int m = (a + b) / 2, ms = 4 + depth;
     if (!t) t = tu_new(1, 0);
-    uint8_t *rec = alt_code(e, e->inq[m - d0], m, 0, 3, as, bs, 1 << ms, 1, t);
+    uint8_t *rec = alt_code(e, &e->inq[m - d0], m, 0, 3, as, bs, 1 << ms, 1, t);
     t = pyr_code(e, t, a, as, m, ms, depth + 1);
     if (!t) t = tu_new(1, 0);
     tu_show_existing(e, t, ms, rec);
@@ -976,7 +1057,7 @@ static Tu *pyr_code(Mav1Encoder *e, Tu *t, int a, int as, int b, int bs, int dep
   }
   for (int d = a + 1; d < b; d++) {
     if (!t) t = tu_new(1, 0);
-    tu_close(e, t, alt_code(e, e->inq[d - d0], d, 0, 2, as, bs, 0, 0, t));
+    tu_close(e, t, alt_code(e, &e->inq[d - d0], d, 0, 2, as, bs, 0, 0, t));
     t = NULL;
   }
   return t;
@@ -997,13 +1078,13 @@ static void alt_drain(Mav1Encoder *e, int flush) {
     if (isKey || L == 1) {
       /* key frame, or a regular frame predicting from the anchor */
       Tu *t = tu_new(!isKey, isKey);
-      uint8_t *rec = alt_code(e, e->inq[0], d0, isKey, 0, e->anchor_slot, -1, 0x01, 0, t);
+      uint8_t *rec = alt_code(e, &e->inq[0], d0, isKey, 0, e->anchor_slot, -1, 0x01, 0, t);
       e->anchor_slot = 0;
       tu_close(e, t, rec);
     } else if (e->cfg.leaf) {
       int arfSlot = e->anchor_slot == 2 ? 3 : 2;
       Tu *t = tu_new(1, 0);
-      uint8_t *arfRecon = alt_code(e, e->inq[L - 1], d0 + L - 1, 0, 1, e->anchor_slot, -1, 1 << arfSlot, 1, t);
+      uint8_t *arfRecon = alt_code(e, &e->inq[L - 1], d0 + L - 1, 0, 1, e->anchor_slot, -1, 1 << arfSlot, 1, t);
       t = pyr_code(e, t, d0 - 1, e->anchor_slot, d0 + L - 1, arfSlot, 0);
       if (!t) t = tu_new(1, 0);
       tu_show_existing(e, t, arfSlot, arfRecon);
@@ -1011,10 +1092,10 @@ static void alt_drain(Mav1Encoder *e, int flush) {
     } else {
       int arfSlot = e->anchor_slot == 2 ? 3 : 2;
       Tu *t = tu_new(1, 0);
-      uint8_t *arfRecon = alt_code(e, e->inq[L - 1], d0 + L - 1, 0, 1, e->anchor_slot, -1, 1 << arfSlot, 1, t);
+      uint8_t *arfRecon = alt_code(e, &e->inq[L - 1], d0 + L - 1, 0, 1, e->anchor_slot, -1, 1 << arfSlot, 1, t);
       for (int i = 0; i < L - 1; i++) {
         if (i > 0) t = tu_new(1, 0);
-        tu_close(e, t, alt_code(e, e->inq[i], d0 + i, 0, 2, i == 0 ? e->anchor_slot : 0, arfSlot, 0x01, 0, t));
+        tu_close(e, t, alt_code(e, &e->inq[i], d0 + i, 0, 2, i == 0 ? e->anchor_slot : 0, arfSlot, 0x01, 0, t));
       }
       t = tu_new(1, 0);
       tu_show_existing(e, t, arfSlot, arfRecon);
@@ -1046,6 +1127,10 @@ int mav1_send_frame(Mav1Encoder *e, const uint8_t *const planes[3], const int st
   }
   if (!planes) e->flushing = 1;
   alt_drain(e, planes == NULL);
+  if (e->flushing && e->gate_pending) { /* no reference frame follows */
+    dispatch_semaphore_signal((dispatch_semaphore_t)e->gate_pending);
+    e->gate_pending = NULL;
+  }
   return 0;
 }
 

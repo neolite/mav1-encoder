@@ -113,10 +113,20 @@ struct Mav1Encoder {
   void *outmu;          /* pthread mutex of outq */
   /* turbo: frame engines (complete encoders without driver) coding frames
    * concurrently; frames wait for the slots they reference */
-  struct Mav1Encoder *eng[2];
+#define NUM_ENG 3 /* engine 0 codes the reference frames, 1 and 2 the others */
+  struct Mav1Encoder *eng[NUM_ENG];
   int eng_next, is_engine;
-  void *eng_q[2], *eng_busy[2]; /* serial dispatch queue, group of its jobs */
-  void *slot_grp[8];            /* dispatch group: pending writes of the slot */
+  void *eng_q[NUM_ENG], *eng_busy[NUM_ENG]; /* serial dispatch queue, group of its jobs */
+  /* slot versions: slot_ver[k] (dispatch group, NULL: written) completes
+   * when the slot's current picture is written; slot_rd[k] holds the
+   * frames reading that picture (a later write waits for them) */
+  void *slot_ver[8], *slot_rd[8];
+  void *inflight;               /* dispatch semaphore: frames in flight */
+  /* GPU priority of reference frames: a non-reference frame's core starts
+   * once the next reference frame's GPU stages are done (gate_pending: the
+   * gate of the last such frame, handed to the next reference frame) */
+  void *gate_pending;
+  void *gate_out;               /* engine: semaphore to signal when the GPU core is done */
 
   /* statistics of the last frame */
   Mav1FrameStats last;

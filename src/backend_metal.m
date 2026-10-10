@@ -59,6 +59,7 @@ static void run(Mav1MetalState *s, void (^encode)(id<MTLComputeCommandEncoder>))
     [cb commit];
     [cb waitUntilCompleted];
     if (getenv("MAV1_GPUT")) fprintf(stderr, "gpu %.2fms\n", (cb.GPUEndTime - cb.GPUStartTime) * 1000);
+    if (getenv("MAV1_GPUTL")) fprintf(stderr, "gpu %p run %.2f %.2f\n", (__bridge void *)s, fmod(cb.GPUStartTime, 1000) * 1e3, fmod(cb.GPUEndTime, 1000) * 1e3);
     if (cb.error) fprintf(stderr, "mav1 metal: command buffer error: %s\n", cb.error.localizedDescription.UTF8String);
   }
 }
@@ -247,7 +248,9 @@ static void mtl_frame_core(Backend *b, struct Mav1Encoder *e) {
       }
       [enc endEncoding];
       dispatch_semaphore_t d = done[k + 1];
+      int kk = k;
       [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        if (getenv("MAV1_GPUTL")) fprintf(stderr, "gpu %p cb%d %.2f %.2f\n", (void *)b, kk, fmod(c.GPUStartTime, 1000) * 1e3, fmod(c.GPUEndTime, 1000) * 1e3);
         if (c.error) fprintf(stderr, "mav1 metal: command buffer error: %s\n", c.error.localizedDescription.UTF8String);
         dispatch_semaphore_signal(d);
       }];
@@ -275,6 +278,10 @@ static void mtl_frame_core(Backend *b, struct Mav1Encoder *e) {
     });
     if (ys) edge_types_rows(e, ys, uvs, k * rowsPer, k_min(e->sb_rows, (k + 1) * rowsPer));
     recon_sched_release(rs, sb0, nsb);
+  }
+  if (e->gate_out) { /* GPU stages done: a waiting non-reference frame may start */
+    dispatch_semaphore_signal((__bridge dispatch_semaphore_t)e->gate_out);
+    e->gate_out = NULL;
   }
   if (ct) fprintf(stderr, " rel %.1f", (CFAbsoluteTimeGetCurrent() - c0) * 1e3);
   recon_sched_end(rs);
