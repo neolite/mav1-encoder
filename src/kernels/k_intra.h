@@ -277,19 +277,37 @@ INLINE void cfl_predict(DEV const uint8_t *luma, int lumaStride, int startX, int
 INLINE int cfl_best_alpha(DEV const uint8_t *luma, int lumaStride, int startX, int startY, int maxLumaW,
                           int maxLumaH, int log2W, int log2H, DEV const int32_t *dcPred, DEV const uint8_t *src,
                           int srcStride, DEV uint8_t *dst, int dstStride, int excludeZero) {
+  /* SSE of every alpha in one pass over the samples (the same values as
+   * predicting the block 33 times); first minimum over alpha = -16..16. */
+  int w = 1 << log2W, h = 1 << log2H;
+  int lumaAvg = 0;
+  for (int i = 0; i < h; i++) {
+    DEV const uint8_t *row = luma + k_min((startY + i) << 1, maxLumaH - 2) * lumaStride;
+    for (int j = 0; j < w; j++) {
+      DEV const uint8_t *l = row + k_min((startX + j) << 1, maxLumaW - 2);
+      lumaAvg += ((int)l[0] + l[1] + l[lumaStride] + l[lumaStride + 1]) << 1;
+    }
+  }
+  lumaAvg = Round2(lumaAvg, log2W + log2H);
+  long sse[33];
+  for (int a = 0; a < 33; a++) sse[a] = 0;
+  for (int i = 0; i < h; i++) {
+    DEV const uint8_t *row = luma + k_min((startY + i) << 1, maxLumaH - 2) * lumaStride;
+    for (int j = 0; j < w; j++) {
+      DEV const uint8_t *l = row + k_min((startX + j) << 1, maxLumaW - 2);
+      int v = (((int)l[0] + l[1] + l[lumaStride] + l[lumaStride + 1]) << 1) - lumaAvg;
+      int dp = dcPred[i * w + j], s0 = src[i * srcStride + j];
+      for (int a = 0; a < 33; a++) {
+        int d = Clip3(0, 255, dp + Round2Signed((a - 16) * v, 6)) - s0;
+        sse[a] += d * d;
+      }
+    }
+  }
   long best = -1;
   int bestA = 0;
-  int w = 1 << log2W, h = 1 << log2H;
   for (int a = -16; a <= 16; a++) {
     if (a == 0 && excludeZero) continue;
-    cfl_predict(luma, lumaStride, startX, startY, maxLumaW, maxLumaH, log2W, log2H, a, dcPred, dst, dstStride);
-    long sse = 0;
-    for (int i = 0; i < h; i++)
-      for (int j = 0; j < w; j++) {
-        int d = (int)dst[i * dstStride + j] - (int)src[i * srcStride + j];
-        sse += d * d;
-      }
-    if (best < 0 || sse < best) { best = sse; bestA = a; }
+    if (best < 0 || sse[a + 16] < best) { best = sse[a + 16]; bestA = a; }
   }
   return bestA;
 }
