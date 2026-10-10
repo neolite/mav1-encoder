@@ -6,6 +6,7 @@
 #include <string.h>
 #include <dispatch/dispatch.h>
 #include <time.h>
+#include <pthread.h>
 
 #include "backend.h"
 #include "enc_internal.h"
@@ -39,6 +40,9 @@ static void buf_free(Buf *b) {
   free(b->base);
   b->base = NULL;
 }
+
+static int wctx_init(Mav1Encoder *e);
+static void wctx_free(Mav1Encoder *e);
 
 void mav1_default_config(Mav1Config *cfg, int width, int height) {
   memset(cfg, 0, sizeof(*cfg));
@@ -156,6 +160,11 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
     mav1_destroy(e);
     return NULL;
   }
+  if (e->cfg.turbo && e->cfg.altref && !getenv("MAV1_NOASYNC") && wctx_init(e)) {
+    snprintf(err, errlen, "out of memory");
+    mav1_destroy(e);
+    return NULL;
+  }
   fwd_build_matrices((int32_t *)e->mats.base);
   e->mi = calloc((size_t)e->mi_rows * e->mi_cols, sizeof(MiInfo));
   e->cdef_idx = calloc((size_t)e->num_sbs, 1);
@@ -175,6 +184,7 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
 
 void mav1_destroy(Mav1Encoder *e) {
   if (!e) return;
+  wctx_free(e);
   if (e->be) e->be->destroy(e->be);
   buf_free(&e->src);
   buf_free(&e->rec);
@@ -459,9 +469,9 @@ static int frame_qindex(const Mav1Encoder *e, int isKey) {
   return q < 1 ? 1 : q > 255 ? 255 : q;
 }
 
-/* Runs every stage of one frame whose header fields (e->hdr) and source are
- * set; returns the tile data. The final reconstruction is left in `rec`. */
-static size_t run_frame(Mav1Encoder *e, int isKey, uint8_t **tile) {
+/* Runs the stages of one frame up to the entropy coding (header fields in
+ * e->hdr, source loaded). The final reconstruction is left in `rec`. */
+static void run_frame_core(Mav1Encoder *e, int isKey) {
   setup_params(e, isKey);
 
   double t0 = now(), tme, tan, t1, t2;
@@ -500,27 +510,116 @@ static size_t run_frame(Mav1Encoder *e, int isKey, uint8_t **tile) {
     e->lrout = t;
   }
   double t3 = now();
-  size_t tileSize = write_tile(e, tile);
-  double t4 = now();
-  if (getenv("MAV1_TIMING"))
-    fprintf(stderr, "kind %d nonref %d: me %.1f ana %.1f edge %.1f rec %.1f flt %.1f ent %.1f ms\n", e->frame_kind, e->nonref,
-            (tme - t0) * 1e3, (tan - tme) * 1e3, (t1 - tan) * 1e3, (t2 - t1) * 1e3, (t3 - t2) * 1e3, (t4 - t3) * 1e3);
-
-  const SbInfo *sbs = ENC_SBS(e);
-  const BlockInfo *blocks = ENC_BLOCKS(e);
-  for (int i = 0; i < e->num_sbs; i++) {
-    e->last.num_blocks += sbs[i].num_blocks;
-    for (int k = 0; k < sbs[i].num_blocks; k++) {
-      const BlockInfo *b = &blocks[sbs[i].first_block + k];
-      e->last.num_inter_blocks += b->is_inter;
-      count_tools(&e->last, b);
-    }
-  }
   e->last.t_analysis = t1 - t0;
   e->last.t_recon = t2 - t1;
   e->last.t_filter = t3 - t2;
-  e->last.t_entropy = t4 - t3;
+  e->last.t_entropy = 0;
+  if (getenv("MAV1_TIMING"))
+    fprintf(stderr, "kind %d nonref %d: me %.1f ana %.1f edge %.1f rec %.1f flt %.1f ms\n", e->frame_kind, e->nonref,
+            (tme - t0) * 1e3, (tan - tme) * 1e3, (t1 - tan) * 1e3, (t2 - t1) * 1e3, (t3 - t2) * 1e3);
+}
+
+/* Entropy codes the frame described by s (the encoder or a writer
+ * snapshot) and adds its block statistics to *st. */
+static size_t frame_tail(Mav1Encoder *s, uint8_t **tile, Mav1FrameStats *st) {
+  double t3 = now();
+  size_t tileSize = write_tile(s, tile);
+  const SbInfo *sbs = ENC_SBS(s);
+  const BlockInfo *blocks = ENC_BLOCKS(s);
+  for (int i = 0; i < s->num_sbs; i++) {
+    st->num_blocks += sbs[i].num_blocks;
+    for (int k = 0; k < sbs[i].num_blocks; k++) {
+      const BlockInfo *b = &blocks[sbs[i].first_block + k];
+      st->num_inter_blocks += b->is_inter;
+      count_tools(st, b);
+    }
+  }
+  st->t_entropy += now() - t3;
+  if (getenv("MAV1_TIMING")) fprintf(stderr, "  ent %.1f ms\n", (now() - t3) * 1e3);
   return tileSize;
+}
+
+/* Runs every stage of one frame; returns the tile data. */
+static size_t run_frame(Mav1Encoder *e, int isKey, uint8_t **tile) {
+  run_frame_core(e, isKey);
+  return frame_tail(e, tile, &e->last);
+}
+
+/* Hands the coded frame's writer inputs to a writer context: its buffers
+ * are swapped with the encoder's (the next frame's core writes the others)
+ * and a snapshot of the encoder state is taken. */
+static Mav1Encoder *snap_take(Mav1Encoder *e, WCtx **out) {
+  WCtx *c = &e->wctx[e->wnext];
+  e->wnext = (e->wnext + 1) % NUM_WCTX;
+  dispatch_semaphore_wait((dispatch_semaphore_t)c->free, DISPATCH_TIME_FOREVER);
+  Buf t;
+#define SWAPB(f) t = e->f; e->f = c->f; c->f = t;
+  SWAPB(blocks) SWAPB(sbs) SWAPB(coefs) SWAPB(params) SWAPB(lrunits)
+#undef SWAPB
+  memcpy(c->cdef_choice, e->cdef_choice, (size_t)e->num_sbs);
+  *c->snap = *e;
+  Mav1Encoder *s = c->snap;
+  s->blocks = c->blocks;
+  s->sbs = c->sbs;
+  s->coefs = c->coefs;
+  s->params = c->params;
+  s->lrunits = c->lrunits;
+  s->mi = c->mi;
+  s->cdef_idx = c->cdef_idx;
+  s->cdef_choice = c->cdef_choice;
+  *out = c;
+  return s;
+}
+
+static int wctx_init(Mav1Encoder *e) {
+  int ok = 0;
+  for (int i = 0; i < NUM_WCTX; i++) {
+    WCtx *c = &e->wctx[i];
+    ok |= buf_alloc(&c->params, e->params.size);
+    ok |= buf_alloc(&c->blocks, e->blocks.size);
+    ok |= buf_alloc(&c->sbs, e->sbs.size);
+    ok |= buf_alloc(&c->coefs, e->coefs.size);
+    ok |= buf_alloc(&c->lrunits, e->lrunits.size);
+    c->mi = calloc((size_t)e->mi_rows * e->mi_cols, sizeof(MiInfo));
+    c->cdef_idx = calloc((size_t)e->num_sbs, 1);
+    c->cdef_choice = calloc((size_t)e->num_sbs, 1);
+    c->snap = calloc(1, sizeof(Mav1Encoder));
+    c->free = (void *)dispatch_semaphore_create(1);
+  }
+  e->wq = (void *)dispatch_queue_create("mav1.writer", DISPATCH_QUEUE_SERIAL);
+  pthread_mutex_t *mu = malloc(sizeof *mu);
+  pthread_mutex_init(mu, NULL);
+  e->outmu = mu;
+  return ok;
+}
+
+static void wctx_free(Mav1Encoder *e) {
+  if (!e->wq) return;
+  dispatch_sync((dispatch_queue_t)e->wq, ^{});
+  for (int i = 0; i < NUM_WCTX; i++) {
+    WCtx *c = &e->wctx[i];
+    buf_free(&c->params);
+    buf_free(&c->blocks);
+    buf_free(&c->sbs);
+    buf_free(&c->coefs);
+    buf_free(&c->lrunits);
+    free(c->mi);
+    free(c->cdef_idx);
+    free(c->cdef_choice);
+    free(c->snap);
+    if (c->free) dispatch_release((dispatch_semaphore_t)c->free);
+  }
+  dispatch_release((dispatch_queue_t)e->wq);
+  e->wq = NULL;
+  pthread_mutex_destroy(e->outmu);
+  free(e->outmu);
+}
+
+/* Runs op on the writer queue (in order with the frames' entropy coding),
+ * or inline. */
+static void q_run(Mav1Encoder *e, void (^op)(void)) {
+  if (e->wq) dispatch_async((dispatch_queue_t)e->wq, op);
+  else op();
 }
 
 int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int strides[3], uint8_t **out,
@@ -630,12 +729,78 @@ static int rel_dist(int a, int b) {
   return d >= 64 ? d - 128 : d;
 }
 
+/* Temporal unit being assembled by the ALTREF driver. Hidden frames are
+ * appended to it; a shown frame (or show_existing_frame header) completes
+ * it. Statistics of all frames coded into it are summed. With the writer
+ * queue every append runs on the queue, in coding order. */
+typedef struct { uint8_t *buf; size_t pos, cap; Mav1FrameStats st; } Tu;
+
+static void tu_reserve(Tu *t, size_t n) {
+  if (t->pos + n > t->cap) {
+    t->cap = t->pos + n;
+    t->buf = realloc(t->buf, t->cap);
+  }
+}
+
+/* A new temporal unit: with the temporal delimiter unless omitTd (a key
+ * frame writes TD and sequence header itself). */
+static Tu *tu_new(int frameType, int omitTd) {
+  Tu *t = calloc(1, sizeof *t);
+  t->cap = 1024;
+  t->buf = malloc(t->cap);
+  if (!omitTd) t->pos = write_temporal_delimiter(t->buf);
+  t->st.frame_type = frameType;
+  return t;
+}
+
+static void alt_push(Mav1Encoder *e, uint8_t *data, size_t size, uint8_t *recon, const Mav1FrameStats *st) {
+  if (e->outmu) pthread_mutex_lock(e->outmu);
+  if (e->out_n == e->out_cap) {
+    e->out_cap = e->out_cap ? 2 * e->out_cap : 8;
+    e->outq = realloc(e->outq, sizeof(*e->outq) * e->out_cap);
+  }
+  struct AltPacket *p = &e->outq[e->out_n++];
+  p->data = data;
+  p->size = size;
+  p->recon = recon;
+  p->st = *st;
+  p->st.bytes = size;
+  if (e->outmu) pthread_mutex_unlock(e->outmu);
+}
+
+/* Completes the temporal unit (queued after its frames). */
+static void tu_close(Mav1Encoder *e, Tu *t, uint8_t *recon) {
+  q_run(e, ^{
+    alt_push(e, t->buf, t->pos, recon, &t->st);
+    free(t);
+  });
+}
+
+static void tu_show_existing(Mav1Encoder *e, Tu *t, int slot, uint8_t *recon) {
+  q_run(e, ^{
+    tu_reserve(t, 64);
+    t->pos += write_show_existing(slot, t->buf + t->pos);
+  });
+  tu_close(e, t, recon);
+}
+
+static void stats_add(Mav1FrameStats *a, const Mav1FrameStats *b) {
+  a->num_blocks += b->num_blocks;
+  a->num_inter_blocks += b->num_inter_blocks;
+  for (int k = 0; k < 16; k++) a->tool_use[k] += b->tool_use[k];
+  a->t_analysis += b->t_analysis;
+  a->t_recon += b->t_recon;
+  a->t_filter += b->t_filter;
+  a->t_entropy += b->t_entropy;
+}
+
 /* Codes one frame of the ALTREF driver: frame (packed I420, display index
  * disp), with LAST from lastSlot and ALTREF from arfSlot (-1: none).
  * Appends the frame OBU (and, for key frames, the TD and sequence header)
- * to *buf. */
+ * to the temporal unit t; with the writer queue the entropy coding and the
+ * append run there, after the frame's core. */
 static void alt_code(Mav1Encoder *e, const uint8_t *frame, int disp, int isKey, int kind, int lastSlot, int arfSlot,
-                     int refresh, int hidden, uint8_t **buf, size_t *pos, size_t *cap) {
+                     int refresh, int hidden, Tu *t) {
   int cw = (e->w + 1) >> 1, ch = (e->h + 1) >> 1;
   const uint8_t *pl[3] = {frame, frame + (size_t)e->w * e->h, frame + (size_t)e->w * e->h + (size_t)cw * ch};
   int st[3] = {e->w, cw, cw};
@@ -669,102 +834,59 @@ static void alt_code(Mav1Encoder *e, const uint8_t *frame, int disp, int isKey, 
     e->ref_gen = e->slot_gen[lastSlot];
     e->gold_gen = arfSlot >= 0 ? e->slot_gen[arfSlot] : 0;
   }
-  uint8_t *tile = NULL;
-  size_t tileSize = run_frame(e, isKey, &tile);
-  double t3 = now();
-  if (*pos + tileSize + 1024 > *cap) {
-    *cap = *pos + tileSize + 1024;
-    *buf = realloc(*buf, *cap);
-  }
-  if (isKey) {
-    *pos += write_temporal_delimiter(*buf + *pos);
-    *pos += write_sequence_header(e, *buf + *pos);
-  }
-  *pos += write_frame_obu(e, tile, tileSize, *buf + *pos);
-  free(tile);
-  e->last.t_entropy += now() - t3;
-  if (h->refresh_frame_flags) e->gen++;
-  for (int s = 0; s < 8; s++)
-    if ((h->refresh_frame_flags >> s) & 1) {
-      e->slot_gen[s] = e->gen;
-      e->slot_hint[s] = h->order_hint;
-      if (e->slot[s].base) memcpy(e->slot[s].base, e->rec.base, e->frame_bytes);
+  memset(&e->last, 0, sizeof e->last);
+  run_frame_core(e, isKey);
+  Mav1FrameStats fst = e->last;
+  WCtx *c = NULL;
+  Mav1Encoder *s = e->wq ? snap_take(e, &c) : e;
+  q_run(e, ^{
+    Mav1FrameStats st2 = fst;
+    uint8_t *tile = NULL;
+    size_t tileSize = frame_tail(s, &tile, &st2);
+    double t3 = now();
+    tu_reserve(t, tileSize + 1024);
+    if (isKey) {
+      t->pos += write_temporal_delimiter(t->buf + t->pos);
+      t->pos += write_sequence_header(s, t->buf + t->pos);
     }
-}
-
-static void alt_push(Mav1Encoder *e, uint8_t *data, size_t size, uint8_t *recon, const Mav1FrameStats *st) {
-  if (e->out_n == e->out_cap) {
-    e->out_cap = e->out_cap ? 2 * e->out_cap : 8;
-    e->outq = realloc(e->outq, sizeof(*e->outq) * e->out_cap);
-  }
-  struct AltPacket *p = &e->outq[e->out_n++];
-  p->data = data;
-  p->size = size;
-  p->recon = recon;
-  p->st = *st;
-  p->st.bytes = size;
-}
-
-static void stats_add(Mav1FrameStats *a, const Mav1FrameStats *b) {
-  a->num_blocks += b->num_blocks;
-  a->num_inter_blocks += b->num_inter_blocks;
-  for (int k = 0; k < 16; k++) a->tool_use[k] += b->tool_use[k];
-  a->t_analysis += b->t_analysis;
-  a->t_recon += b->t_recon;
-  a->t_filter += b->t_filter;
-  a->t_entropy += b->t_entropy;
-}
-
-/* Pyramid mini-GOP (cfg.leaf): the temporal unit being assembled. Hidden
- * frames are appended to it; a shown frame (or show_existing_frame header)
- * completes it. Statistics of hidden frames go with the next shown frame. */
-typedef struct { uint8_t *buf; size_t pos, cap; Mav1FrameStats st; } PyrTu;
-
-static void pyr_open(PyrTu *t) {
-  if (t->buf) return;
-  t->cap = 1024;
-  t->buf = malloc(t->cap);
-  t->pos = write_temporal_delimiter(t->buf);
-}
-
-static void pyr_close(Mav1Encoder *e, PyrTu *t, uint8_t *recon) {
-  t->st.frame_type = 1;
-  alt_push(e, t->buf, t->pos, recon, &t->st);
-  memset(t, 0, sizeof *t);
-}
-
-static void pyr_show_existing(Mav1Encoder *e, PyrTu *t, int slot, uint8_t *recon) {
-  pyr_open(t);
-  if (t->pos + 64 > t->cap) t->buf = realloc(t->buf, t->cap = t->pos + 64);
-  t->pos += write_show_existing(slot, t->buf + t->pos);
-  pyr_close(e, t, recon);
+    t->pos += write_frame_obu(s, tile, tileSize, t->buf + t->pos);
+    free(tile);
+    st2.t_entropy += now() - t3;
+    stats_add(&t->st, &st2);
+    if (c) dispatch_semaphore_signal((dispatch_semaphore_t)c->free);
+  });
+  if (h->refresh_frame_flags) e->gen++;
+  for (int k = 0; k < 8; k++)
+    if ((h->refresh_frame_flags >> k) & 1) {
+      e->slot_gen[k] = e->gen;
+      e->slot_hint[k] = h->order_hint;
+      if (e->slot[k].base) memcpy(e->slot[k].base, e->rec.base, e->frame_bytes);
+    }
 }
 
 /* Codes the display frames strictly between a (slot as) and b (slot bs),
  * both already coded. With 3 or more frames the middle one is coded first
  * as a hidden reference (slot 4 + depth, predicting from a and b), then each
  * half recursively; otherwise the frames are non-reference leaf frames. */
-static void pyr_code(Mav1Encoder *e, PyrTu *t, int a, int as, int b, int bs, int depth) {
+static Tu *pyr_code(Mav1Encoder *e, Tu *t, int a, int as, int b, int bs, int depth) {
   int d0 = e->in_disp - e->inq_n;
   if (b - a - 1 >= 3 && depth < 4) {
     int m = (a + b) / 2, ms = 4 + depth;
-    memset(&e->last, 0, sizeof e->last);
-    pyr_open(t);
-    alt_code(e, e->inq[m - d0], m, 0, 3, as, bs, 1 << ms, 1, &t->buf, &t->pos, &t->cap);
+    if (!t) t = tu_new(1, 0);
+    alt_code(e, e->inq[m - d0], m, 0, 3, as, bs, 1 << ms, 1, t);
     uint8_t *rec = pack_frame(e, e->rec.base);
-    stats_add(&t->st, &e->last);
-    pyr_code(e, t, a, as, m, ms, depth + 1);
-    pyr_show_existing(e, t, ms, rec);
-    pyr_code(e, t, m, ms, b, bs, depth + 1);
-    return;
+    t = pyr_code(e, t, a, as, m, ms, depth + 1);
+    if (!t) t = tu_new(1, 0);
+    tu_show_existing(e, t, ms, rec);
+    return pyr_code(e, NULL, m, ms, b, bs, depth + 1);
   }
   for (int d = a + 1; d < b; d++) {
-    memset(&e->last, 0, sizeof e->last);
-    pyr_open(t);
-    alt_code(e, e->inq[d - d0], d, 0, 2, as, bs, 0, 0, &t->buf, &t->pos, &t->cap);
-    stats_add(&t->st, &e->last);
-    pyr_close(e, t, pack_frame(e, e->rec.base));
+    if (!t) t = tu_new(1, 0);
+    alt_code(e, e->inq[d - d0], d, 0, 2, as, bs, 0, 0, t);
+    tu_close(e, t, pack_frame(e, e->rec.base));
+    t = NULL;
   }
+  return t;
 }
 
 /* Codes the queued frames that can be coded (all of them when flushing). */
@@ -781,58 +903,31 @@ static void alt_drain(Mav1Encoder *e, int flush) {
     }
     if (isKey || L == 1) {
       /* key frame, or a regular frame predicting from the anchor */
-      uint8_t *buf = NULL;
-      size_t pos = 0, cap = 0;
-      if (!isKey) {
-        cap = 1024;
-        buf = malloc(cap);
-        pos = write_temporal_delimiter(buf);
-      }
-      memset(&e->last, 0, sizeof e->last);
-      e->last.frame_type = !isKey;
-      alt_code(e, e->inq[0], d0, isKey, 0, e->anchor_slot, -1, 0x01, 0, &buf, &pos, &cap);
+      Tu *t = tu_new(!isKey, isKey);
+      alt_code(e, e->inq[0], d0, isKey, 0, e->anchor_slot, -1, 0x01, 0, t);
       e->anchor_slot = 0;
-      alt_push(e, buf, pos, pack_frame(e, e->rec.base), &e->last);
+      tu_close(e, t, pack_frame(e, e->rec.base));
     } else if (e->cfg.leaf) {
       int arfSlot = e->anchor_slot == 2 ? 3 : 2;
-      PyrTu tu = {0};
-      memset(&e->last, 0, sizeof e->last);
-      e->last.frame_type = 1;
-      pyr_open(&tu);
-      alt_code(e, e->inq[L - 1], d0 + L - 1, 0, 1, e->anchor_slot, -1, 1 << arfSlot, 1, &tu.buf, &tu.pos, &tu.cap);
+      Tu *t = tu_new(1, 0);
+      alt_code(e, e->inq[L - 1], d0 + L - 1, 0, 1, e->anchor_slot, -1, 1 << arfSlot, 1, t);
       uint8_t *arfRecon = pack_frame(e, e->rec.base);
-      stats_add(&tu.st, &e->last);
-      pyr_code(e, &tu, d0 - 1, e->anchor_slot, d0 + L - 1, arfSlot, 0);
-      pyr_show_existing(e, &tu, arfSlot, arfRecon);
+      t = pyr_code(e, t, d0 - 1, e->anchor_slot, d0 + L - 1, arfSlot, 0);
+      if (!t) t = tu_new(1, 0);
+      tu_show_existing(e, t, arfSlot, arfRecon);
       e->anchor_slot = arfSlot;
     } else {
       int arfSlot = e->anchor_slot == 2 ? 3 : 2;
-      Mav1FrameStats arfSt;
-      uint8_t *buf = malloc(1024);
-      size_t pos = write_temporal_delimiter(buf), cap = 1024;
-      memset(&e->last, 0, sizeof e->last);
-      e->last.frame_type = 1;
-      alt_code(e, e->inq[L - 1], d0 + L - 1, 0, 1, e->anchor_slot, -1, 1 << arfSlot, 1, &buf, &pos, &cap);
+      Tu *t = tu_new(1, 0);
+      alt_code(e, e->inq[L - 1], d0 + L - 1, 0, 1, e->anchor_slot, -1, 1 << arfSlot, 1, t);
       uint8_t *arfRecon = pack_frame(e, e->rec.base);
-      arfSt = e->last;
       for (int i = 0; i < L - 1; i++) {
-        if (i > 0) {
-          buf = malloc(1024);
-          cap = 1024;
-          pos = write_temporal_delimiter(buf);
-        }
-        memset(&e->last, 0, sizeof e->last);
-        e->last.frame_type = 1;
-        alt_code(e, e->inq[i], d0 + i, 0, 2, i == 0 ? e->anchor_slot : 0, arfSlot, 0x01, 0, &buf, &pos, &cap);
-        if (i == 0) stats_add(&e->last, &arfSt);
-        alt_push(e, buf, pos, pack_frame(e, e->rec.base), &e->last);
+        if (i > 0) t = tu_new(1, 0);
+        alt_code(e, e->inq[i], d0 + i, 0, 2, i == 0 ? e->anchor_slot : 0, arfSlot, 0x01, 0, t);
+        tu_close(e, t, pack_frame(e, e->rec.base));
       }
-      buf = malloc(64);
-      pos = write_temporal_delimiter(buf);
-      pos += write_show_existing(arfSlot, buf + pos);
-      memset(&e->last, 0, sizeof e->last);
-      e->last.frame_type = 1;
-      alt_push(e, buf, pos, arfRecon, &e->last);
+      t = tu_new(1, 0);
+      tu_show_existing(e, t, arfSlot, arfRecon);
       e->anchor_slot = arfSlot;
     }
     for (int i = 0; i < L; i++) free(e->inq[i]);
@@ -859,6 +954,7 @@ int mav1_send_frame(Mav1Encoder *e, const uint8_t *const planes[3], const int st
     e->inq[e->inq_n++] = f;
     e->in_disp++;
   }
+  if (!planes) e->flushing = 1;
   alt_drain(e, planes == NULL);
   return 0;
 }
@@ -871,15 +967,21 @@ int mav1_receive_packet(Mav1Encoder *e, uint8_t **out, size_t *outSize) {
     *outSize = e->pend_size;
     return 0;
   }
+  /* with the writer queue, packets come out as their frames complete;
+   * when flushing, every queued one is waited for */
+  if (e->wq && e->flushing) dispatch_sync((dispatch_queue_t)e->wq, ^{});
+  if (e->outmu) pthread_mutex_lock(e->outmu);
   if (e->out_pos == e->out_n) {
     e->out_pos = e->out_n = 0;
+    if (e->outmu) pthread_mutex_unlock(e->outmu);
     return 1;
   }
-  struct AltPacket *p = &e->outq[e->out_pos++];
-  *out = p->data;
-  *outSize = p->size;
+  struct AltPacket p = e->outq[e->out_pos++];
+  if (e->outmu) pthread_mutex_unlock(e->outmu);
+  *out = p.data;
+  *outSize = p.size;
   free(e->shown_recon);
-  e->shown_recon = p->recon;
-  e->last = p->st;
+  e->shown_recon = p.recon;
+  e->last = p.st;
   return 0;
 }

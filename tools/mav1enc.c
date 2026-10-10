@@ -103,7 +103,7 @@ int main(int argc, char **argv) {
   int cw = (w + 1) / 2, ch = (h + 1) / 2;
   size_t ysz = (size_t)w * h, csz = (size_t)cw * ch;
   /* input frames are kept until their temporal unit comes out (reordering) */
-  int ring = (turbo && altref < 2 ? 2 : altref) + 2;
+  int ring = (turbo && altref < 2 ? 2 : altref) + 8; /* + frames whose packets wait for the writer queue */
   size_t fsz = ysz + 2 * csz;
   uint8_t *frames = malloc(fsz * ring), *rec = malloc(fsz);
   int count = 0, sent = 0, eos = 0;

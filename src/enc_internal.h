@@ -12,6 +12,7 @@
 #include "mav1.h"
 
 typedef struct Backend Backend;
+struct Mav1Encoder;
 
 /* Per 4x4 (mi) information kept for context derivation. */
 typedef struct {
@@ -49,6 +50,18 @@ typedef struct {
   uint8_t *base;    /* page aligned allocation */
   size_t size;
 } Buf;
+
+/* Writer context (turbo): the per-frame buffers the tile writer reads,
+ * handed over from the frame core so that the entropy coding of a frame runs
+ * on the writer queue while the next frame's core runs. */
+typedef struct WCtx {
+  Buf blocks, sbs, coefs, params, lrunits;
+  MiInfo *mi;
+  int8_t *cdef_idx, *cdef_choice;
+  void *free;              /* dispatch semaphore: the context is not in use */
+  struct Mav1Encoder *snap; /* encoder state the writer job sees */
+} WCtx;
+#define NUM_WCTX 3
 
 struct Mav1Encoder {
   Mav1Config cfg;
@@ -92,6 +105,12 @@ struct Mav1Encoder {
   uint8_t *shown_recon; /* recon of the frame shown by the last received packet */
   int pending;          /* non-altref send/receive: a packet waits */
   uint8_t *pend_data; size_t pend_size;
+
+  /* turbo: entropy coding and bitstream assembly on a serial queue */
+  void *wq;             /* dispatch queue (NULL: everything inline) */
+  WCtx wctx[NUM_WCTX];
+  int wnext, flushing;
+  void *outmu;          /* pthread mutex of outq */
 
   /* statistics of the last frame */
   Mav1FrameStats last;
