@@ -123,7 +123,7 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
              (long)lam * mode_bits8(mode) / 8;
     if (best < 0 || c < best) { best = c; bestMode = mode; }
   }
-  if (intra_is_directional(bestMode)) {
+  if (intra_is_directional(bestMode) && !fp->fast) {
     int base = bestMode;
     for (int d = -MAX_ANGLE_DELTA; d <= MAX_ANGLE_DELTA; d++) {
       if (d == 0) continue;
@@ -132,11 +132,32 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
       if (c < best) { best = c; bestDelta = d; }
     }
   }
-  /* chroma intra */
   int cx = x >> 1, cy = y >> 1, clw = lw - 1, clh = lh - 1;
-  long bestUv = -1;
+  long interCost = -1;
+  int mvr = 0, mvc = 0;
+  if (!fp->frame_is_intra) {
+    int sbIdx = (miRow >> 4) * fp->sb_cols + (miCol >> 4);
+    DEV const int32_t *mvp = mvField + (sbIdx * NUM_NODES + mvNode) * 2;
+    mvr = mvp[0];
+    mvc = mvp[1];
+    DEV int32_t *tmp = scratch + A_TMP;
+    predict_inter_block(ref + fp->offset[0], fp->stride[0], fp->frame_w, fp->frame_h, pred, 64, x, y, w, h,
+                        mvr, mvc, 0, 0, EIGHTTAP, tmp);
+    interCost = block_satd(src + fp->offset[0] + y * fp->stride[0] + x, fp->stride[0], pred, w, h);
+    for (int p = 1; p < 3; p++) {
+      predict_inter_block(ref + fp->offset[p], fp->stride[p], fp->frame_w, fp->frame_h, pred, 64, cx, cy,
+                          w >> 1, h >> 1, mvr, mvc, 1, 1, EIGHTTAP, tmp);
+      interCost += block_satd(src + fp->offset[p] + cy * fp->stride[p] + cx, fp->stride[p], pred, w >> 1, h >> 1);
+    }
+    interCost += (long)lam * (4 + mv_bits8(mvr, mvc)) / 8;
+  }
+  /* chroma costs are >= 0: if luma intra alone already loses to inter, the
+   * chroma search cannot change the decision (fast preset prunes it) */
+  int skipUv = fp->fast && interCost >= 0 && best + (long)lam * 16 / 8 >= interCost;
+  /* chroma intra */
+  long bestUv = skipUv ? 0 : -1;
   int bestUvMode = DC_PRED;
-  for (int m = DC_PRED; m <= PAETH_PRED; m++) {
+  for (int m = DC_PRED; m <= PAETH_PRED && !skipUv; m++) {
     if (intra_is_directional(m) && m != V_PRED && m != H_PRED && m != bestMode) continue;
     int delta = (m == bestMode) ? bestDelta : 0;
     long c = intra_satd(fp, src + fp->offset[1], fp->stride[1], 1, cx, cy, clw, clh, m, delta, pred) +
@@ -144,7 +165,7 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
              (long)lam * (m == DC_PRED ? 8 : 24) / 8;
     if (bestUv < 0 || c < bestUv) { bestUv = c; bestUvMode = m; }
   }
-  if (cfl_allowed(bsize, fp->lossless)) {
+  if (!skipUv && cfl_allowed(bsize, fp->lossless)) {
     /* CfL estimated from source luma (recon picks the final alphas). */
     DEV int32_t *dc = scratch + A_TMP;
     int cw = 1 << clw, ch = 1 << clh;
@@ -179,20 +200,7 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
   out->tx_type = DCT_DCT;
   long cost = best + bestUv + (long)lam * (fp->frame_is_intra ? 0 : 16) / 8;
 
-  if (!fp->frame_is_intra) {
-    int sbIdx = (miRow >> 4) * fp->sb_cols + (miCol >> 4);
-    DEV const int32_t *mvp = mvField + (sbIdx * NUM_NODES + mvNode) * 2;
-    int mvr = mvp[0], mvc = mvp[1];
-    DEV int32_t *tmp = scratch + A_TMP;
-    predict_inter_block(ref + fp->offset[0], fp->stride[0], fp->frame_w, fp->frame_h, pred, 64, x, y, w, h,
-                        mvr, mvc, 0, 0, EIGHTTAP, tmp);
-    long interCost = block_satd(src + fp->offset[0] + y * fp->stride[0] + x, fp->stride[0], pred, w, h);
-    for (int p = 1; p < 3; p++) {
-      predict_inter_block(ref + fp->offset[p], fp->stride[p], fp->frame_w, fp->frame_h, pred, 64, cx, cy,
-                          w >> 1, h >> 1, mvr, mvc, 1, 1, EIGHTTAP, tmp);
-      interCost += block_satd(src + fp->offset[p] + cy * fp->stride[p] + cx, fp->stride[p], pred, w >> 1, h >> 1);
-    }
-    interCost += (long)lam * (4 + mv_bits8(mvr, mvc)) / 8;
+  if (interCost >= 0) {
     if (interCost < cost) {
       cost = interCost;
       out->is_inter = 1;
@@ -311,6 +319,7 @@ INLINE void analyze_sb(DEV const FrameParams *fp, int sbIdx, DEV const uint8_t *
         if (level == 0 && (p == PARTITION_HORZ_4 || p == PARTITION_VERT_4)) {
           /* 64x16 / 16x64 are allowed */
         }
+        if (fp->fast && p > PARTITION_SPLIT) continue; /* A/B and 4-way */
         if (level == 2 && (p == PARTITION_HORZ_4 || p == PARTITION_VERT_4)) continue; /* 16x4 */
         if (!(hasRows && hasCols)) {
           if (!((p == PARTITION_HORZ && hasCols && !hasRows) || (p == PARTITION_VERT && hasRows && !hasCols)))

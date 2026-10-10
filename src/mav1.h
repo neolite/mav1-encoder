@@ -27,6 +27,7 @@ typedef struct {
   int loop_filter;     /* deblocking filter */
   int cdef;            /* constrained directional enhancement filter */
   int restoration;     /* loop restoration (Wiener / self-guided) */
+  int fast;              /* reduced mode/partition search */
   int switchable_interp; /* per-block dual interpolation filter choice */
   int lr_test;         /* testing: force Wiener / self-guided on alternate units, ignoring rate */
   int me_range;        /* full-pel motion search range */

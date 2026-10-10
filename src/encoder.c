@@ -193,6 +193,7 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   fp->lossless = q == 0;
   fp->tx_mode_select = q != 0 && e->cfg.tx_depth;
   fp->switchable_interp = !isKey && e->cfg.switchable_interp;
+  fp->fast = e->cfg.fast;
   long acq = fp->ac_q[0];
   fp->lambda = (int32_t)(acq * acq * 256 / 430);
   fp->frame_w = e->w;
