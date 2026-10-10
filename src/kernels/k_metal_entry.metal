@@ -355,6 +355,71 @@ INLINE int coop_intra_satd(DEV const uint8_t *px, int stride, int x, int y, int 
   return simd_sum(s);
 }
 
+/* CfL cost of chroma plane p (the eval_block CfL step, lanes over samples):
+ * DC prediction (a constant), best alpha by SSE over -16..16 (first
+ * minimum), SATD of that prediction. */
+INLINE int coop_cfl_satd(DEV const FrameParams *fp, DEV const uint8_t *src, int p, int cx, int cy, int clw, int clh,
+                         int maxLumaW, int maxLumaH, threadgroup int *A, threadgroup int *L, uint lane) {
+  int cw = 1 << clw, ch = 1 << clh;
+  DEV const uint8_t *pp = src + fp->offset[p];
+  int stride = fp->stride[p], ls = fp->stride[0];
+  DEV const uint8_t *luma = src + fp->offset[0];
+  coop_edges(fp, pp, stride, p, cx, cy, cw, ch, A, L, lane);
+  int haveLeft = cx > 0, haveAbove = cy > 0, dcAvg, sum = 0;
+  if (haveLeft && haveAbove) {
+    for (int k = 0; k < ch; k++) sum += L[k];
+    for (int k = 0; k < cw; k++) sum += A[k];
+    dcAvg = (sum + ((cw + ch) >> 1)) / (cw + ch);
+  } else if (haveLeft) {
+    for (int k = 0; k < ch; k++) sum += L[k];
+    dcAvg = Clip1((sum + (ch >> 1)) >> clh);
+  } else if (haveAbove) {
+    for (int k = 0; k < cw; k++) sum += A[k];
+    dcAvg = Clip1((sum + (cw >> 1)) >> clw);
+  } else {
+    dcAvg = 1 << 7;
+  }
+  int n = cw * ch, lsum = 0;
+  for (int t = (int)lane; t < n; t += 32) {
+    int i = t >> clw, j = t & (cw - 1);
+    DEV const uint8_t *l = luma + k_min((cy + i) << 1, maxLumaH - 2) * ls + k_min((cx + j) << 1, maxLumaW - 2);
+    lsum += ((int)l[0] + l[1] + l[ls] + l[ls + 1]) << 1;
+  }
+  int avg = Round2(simd_sum(lsum), clw + clh);
+  int sse[33];
+  for (int a = 0; a < 33; a++) sse[a] = 0;
+  for (int t = (int)lane; t < n; t += 32) {
+    int i = t >> clw, j = t & (cw - 1);
+    DEV const uint8_t *l = luma + k_min((cy + i) << 1, maxLumaH - 2) * ls + k_min((cx + j) << 1, maxLumaW - 2);
+    int v = (((int)l[0] + l[1] + l[ls] + l[ls + 1]) << 1) - avg;
+    int s0 = pp[(cy + i) * stride + cx + j];
+    for (int a = 0; a < 33; a++) {
+      int d = Clip3(0, 255, dcAvg + Round2Signed((a - 16) * v, 6)) - s0;
+      sse[a] += d * d;
+    }
+  }
+  int bestA = 0;
+  long best = -1;
+  for (int a = 0; a < 33; a++) {
+    long e2 = simd_sum(sse[a]);
+    if (best < 0 || e2 < best) { best = e2; bestA = a - 16; }
+  }
+  int nu = cw >> 2, nUnits = nu * (ch >> 2), sat = 0;
+  for (int u = (int)lane; u < nUnits; u += 32) {
+    int ux = (u % nu) * 4, uy = (u / nu) * 4;
+    int32_t d[16];
+    for (int r = 0; r < 4; r++)
+      for (int c = 0; c < 4; c++) {
+        int i = uy + r, j = ux + c;
+        DEV const uint8_t *l = luma + k_min((cy + i) << 1, maxLumaH - 2) * ls + k_min((cx + j) << 1, maxLumaW - 2);
+        int v = (((int)l[0] + l[1] + l[ls] + l[ls + 1]) << 1) - avg;
+        d[r * 4 + c] = (int)pp[(cy + i) * stride + cx + j] - Clip3(0, 255, dcAvg + Round2Signed(bestA * v, 6));
+      }
+    sat += satd4x4(d);
+  }
+  return simd_sum(sat);
+}
+
 /* eval_block( ) for one SIMD group. */
 INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
                             DEV const int32_t *mvField, int mvNode, int miRow, int miCol, int bsize,
@@ -421,25 +486,8 @@ INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, D
       if (bestUv < 0 || c < bestUv) { bestUv = c; bestUvMode = m; }
     }
     if (cfl_allowed(bsize, fp->lossless)) {
-      /* CfL: serial on lane 0 (the eval_block code), broadcast */
-      long c = 0;
-      if (lane == 0) {
-        DEV int32_t *dc = tmpArea;
-        int cw = 1 << clw, ch = 1 << clh;
-        c = (long)lam * 40 / 8;
-        for (int p = 1; p < 3; p++) {
-          intra_satd(fp, src + fp->offset[p], fp->stride[p], p, cx, cy, clw, clh, DC_PRED, 0, pred, ps);
-          for (int i = 0; i < ch; i++)
-            for (int j = 0; j < cw; j++) dc[i * cw + j] = pred[i * ps + j];
-          DEV const uint8_t *sp = src + fp->offset[p] + cy * fp->stride[p] + cx;
-          int al = cfl_best_alpha(src + fp->offset[0], fp->stride[0], cx, cy, x + w, y + h, clw, clh, dc, sp,
-                                  fp->stride[p], pred, ps, 0);
-          cfl_predict(src + fp->offset[0], fp->stride[0], cx, cy, x + w, y + h, clw, clh, al, dc, pred, ps);
-          c += block_satd_s(sp, fp->stride[p], pred, ps, cw, ch);
-        }
-      }
-      int lo = simd_broadcast_first((int)(c & 0xFFFFFFFF)), hi = simd_broadcast_first((int)(c >> 32));
-      c = ((long)hi << 32) | (long)(uint)lo;
+      long c = (long)lam * 40 / 8;
+      for (int p = 1; p < 3; p++) c += coop_cfl_satd(fp, src, p, cx, cy, clw, clh, x + w, y + h, A, L, lane);
       if (c < bestUv) { bestUv = c; bestUvMode = UV_CFL_PRED; }
     }
   }
