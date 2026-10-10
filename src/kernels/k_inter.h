@@ -8,6 +8,67 @@
 
 #include "k_common.h"
 
+
+#ifndef __METAL_VERSION__
+/* CPU fast path of both predictors (unscaled references: the filter phases
+ * are constant over the block). Same arithmetic as the spec loops: rows
+ * that only meet zero vertical taps are skipped, interior rows read
+ * without clamping. Writes Clip1( Round2( ., round1 ) ) bytes to dst8, or
+ * Round2( ., round1 ) ints to dst32. */
+static inline void inter_fast(const uint8_t *ref, int refStride, int lastX, int lastY, int startX, int startY, int w,
+                              int h, int fh, int fv, int round1, uint8_t *dst8, int32_t *dst32, int dstStride,
+                              int32_t *tmp) {
+  int x0 = (startX >> 10) - 3, y0 = (startY >> 10) - 3;
+  int px = (startX >> 6) & SUBPEL_MASK, py = (startY >> 6) & SUBPEL_MASK;
+  int fH[8], fV[8];
+  for (int t = 0; t < 8; t++) { fH[t] = Subpel_Filters[fh][px][t]; fV[t] = Subpel_Filters[fv][py][t]; }
+  int rlo = py ? 0 : 3, rhi = py ? h + 7 : h + 3;
+  int interior = x0 >= 0 && x0 + w + 7 <= lastX + 1;
+  int clipX[64 + 8];
+  if (!interior)
+    for (int c = 0; c < w + 7; c++) clipX[c] = Clip3(0, lastX, x0 + c);
+  for (int r = rlo; r < rhi; r++) {
+    const uint8_t *row = ref + Clip3(0, lastY, y0 + r) * refStride;
+    int32_t *t = tmp + r * w;
+    if (!px) {
+      for (int c = 0; c < w; c++) t[c] = (int32_t)(interior ? row[x0 + 3 + c] : row[clipX[c + 3]]) << 4;
+    } else if (interior) {
+      const uint8_t *q = row + x0;
+      for (int c = 0; c < w; c++) {
+        int a = 0;
+        for (int k = 0; k < 8; k++) a += fH[k] * q[c + k];
+        t[c] = (a + 4) >> 3;
+      }
+    } else {
+      for (int c = 0; c < w; c++) {
+        int a = 0;
+        for (int k = 0; k < 8; k++) a += fH[k] * row[clipX[c + k]];
+        t[c] = (a + 4) >> 3;
+      }
+    }
+  }
+  int rr = 1 << (round1 - 1);
+  for (int r = 0; r < h; r++) {
+    const int32_t *t = tmp + r * w;
+    if (!py) {
+      for (int c = 0; c < w; c++) {
+        int v = (t[3 * w + c] * 128 + rr) >> round1;
+        if (dst8) dst8[r * dstStride + c] = (uint8_t)Clip1(v);
+        else dst32[r * dstStride + c] = v;
+      }
+    } else {
+      for (int c = 0; c < w; c++) {
+        int a = 0;
+        for (int k = 0; k < 8; k++) a += fV[k] * t[k * w + c];
+        int v = (a + rr) >> round1;
+        if (dst8) dst8[r * dstStride + c] = (uint8_t)Clip1(v);
+        else dst32[r * dstStride + c] = v;
+      }
+    }
+  }
+}
+#endif
+
 /*
  * Predicts a w x h block of one plane at sample position (x, y) and writes
  * Clip1( pred ) to dst (top-left of the block, row stride dstStride). `refW`/`refH` are the reference frame's luma
@@ -40,6 +101,13 @@ INLINE void predict_inter_block(DEV const uint8_t *ref, int refStride, int refW,
   if (w <= 4) { if (fh == EIGHTTAP || fh == EIGHTTAP_SHARP) fh = 4; else if (fh == EIGHTTAP_SMOOTH) fh = 5; }
   if (h <= 4) { if (fv == EIGHTTAP || fv == EIGHTTAP_SHARP) fv = 4; else if (fv == EIGHTTAP_SMOOTH) fv = 5; }
 
+#ifndef __METAL_VERSION__
+  if (w <= 64) {
+    (void)intermediateHeight;
+    inter_fast(ref, refStride, lastX, lastY, startX, startY, w, h, fh, fv, InterRound1, dst, NULL, dstStride, tmp);
+    return;
+  }
+#endif
   for (int r = 0; r < intermediateHeight; r++) {
     int ry = Clip3(0, lastY, (startY >> 10) + r - 3);
     for (int c = 0; c < w; c++) {
@@ -92,6 +160,13 @@ INLINE void predict_inter_raw(DEV const uint8_t *ref, int refStride, int refW, i
   if (w <= 4) { if (fh == EIGHTTAP || fh == EIGHTTAP_SHARP) fh = 4; else if (fh == EIGHTTAP_SMOOTH) fh = 5; }
   if (h <= 4) { if (fv == EIGHTTAP || fv == EIGHTTAP_SHARP) fv = 4; else if (fv == EIGHTTAP_SMOOTH) fv = 5; }
 
+#ifndef __METAL_VERSION__
+  if (w <= 64) {
+    (void)intermediateHeight;
+    inter_fast(ref, refStride, lastX, lastY, startX, startY, w, h, fh, fv, InterRound1, NULL, dst, dstStride, tmp);
+    return;
+  }
+#endif
   for (int r = 0; r < intermediateHeight; r++) {
     int ry = Clip3(0, lastY, (startY >> 10) + r - 3);
     for (int c = 0; c < w; c++) {
