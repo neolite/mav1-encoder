@@ -269,9 +269,9 @@ static void mtl_filter(Backend *b, struct Mav1Encoder *e) {
     [enc setBuffer:wrap(s, &e->lfmask) offset:0 atIndex:2];
     NSUInteger tg = MIN((NSUInteger)64, s.lf.maxTotalThreadsPerThreadgroup);
     for (int pass = 0; pass < 2; pass++) {
-      int lines = pass == 0 ? e->mi_rows : e->mi_cols;
+      int lines = pass == 0 ? e->mi_rows : e->mi_cols, segs = ((pass == 0 ? e->mi_cols : e->mi_rows) + 15) >> 4;
       [enc setBytes:&pass length:sizeof pass atIndex:3];
-      [enc dispatchThreads:MTLSizeMake(3 * lines, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+      [enc dispatchThreads:MTLSizeMake(3 * lines * segs, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
       [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     }
     if (e->num_cdef_presets) {
@@ -281,11 +281,12 @@ static void mtl_filter(Backend *b, struct Mav1Encoder *e) {
       [enc setBuffer:wrap(s, &e->rec) offset:0 atIndex:1];
       [enc setBuffer:wrap(s, &e->lfmask) offset:0 atIndex:3];
       NSUInteger tc = MIN((NSUInteger)64, s.cdef.maxTotalThreadsPerThreadgroup);
-      for (int k = 0; k < e->num_cdef_presets; k++) {
-        [enc setBuffer:wrap(s, &e->cdefbuf) offset:(NSUInteger)k * e->frame_bytes atIndex:2];
-        [enc setBytes:&k length:sizeof k atIndex:4];
-        [enc dispatchThreads:MTLSizeMake(bc * br, 1, 1) threadsPerThreadgroup:MTLSizeMake(tc, 1, 1)];
-      }
+      int np = e->num_cdef_presets;
+      long fb = (long)e->frame_bytes;
+      [enc setBuffer:wrap(s, &e->cdefbuf) offset:0 atIndex:2];
+      [enc setBytes:&np length:sizeof np atIndex:4];
+      [enc setBytes:&fb length:sizeof fb atIndex:5];
+      [enc dispatchThreads:MTLSizeMake(bc * br, 1, 1) threadsPerThreadgroup:MTLSizeMake(tc, 1, 1)];
     }
   });
 }

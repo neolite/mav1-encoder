@@ -11,11 +11,13 @@ kernel void mav1_lf(device const FrameParams *fp [[buffer(0)]],
                     device const uint8_t *info [[buffer(2)]],
                     constant int &pass [[buffer(3)]],
                     uint gid [[thread_position_in_grid]]) {
-  int lines = pass == 0 ? fp->mi_rows : fp->mi_cols;
-  if ((int)gid >= 3 * lines) return;
-  int plane = (int)gid / lines, line = (int)gid % lines;
+  /* one thread per (plane, line, 16-mi segment) */
+  int lines = pass == 0 ? fp->mi_rows : fp->mi_cols, segs = ((pass == 0 ? fp->mi_cols : fp->mi_rows) + 15) >> 4;
+  if ((int)gid >= 3 * lines * segs) return;
+  int seg = (int)gid % segs, pl = (int)gid / segs;
+  int plane = pl / lines, line = pl % lines;
   if (plane > 0 && (line & 1)) return;
-  lf_line(fp, rec, info, plane, pass, line);
+  lf_line_seg(fp, rec, info, plane, pass, line, seg * 16, seg * 16 + 16);
 }
 
 kernel void mav1_lr(device const FrameParams *fp [[buffer(0)]],
@@ -35,11 +37,12 @@ kernel void mav1_cdef(device const FrameParams *fp [[buffer(0)]],
                       device const uint8_t *cur [[buffer(1)]],
                       device uint8_t *out [[buffer(2)]],
                       device const uint8_t *info [[buffer(3)]],
-                      constant int &idx [[buffer(4)]],
+                      constant int &n [[buffer(4)]],
+                      constant long &frameBytes [[buffer(5)]],
                       uint gid [[thread_position_in_grid]]) {
   int bc = (fp->mi_cols + 1) >> 1, br = (fp->mi_rows + 1) >> 1;
   if ((int)gid >= bc * br) return;
-  cdef_block(fp, cur, out, info, ((int)gid / bc) * 2, ((int)gid % bc) * 2, idx);
+  cdef_block_all(fp, cur, out, frameBytes, info, ((int)gid / bc) * 2, ((int)gid % bc) * 2, n);
 }
 
 /* SATD of 4x4 unit u of the node against the EIGHTTAP luma prediction at

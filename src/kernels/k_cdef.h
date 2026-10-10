@@ -124,4 +124,29 @@ INLINE void cdef_block(DEV const FrameParams *fp, DEV const uint8_t *cur, DEV ui
   cdef_filter(fp, cur, out, 2, r, c, priStr, secStr, fp->cdef_damping - 1, dir);
 }
 
+/* cdef_block( ) of the 8x8 block at mi (r, c) for parameter sets
+ * 0 .. n-1, set k written to out + k * frameBytes; the direction is
+ * computed once and an all-zero set is a copy (as filtering returns x). */
+INLINE void cdef_block_all(DEV const FrameParams *fp, DEV const uint8_t *cur, DEV uint8_t *out, long frameBytes,
+                           DEV const uint8_t *info, int r, int c, int n) {
+  int skip = (info[r * fp->mi_cols + c] >> 5) & 1;
+  int yDir = 0, var = 0;
+  if (!skip) cdef_direction(cur + fp->offset[0] + r * MI_SIZE * fp->stride[0] + c * MI_SIZE, fp->stride[0], &yDir, &var);
+  for (int idx = 0; idx < n; idx++) {
+    DEV uint8_t *o = out + (long)idx * frameBytes;
+    cdef_copy(fp, cur, o, r, c);
+    if (skip) continue;
+    int priStr = fp->cdef_y_pri[idx], secStr = fp->cdef_y_sec[idx];
+    int uvPri = fp->cdef_uv_pri[idx], uvSec = fp->cdef_uv_sec[idx];
+    if (priStr == 0 && secStr == 0 && uvPri == 0 && uvSec == 0) continue;
+    int dir = priStr == 0 ? 0 : yDir;
+    int varStr = (var >> 6) ? k_min(FloorLog2(var >> 6), 12) : 0;
+    priStr = var ? (priStr * (4 + varStr) + 8) >> 4 : 0;
+    cdef_filter(fp, cur, o, 0, r, c, priStr, secStr, fp->cdef_damping, dir);
+    dir = uvPri == 0 ? 0 : Cdef_Uv_Dir[1][1][yDir];
+    cdef_filter(fp, cur, o, 1, r, c, uvPri, uvSec, fp->cdef_damping - 1, dir);
+    cdef_filter(fp, cur, o, 2, r, c, uvPri, uvSec, fp->cdef_damping - 1, dir);
+  }
+}
+
 #endif

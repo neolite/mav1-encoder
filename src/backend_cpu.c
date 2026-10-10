@@ -164,12 +164,11 @@ static void cpu_filter(Backend *b, struct Mav1Encoder *e) {
     });
   }
   int bc = (e->mi_cols + 1) >> 1, br = (e->mi_rows + 1) >> 1;
-  for (int k = 0; k < e->num_cdef_presets; k++) {
-    uint8_t *out = e->cdefbuf.base + (size_t)k * e->frame_bytes;
+  if (e->num_cdef_presets)
     dispatch_apply((size_t)(bc * br), DISPATCH_APPLY_AUTO, ^(size_t i) {
-      cdef_block(fp, e->rec.base, out, info, (int)(i / bc) * 2, (int)(i % bc) * 2, k);
+      cdef_block_all(fp, e->rec.base, e->cdefbuf.base, (long)e->frame_bytes, info, (int)(i / bc) * 2, (int)(i % bc) * 2,
+                     e->num_cdef_presets);
     });
-  }
 }
 
 static void cpu_restore(Backend *b, struct Mav1Encoder *e) {

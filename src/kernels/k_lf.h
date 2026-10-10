@@ -97,17 +97,21 @@ INLINE void lf_sample(DEV uint8_t *px, int pitch /* step across the edge */, int
 
 /* Filters every edge along one line of 4x4 units. pass 0: `line` is a luma
  * mi row (step 1 << subY), edges at each mi col; pass 1: `line` is an mi col. */
-INLINE void lf_line(DEV const FrameParams *fp, DEV uint8_t *rec, DEV const uint8_t *miSizes, int plane, int pass,
-                    int line) {
+/* Edges of mi positions [k0, k1) of a line. The edges of one pass are
+ * independent (a filter is no longer than the transforms on either side,
+ * so neighbouring edges never touch the same samples), so lines may be
+ * split into segments. */
+INLINE void lf_line_seg(DEV const FrameParams *fp, DEV uint8_t *rec, DEV const uint8_t *miSizes, int plane, int pass,
+                        int line, int k0, int k1) {
   int sub = plane > 0;
   int lvl = Clip3(0, MAX_LOOP_FILTER, fp->lf_level[plane == 0 ? pass : plane + 1]);
   if (lvl == 0) return;
   int stride = fp->stride[plane];
   DEV uint8_t *base = rec + fp->offset[plane];
   int dx = pass == 0, dy = pass == 1;
-  int n = pass == 0 ? fp->mi_cols : fp->mi_rows;
+  int n = k_min(k1, pass == 0 ? fp->mi_cols : fp->mi_rows);
   int step = 1 << sub;
-  for (int k = 0; k < n; k += step) {
+  for (int k = k0; k < n; k += step) {
     int row0 = pass == 0 ? line : k, col0 = pass == 0 ? k : line;
     int x = col0 * MI_SIZE, y = row0 * MI_SIZE;
     int row = row0 | sub, col = col0 | sub;
@@ -129,6 +133,11 @@ INLINE void lf_line(DEV const FrameParams *fp, DEV uint8_t *rec, DEV const uint8
       lf_sample(base + sy * stride + sx, pass == 0 ? 1 : stride, plane, lvl, fp->lf_sharpness, filterSize);
     }
   }
+}
+
+INLINE void lf_line(DEV const FrameParams *fp, DEV uint8_t *rec, DEV const uint8_t *miSizes, int plane, int pass,
+                    int line) {
+  lf_line_seg(fp, rec, miSizes, plane, pass, line, 0, 1 << 30);
 }
 
 #endif
