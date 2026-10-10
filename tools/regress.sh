@@ -23,6 +23,10 @@ print('aom_ok' if b''.join(fr)==a else 'aom_DIFF')")
   st=ok; [[ $a == aom_ok && $d == identical* && $m == metal==cpu ]] || st=FAIL
   echo "$st $(basename $clip) q=$q $(stat -f%z $dir/cpu.ivf)B dav1d:[$d] $a $m"
 }
+# test clips are generated on demand (make clean wipes build/)
+mkdir -p media
+[[ -f media/ts352.y4m ]] || ffmpeg -v error -f lavfi -i testsrc2=size=352x288:rate=30 -frames:v 10 -pix_fmt yuv420p media/ts352.y4m
+[[ -f media/mb203.y4m ]] || ffmpeg -v error -f lavfi -i mandelbrot=size=203x131:rate=30 -frames:v 10 -pix_fmt yuv420p media/mb203.y4m
 cases=()
 for clip in media/ts352.y4m media/mb203.y4m; do
   for q in 0 1 40 100 180 255; do cases+=("$clip $q"); done
