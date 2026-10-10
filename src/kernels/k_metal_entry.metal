@@ -315,6 +315,38 @@ INLINE long coop_compound_cost(DEV const FrameParams *fp, DEV const uint8_t *src
   return c + (long)lam * (8 + mv_bits8(mvr, mvc) + mv_bits8(mvr2, mvc2) + COMPOUND_BITS8) / 8;
 }
 
+/* LAST, second reference and compound SATDs of the whole block (all planes)
+ * from one evaluation of both predictions per 4x4 unit: s[0..2]. */
+INLINE void coop_inter3(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
+                        DEV const uint8_t *ref2, int x, int y, int w, int h, int mvr, int mvc, int mvr2, int mvc2,
+                        uint lane, THR long *s) {
+  int a0 = 0, a1 = 0, a2 = 0;
+  for (int p = 0; p < 3; p++) {
+    int sub = p > 0, bw = w >> sub, bh = h >> sub, bx = x >> sub, by = y >> sub, nu = bw >> 2, n = nu * (bh >> 2);
+    int stride = fp->stride[p];
+    for (int u = (int)lane; u < n; u += 32) {
+      int pr[16], pr2[16];
+      coop_pred_unit(fp, ref, p, bx, by, bw, bh, mvr, mvc, u, pr);
+      coop_pred_unit(fp, ref2, p, bx, by, bw, bh, mvr2, mvc2, u, pr2);
+      DEV const uint8_t *sp = src + fp->offset[p] + (by + (u / nu) * 4) * stride + bx + (u % nu) * 4;
+      int32_t d0[16], d1[16], d2[16];
+      for (int rr = 0; rr < 4; rr++)
+        for (int c = 0; c < 4; c++) {
+          int sv = sp[rr * stride + c], k = rr * 4 + c;
+          d0[k] = sv - pr[k];
+          d1[k] = sv - pr2[k];
+          d2[k] = sv - ((pr[k] + pr2[k] + 1) >> 1);
+        }
+      a0 += satd4x4(d0);
+      a1 += satd4x4(d1);
+      a2 += satd4x4(d2);
+    }
+  }
+  s[0] = simd_sum(a0);
+  s[1] = simd_sum(a1);
+  s[2] = simd_sum(a2);
+}
+
 INLINE int coop_inter_satd(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref, int p,
                            int bx, int by, int bw, int bh, int mvr, int mvc, uint lane) {
   int n = (bw >> 2) * (bh >> 2), s = 0;
@@ -534,7 +566,35 @@ INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, D
   int cx = x >> 1, cy = y >> 1, clw = lw - 1, clh = lh - 1;
   long interCost = -1;
   int mvr = 0, mvc = 0, refFrame = LAST_FRAME, refFrame1 = 0, mvr1 = 0, mvc1 = 0;
-  if (!fp->frame_is_intra) {
+  if (!fp->frame_is_intra && fp->golden && fp->compound) {
+    /* same costs as below, both predictions evaluated once */
+    int sbIdx = (y >> 6) * fp->sb_cols + (x >> 6);
+    DEV const int32_t *m0 = mvField + (sbIdx * NUM_NODES + mvNode) * 2;
+    DEV const int32_t *m1 = mvFieldGold + (sbIdx * NUM_NODES + mvNode) * 2;
+    int lr = m0[0], lc = m0[1], gr = m1[0], gc = m1[1];
+    long s[3];
+    coop_inter3(fp, src, ref, gold, x, y, w, h, lr, lc, gr, gc, lane, s);
+    interCost = s[0] + (long)lam * (4 + mv_bits8(lr, lc)) / 8;
+    mvr = lr;
+    mvc = lc;
+    long g = s[1] + (long)lam * (4 + mv_bits8(gr, gc)) / 8 + (long)lam * GOLDEN_REF_BITS8 / 8;
+    if (g < interCost) {
+      interCost = g;
+      mvr = gr;
+      mvc = gc;
+      refFrame = fp->ref2_frame;
+    }
+    long cc = s[2] + (long)lam * (8 + mv_bits8(lr, lc) + mv_bits8(gr, gc) + COMPOUND_BITS8) / 8;
+    if (cc < interCost) {
+      interCost = cc;
+      mvr = lr;
+      mvc = lc;
+      mvr1 = gr;
+      mvc1 = gc;
+      refFrame = LAST_FRAME;
+      refFrame1 = fp->ref2_frame;
+    }
+  } else if (!fp->frame_is_intra) {
     interCost = coop_inter_cost(fp, src, ref, mvField, mvNode, x, y, w, h, &mvr, &mvc, lane);
     if (fp->golden) {
       int lr = mvr, lc = mvc, gr, gc;

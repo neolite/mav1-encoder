@@ -161,6 +161,38 @@ INLINE long compound_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV
   return c + (long)lam * (8 + mv_bits8(mvr, mvc) + mv_bits8(mvr2, mvc2) + COMPOUND_BITS8) / 8;
 }
 
+/* LAST, second reference and compound SATDs (all planes) with each plane's
+ * two predictions computed once: s[0..2] (the sums inter_cost( ) and
+ * compound_cost( ) compute). */
+INLINE void inter3_satd(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
+                        DEV const uint8_t *ref2, int x, int y, int w, int h, DEV uint8_t *pred, DEV uint8_t *pred2,
+                        int ps, DEV int32_t *tmp, int mvr, int mvc, int mvr2, int mvc2, THR long *s) {
+  s[0] = s[1] = s[2] = 0;
+  for (int p = 0; p < 3; p++) {
+    int sub = p > 0;
+    int bx = x >> sub, by = y >> sub, bw = w >> sub, bh = h >> sub, stride = fp->stride[p];
+    predict_inter_block(ref + fp->offset[p], stride, fp->frame_w, fp->frame_h, pred, ps, bx, by, bw, bh, mvr, mvc, sub,
+                        sub, EIGHTTAP, tmp);
+    predict_inter_block(ref2 + fp->offset[p], stride, fp->frame_w, fp->frame_h, pred2, ps, bx, by, bw, bh, mvr2, mvc2,
+                        sub, sub, EIGHTTAP, tmp);
+    DEV const uint8_t *sp = src + fp->offset[p] + by * stride + bx;
+    int32_t d0[16], d1[16], d2[16];
+    for (int uy = 0; uy < bh; uy += 4)
+      for (int ux = 0; ux < bw; ux += 4) {
+        for (int i = 0; i < 4; i++)
+          for (int j = 0; j < 4; j++) {
+            int sv = sp[(uy + i) * stride + ux + j], a = pred[(uy + i) * ps + ux + j], b = pred2[(uy + i) * ps + ux + j];
+            d0[i * 4 + j] = sv - a;
+            d1[i * 4 + j] = sv - b;
+            d2[i * 4 + j] = sv - ((a + b + 1) >> 1);
+          }
+        s[0] += satd4x4(d0);
+        s[1] += satd4x4(d1);
+        s[2] += satd4x4(d2);
+      }
+  }
+}
+
 /* Evaluates the block (miRow, miCol, bsize); the inter candidates use the
  * motion vector of square node `mvNode` of the superblock, per reference
  * (LAST: ref / mvField, GOLDEN when fp->golden: gold / mvFieldGold).
@@ -180,7 +212,36 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
   int cx = x >> 1, cy = y >> 1, clw = lw - 1, clh = lh - 1;
   long interCost = -1;
   int mvr = 0, mvc = 0, refFrame = LAST_FRAME, refFrame1 = 0, mvr1 = 0, mvc1 = 0;
-  if (!fp->frame_is_intra) {
+  if (!fp->frame_is_intra && fp->golden && fp->compound) {
+    /* same costs as below, both predictions evaluated once */
+    int sbIdx = (y >> 6) * fp->sb_cols + (x >> 6);
+    DEV const int32_t *m0 = mvField + (sbIdx * NUM_NODES + mvNode) * 2;
+    DEV const int32_t *m1 = mvFieldGold + (sbIdx * NUM_NODES + mvNode) * 2;
+    int lr = m0[0], lc = m0[1], gr = m1[0], gc = m1[1];
+    long s[3];
+    inter3_satd(fp, src, ref, gold, x, y, w, h, pred, (DEV uint8_t *)(tmpArea + (ps + 7) * ps), ps, tmpArea, lr, lc, gr,
+                gc, s);
+    interCost = s[0] + (long)lam * (4 + mv_bits8(lr, lc)) / 8;
+    mvr = lr;
+    mvc = lc;
+    long g = s[1] + (long)lam * (4 + mv_bits8(gr, gc)) / 8 + (long)lam * GOLDEN_REF_BITS8 / 8;
+    if (g < interCost) {
+      interCost = g;
+      mvr = gr;
+      mvc = gc;
+      refFrame = fp->ref2_frame;
+    }
+    long cc = s[2] + (long)lam * (8 + mv_bits8(lr, lc) + mv_bits8(gr, gc) + COMPOUND_BITS8) / 8;
+    if (cc < interCost) {
+      interCost = cc;
+      mvr = lr;
+      mvc = lc;
+      mvr1 = gr;
+      mvc1 = gc;
+      refFrame = LAST_FRAME;
+      refFrame1 = fp->ref2_frame;
+    }
+  } else if (!fp->frame_is_intra) {
     interCost = inter_cost(fp, src, ref, mvField, mvNode, x, y, w, h, pred, ps, tmpArea, &mvr, &mvc);
     if (fp->golden) {
       int lr = mvr, lc = mvc, gr, gc;
