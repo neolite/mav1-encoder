@@ -388,6 +388,7 @@ Backend *backend_metal_create(struct Mav1Encoder *e, char *err, size_t errlen) {
         snprintf(perr, sizeof perr, "no Metal device");
         return;
       }
+      double t0i = CFAbsoluteTimeGetCurrent();
       MTLCompileOptions *opt = [MTLCompileOptions new];
       opt.mathMode = MTLMathModeSafe;
       NSError *nerr = nil;
@@ -396,6 +397,7 @@ Backend *backend_metal_create(struct Mav1Encoder *e, char *err, size_t errlen) {
         snprintf(perr, sizeof perr, "Metal kernel compilation failed: %s", nerr.localizedDescription.UTF8String);
         return;
       }
+      if (getenv("MAV1_TL")) fprintf(stderr, "init: device+compile %.1f ms\n", (CFAbsoluteTimeGetCurrent() - t0i) * 1e3);
       s.device = dev;
       s.analyze = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_analyze"] error:&nerr];
       s.analyzeCoop = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_analyze_coop"] error:&nerr];
@@ -412,6 +414,7 @@ Backend *backend_metal_create(struct Mav1Encoder *e, char *err, size_t errlen) {
         return;
       }
       proto = s;
+      if (getenv("MAV1_TL")) fprintf(stderr, "init: pipelines %.1f ms\n", (CFAbsoluteTimeGetCurrent() - t0i) * 1e3);
       if (getenv("MAV1_PSO"))
         fprintf(stderr, "maxThreads: analyze %lu coop %lu recon %lu me %lu hpel %lu lf %lu cdef %lu\n",
                 (unsigned long)s.analyze.maxTotalThreadsPerThreadgroup, (unsigned long)s.analyzeCoop.maxTotalThreadsPerThreadgroup,

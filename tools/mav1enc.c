@@ -20,8 +20,15 @@ static void put_le32(FILE *f, unsigned v) { put_le16(f, v & 0xFFFF); put_le16(f,
 static void put_le64(FILE *f, unsigned long long v) { put_le32(f, (unsigned)v); put_le32(f, (unsigned)(v >> 32)); }
 
 static double psnr(const uint8_t *a, const uint8_t *b, size_t n) {
-  double sse = 0;
-  for (size_t i = 0; i < n; i++) { double d = (double)a[i] - b[i]; sse += d * d; }
+  /* integer sum of squares (exact, vectorizes); per-row partial sums stay in 32 bits */
+  unsigned long long acc = 0;
+  for (size_t i0 = 0; i0 < n; i0 += 4096) {
+    size_t e = i0 + 4096 < n ? i0 + 4096 : n;
+    unsigned s = 0;
+    for (size_t i = i0; i < e; i++) { int d = (int)a[i] - b[i]; s += (unsigned)(d * d); }
+    acc += s;
+  }
+  double sse = (double)acc;
   if (sse == 0) return 99.0;
   return 10 * log10(255.0 * 255.0 * n / sse);
 }

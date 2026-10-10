@@ -269,7 +269,15 @@ INLINE void itx_2d(DEV int32_t *dequant, DEV int32_t *residual, int txSz, int tx
   int rowKind = itx_row_kind(txType), colKind = itx_col_kind(txType);
   int32_t T[64];
   for (int i = 0; i < h; i++) {
-    for (int j = 0; j < w; j++) T[j] = (i < 32 && j < 32) ? dequant[i * 64 + j] : 0;
+    int nz = 0;
+    for (int j = 0; j < w; j++) {
+      T[j] = (i < 32 && j < 32) ? dequant[i * 64 + j] : 0;
+      nz |= T[j];
+    }
+    if (!nz && !lossless) { /* every row kernel maps zeros to zeros */
+      for (int j = 0; j < w; j++) residual[i * 64 + j] = 0;
+      continue;
+    }
     if (k_abs(log2W - log2H) == 1)
       for (int j = 0; j < w; j++) T[j] = (int32_t)Round2L((long)T[j] * 2896, 12);
     if (lossless) itx_wht(T, 2);

@@ -141,8 +141,10 @@ INLINE int code_tx_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV 
   for (int k = 0; k < tw * th; k++) coefOut[k] = qbest[k];
   if (bestEob > 0) {
     int fud = itx_flip_ud(bestType), flr = itx_flip_lr(bestType);
-    dequant_block(qbest, dq, txSz, dcQ, acQ);
-    itx_2d(dq, res, txSz, bestType, 0);
+    if (numCands > 1) { /* a single candidate's residual is still in res */
+      dequant_block(qbest, dq, txSz, dcQ, acQ);
+      itx_2d(dq, res, txSz, bestType, 0);
+    }
     for (int i = 0; i < h; i++)
       for (int j = 0; j < w; j++) {
         int yy = fud ? (h - 1 - i) : i, xx = flr ? (w - 1 - j) : j;
