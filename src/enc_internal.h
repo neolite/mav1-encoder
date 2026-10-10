@@ -50,10 +50,12 @@ struct Mav1Encoder {
   size_t frame_bytes;
 
   /* Shared (CPU/GPU) buffers. */
-  Buf src, rec, ref, params, blocks, sbs, coefs, mats, mvfield, scratch, lfmask;
+  Buf src, rec, ref, params, blocks, sbs, coefs, mats, mvfield, scratch, lfmask, cdefbuf;
 
   MiInfo *mi;               /* mi_rows * mi_cols */
   int8_t *cdef_idx;         /* per 64x64 superblock, -1 when not coded */
+  int8_t *cdef_choice;      /* per superblock: chosen CDEF parameter set */
+  int num_cdef_presets;     /* 1 << cdef_bits */
   FrameHdr hdr;
   int frame_num;
   int order_hint;

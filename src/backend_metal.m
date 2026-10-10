@@ -12,7 +12,7 @@
 @interface Mav1MetalState : NSObject
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
-@property(nonatomic, strong) id<MTLComputePipelineState> analyze, recon, me;
+@property(nonatomic, strong) id<MTLComputePipelineState> analyze, recon, me, lf, cdef;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, id<MTLBuffer>> *buffers;
 @end
 @implementation Mav1MetalState
@@ -110,7 +110,35 @@ static void mtl_recon(Backend *b, struct Mav1Encoder *e) {
   });
 }
 
-static void mtl_filter(Backend *b, struct Mav1Encoder *e) { (void)b; (void)e; }
+static void mtl_filter(Backend *b, struct Mav1Encoder *e) {
+  Mav1MetalState *s = ST(b);
+  run(s, ^(id<MTLComputeCommandEncoder> enc) {
+    [enc setComputePipelineState:s.lf];
+    [enc setBuffer:wrap(s, &e->params) offset:0 atIndex:0];
+    [enc setBuffer:wrap(s, &e->rec) offset:0 atIndex:1];
+    [enc setBuffer:wrap(s, &e->lfmask) offset:0 atIndex:2];
+    NSUInteger tg = MIN((NSUInteger)64, s.lf.maxTotalThreadsPerThreadgroup);
+    for (int pass = 0; pass < 2; pass++) {
+      int lines = pass == 0 ? e->mi_rows : e->mi_cols;
+      [enc setBytes:&pass length:sizeof pass atIndex:3];
+      [enc dispatchThreads:MTLSizeMake(3 * lines, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+      [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    }
+    if (e->num_cdef_presets) {
+      int bc = (e->mi_cols + 1) >> 1, br = (e->mi_rows + 1) >> 1;
+      [enc setComputePipelineState:s.cdef];
+      [enc setBuffer:wrap(s, &e->params) offset:0 atIndex:0];
+      [enc setBuffer:wrap(s, &e->rec) offset:0 atIndex:1];
+      [enc setBuffer:wrap(s, &e->lfmask) offset:0 atIndex:3];
+      NSUInteger tc = MIN((NSUInteger)64, s.cdef.maxTotalThreadsPerThreadgroup);
+      for (int k = 0; k < e->num_cdef_presets; k++) {
+        [enc setBuffer:wrap(s, &e->cdefbuf) offset:(NSUInteger)k * e->frame_bytes atIndex:2];
+        [enc setBytes:&k length:sizeof k atIndex:4];
+        [enc dispatchThreads:MTLSizeMake(bc * br, 1, 1) threadsPerThreadgroup:MTLSizeMake(tc, 1, 1)];
+      }
+    }
+  });
+}
 
 static void mtl_destroy(Backend *b) {
   MetalBackend *m = (MetalBackend *)b;
@@ -141,7 +169,9 @@ Backend *backend_metal_create(struct Mav1Encoder *e, char *err, size_t errlen) {
     s.analyze = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_analyze"] error:&nerr];
     s.recon = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_recon"] error:&nerr];
     s.me = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_me"] error:&nerr];
-    if (!s.analyze || !s.recon || !s.me) {
+    s.lf = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_lf"] error:&nerr];
+    s.cdef = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_cdef"] error:&nerr];
+    if (!s.analyze || !s.recon || !s.me || !s.lf || !s.cdef) {
       snprintf(err, errlen, "pipeline creation failed: %s", nerr.localizedDescription.UTF8String);
       return NULL;
     }

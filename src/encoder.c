@@ -86,6 +86,9 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
   ok |= buf_alloc(&e->mats, sizeof(int32_t) * FWD_SLOT_SIZE * FWD_NUM_SLOTS);
   ok |= buf_alloc(&e->mvfield, sizeof(int32_t) * 2 * NUM_NODES * e->num_sbs);
   ok |= buf_alloc(&e->scratch, sizeof(int32_t) * SCRATCH_INTS * (size_t)e->num_sbs);
+  ok |= buf_alloc(&e->lfmask, (size_t)e->mi_rows * e->mi_cols);
+  e->num_cdef_presets = e->cfg.cdef ? 4 : 0;
+  ok |= buf_alloc(&e->cdefbuf, e->frame_bytes * (e->num_cdef_presets ? e->num_cdef_presets : 1));
   if (ok) {
     snprintf(err, errlen, "out of memory");
     mav1_destroy(e);
@@ -94,6 +97,7 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
   fwd_build_matrices((int32_t *)e->mats.base);
   e->mi = calloc((size_t)e->mi_rows * e->mi_cols, sizeof(MiInfo));
   e->cdef_idx = calloc((size_t)e->num_sbs, 1);
+  e->cdef_choice = calloc((size_t)e->num_sbs, 1);
 
   if (cfg->use_metal) {
     e->be = backend_metal_create(e, err, errlen);
@@ -122,6 +126,9 @@ void mav1_destroy(Mav1Encoder *e) {
   buf_free(&e->scratch);
   free(e->mi);
   free(e->cdef_idx);
+  free(e->cdef_choice);
+  buf_free(&e->lfmask);
+  buf_free(&e->cdefbuf);
   free(e);
 }
 
@@ -175,6 +182,79 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   fp->frame_w = e->w;
   fp->frame_h = e->h;
   fp->me_range = e->cfg.me_range;
+
+  /* Loop filter level from q (libaom's LPF_PICK_FROM_Q rule for 8-bit). */
+  FrameHdr *h = &e->hdr;
+  int lvl = 0;
+  if (e->cfg.loop_filter) {
+    lvl = (int)((acq * 20723 + 1015158 + (1 << 17)) >> 18);
+    if (!isKey) lvl -= 4;
+    lvl = lvl < 0 ? 0 : (lvl > MAX_LOOP_FILTER ? MAX_LOOP_FILTER : lvl);
+  }
+  for (int i = 0; i < 4; i++) h->lf_level[i] = fp->lf_level[i] = lvl;
+  h->lf_sharpness = fp->lf_sharpness = 0;
+  /* CDEF parameter sets, selected per superblock by SSE. */
+  static const int presets[4][4] = {{0, 0, 0, 0}, {2, 1, 1, 0}, {4, 2, 2, 1}, {8, 4, 4, 2}};
+  h->cdef_damping = fp->cdef_damping = 3 + (q >> 6);
+  h->cdef_bits = fp->cdef_bits = 2;
+  for (int i = 0; i < 4; i++) {
+    h->cdef_y_pri[i] = fp->cdef_y_pri[i] = presets[i][0];
+    h->cdef_y_sec[i] = fp->cdef_y_sec[i] = presets[i][1];
+    h->cdef_uv_pri[i] = fp->cdef_uv_pri[i] = presets[i][2];
+    h->cdef_uv_sec[i] = fp->cdef_uv_sec[i] = presets[i][3];
+  }
+}
+
+/* Per-mi block size and skip flag for the loop filters. */
+static void build_filter_info(Mav1Encoder *e) {
+  uint8_t *info = e->lfmask.base;
+  const SbInfo *sbs = ENC_SBS(e);
+  const BlockInfo *blocks = ENC_BLOCKS(e);
+  for (int i = 0; i < e->num_sbs; i++)
+    for (int k = 0; k < sbs[i].num_blocks; k++) {
+      const BlockInfo *b = &blocks[sbs[i].first_block + k];
+      int skip = b->eob[0] == 0 && b->eob[1] == 0 && b->eob[2] == 0;
+      int bw4 = Num_4x4_Blocks_Wide[b->bsize], bh4 = Num_4x4_Blocks_High[b->bsize];
+      for (int y = 0; y < bh4 && b->mi_row + y < e->mi_rows; y++)
+        for (int x = 0; x < bw4 && b->mi_col + x < e->mi_cols; x++)
+          info[(b->mi_row + y) * e->mi_cols + b->mi_col + x] = (uint8_t)(b->bsize | (skip << 5));
+    }
+}
+
+/* Chooses the CDEF parameter set of every superblock by SSE against the
+ * source and assembles the final frame into `rec`. */
+static void cdef_select(Mav1Encoder *e) {
+  for (int sb = 0; sb < e->num_sbs; sb++) {
+    int sr = sb / e->sb_cols, sc = sb % e->sb_cols;
+    long best = -1;
+    int bestK = 0;
+    for (int k = 0; k < e->num_cdef_presets; k++) {
+      const uint8_t *out = e->cdefbuf.base + (size_t)k * e->frame_bytes;
+      long sse = 0;
+      for (int p = 0; p < 3; p++) {
+        int sub = p > 0, n = 64 >> sub;
+        int pw = p ? (e->w + 1) >> 1 : e->w, ph = p ? (e->h + 1) >> 1 : e->h;
+        for (int y = sr * n; y < (sr + 1) * n && y < ph; y++)
+          for (int x = sc * n; x < (sc + 1) * n && x < pw; x++) {
+            size_t o = e->offset[p] + (size_t)y * e->stride[p] + x;
+            int d = (int)out[o] - (int)e->src.base[o];
+            sse += d * d;
+          }
+      }
+      if (best < 0 || sse < best) { best = sse; bestK = k; }
+    }
+    e->cdef_choice[sb] = (int8_t)bestK;
+    const uint8_t *out = e->cdefbuf.base + (size_t)bestK * e->frame_bytes;
+    for (int p = 0; p < 3; p++) {
+      int sub = p > 0, n = 64 >> sub;
+      int mw = (e->mi_cols * 4) >> sub, mh = (e->mi_rows * 4) >> sub;
+      for (int y = sr * n; y < (sr + 1) * n && y < mh; y++) {
+        int x0 = sc * n, x1 = (sc + 1) * n < mw ? (sc + 1) * n : mw;
+        size_t o = e->offset[p] + (size_t)y * e->stride[p];
+        memcpy(e->rec.base + o + x0, out + o + x0, x1 - x0);
+      }
+    }
+  }
 }
 
 int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int strides[3], uint8_t **out,
@@ -183,7 +263,6 @@ int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int stride
   memset(&e->last, 0, sizeof(e->last));
   e->last.frame_type = isKey ? 0 : 1;
   load_source(e, planes, strides);
-  setup_params(e, isKey);
 
   FrameHdr *h = &e->hdr;
   memset(h, 0, sizeof(*h));
@@ -192,6 +271,7 @@ int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int stride
   if (isKey) e->order_hint = 0;
   h->order_hint = e->order_hint;
   h->refresh_frame_flags = isKey ? 0xFF : 0x01;
+  setup_params(e, isKey);
 
   double t0 = now();
   if (!isKey) e->be->motion_search(e->be, e);
@@ -199,7 +279,9 @@ int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int stride
   double t1 = now();
   e->be->recon(e->be, e);
   double t2 = now();
+  build_filter_info(e);
   e->be->filter(e->be, e);
+  if (e->cfg.cdef) cdef_select(e);
   double t3 = now();
 
   uint8_t *tile = NULL;

@@ -2,6 +2,31 @@
 #include "k_analysis.h"
 #include "k_recon.h"
 #include "k_me.h"
+#include "k_lf.h"
+#include "k_cdef.h"
+
+kernel void mav1_lf(device const FrameParams *fp [[buffer(0)]],
+                    device uint8_t *rec [[buffer(1)]],
+                    device const uint8_t *info [[buffer(2)]],
+                    constant int &pass [[buffer(3)]],
+                    uint gid [[thread_position_in_grid]]) {
+  int lines = pass == 0 ? fp->mi_rows : fp->mi_cols;
+  if ((int)gid >= 3 * lines) return;
+  int plane = (int)gid / lines, line = (int)gid % lines;
+  if (plane > 0 && (line & 1)) return;
+  lf_line(fp, rec, info, plane, pass, line);
+}
+
+kernel void mav1_cdef(device const FrameParams *fp [[buffer(0)]],
+                      device const uint8_t *cur [[buffer(1)]],
+                      device uint8_t *out [[buffer(2)]],
+                      device const uint8_t *info [[buffer(3)]],
+                      constant int &idx [[buffer(4)]],
+                      uint gid [[thread_position_in_grid]]) {
+  int bc = (fp->mi_cols + 1) >> 1, br = (fp->mi_rows + 1) >> 1;
+  if ((int)gid >= bc * br) return;
+  cdef_block(fp, cur, out, info, ((int)gid / bc) * 2, ((int)gid % bc) * 2, idx);
+}
 
 kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
                     device const uint8_t *src [[buffer(1)]],

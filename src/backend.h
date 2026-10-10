@@ -12,6 +12,8 @@ typedef struct Backend {
   void (*motion_search)(struct Backend *, struct Mav1Encoder *);
   void (*analyze)(struct Backend *, struct Mav1Encoder *);
   void (*recon)(struct Backend *, struct Mav1Encoder *);
+  /* Deblocks `rec` in place, then writes CDEF output for every parameter
+   * set k into cdefbuf + k * frame_bytes. */
   void (*filter)(struct Backend *, struct Mav1Encoder *);
   void (*destroy)(struct Backend *);
 } Backend;

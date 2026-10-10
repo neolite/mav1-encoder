@@ -303,8 +303,8 @@ static void write_block(Tile *t, const BlockInfo *b) {
   if (e->cfg.cdef && !skip) {
     int sbi = (r >> 4) * e->sb_cols + (c >> 4);
     if (e->cdef_idx[sbi] == -1) {
-      e->cdef_idx[sbi] = 0;
-      ec_literal(&t->ec, e->hdr.cdef_bits, 0);
+      e->cdef_idx[sbi] = e->cdef_choice[sbi];
+      ec_literal(&t->ec, e->hdr.cdef_bits, e->cdef_choice[sbi]);
     }
   }
   int interMode = NEWMV;
