@@ -136,6 +136,24 @@ INLINE long eval_node(DEV const FrameParams *fp, DEV const uint8_t *src, DEV con
              (long)lam * (m == DC_PRED ? 8 : 24) / 8;
     if (bestUv < 0 || c < bestUv) { bestUv = c; bestUvMode = m; }
   }
+  if (log2 <= 5) {
+    /* CfL estimated from source luma (recon picks the final alphas). */
+    DEV int32_t *dc = scratch + A_TMP;
+    int cw = 1 << clog2;
+    long c = (long)lam * 40 / 8;
+    for (int p = 1; p < 3; p++) {
+      intra_satd(fp, src + fp->offset[p], fp->stride[p], p, cx, cy, clog2, DC_PRED, 0, pred);
+      for (int i = 0; i < cw; i++)
+        for (int j = 0; j < cw; j++) dc[i * cw + j] = pred[i * 64 + j];
+      DEV const uint8_t *sp = src + fp->offset[p] + cy * fp->stride[p] + cx;
+      int al = cfl_best_alpha(src + fp->offset[0], fp->stride[0], cx, cy, x + (1 << log2), y + (1 << log2), clog2,
+                              clog2, dc, sp, fp->stride[p], pred, 64, 0);
+      cfl_predict(src + fp->offset[0], fp->stride[0], cx, cy, x + (1 << log2), y + (1 << log2), clog2, clog2, al, dc,
+                  pred, 64);
+      c += block_satd(sp, fp->stride[p], pred, cw, cw);
+    }
+    if (c < bestUv) { bestUv = c; bestUvMode = UV_CFL_PRED; }
+  }
 
   out->mi_row = miRow;
   out->mi_col = miCol;
@@ -145,6 +163,7 @@ INLINE long eval_node(DEV const FrameParams *fp, DEV const uint8_t *src, DEV con
   out->angle_y = bestDelta;
   out->uv_mode = bestUvMode;
   out->angle_uv = (bestUvMode == bestMode) ? bestDelta : 0;
+  out->cfl_alpha_u = out->cfl_alpha_v = 0;
   out->mv_row = 0;
   out->mv_col = 0;
   out->tx_type = DCT_DCT;

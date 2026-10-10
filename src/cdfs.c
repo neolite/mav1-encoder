@@ -13,6 +13,8 @@ void cdf_init(CdfContext *c, int base_q_idx) {
   COPY(c->y_mode, Default_Y_Mode_Cdf);
   COPY(c->uv_mode_cfl_not_allowed, Default_Uv_Mode_Cfl_Not_Allowed_Cdf);
   COPY(c->uv_mode_cfl_allowed, Default_Uv_Mode_Cfl_Allowed_Cdf);
+  COPY(c->cfl_sign, Default_Cfl_Sign_Cdf);
+  COPY(c->cfl_alpha, Default_Cfl_Alpha_Cdf);
   COPY(c->angle_delta, Default_Angle_Delta_Cdf);
   COPY(c->partition_w8, Default_Partition_W8_Cdf);
   COPY(c->partition_w16, Default_Partition_W16_Cdf);

@@ -18,7 +18,7 @@ AV1 normatively specifies only the decoder. An encoder is therefore correct when
 | AOM CTC test vectors `av1-1-b8-00-quantizer-{00..63}` | Every base_q_idx class | Same space as the mav1 q sweep (1..255) |
 | `av1-1-b8-01-size-{16,18,32,34,64,66,196..226}x{...}` | Odd and small frame sizes | Mirrored by the 203x131 clip (non-multiple-of-8) |
 | `av1-1-b8-02-allintra`, `-03-sizeup/sizedown`, `-04-cdfupdate`, `-05-mv`, `-06-mfmv`, `-22-svc`, `-23-film_grain` | Tool-specific streams | mv and allintra are covered; the rest exercise tools mav1 does not emit |
-| Argon conformance suite (AOM, about 2,500 streams) | Exhaustive coverage of the syntax and decoding process | Not redistributable here. dav1d and libaom pass it, which is why they serve as the oracles |
+| Argon conformance suite (AOM, about 2,500 streams) | Exhaustive coverage of the syntax and decoding process | Not run in this project (licensed suite). dav1d and libaom are themselves Argon-conformant, which is why they serve as the oracles here |
 Full list: `ref/aom/test/test_vectors.cc` (176 entries).
 
 ### B. libaom encoder-side tests (`ref/aom/test/*.cc`) and the mav1 equivalent of each

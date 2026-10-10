@@ -75,6 +75,7 @@ typedef struct {
   int32_t tx_type;                      /* luma tx type (DCT_DCT if eob==0) */
   int32_t eob[3];
   int32_t coef_off[3];                  /* offsets into the coefficient buffer */
+  int32_t cfl_alpha_u, cfl_alpha_v;     /* CflAlphaU/V when uv_mode == UV_CFL_PRED */
   int32_t pad0;
 } BlockInfo;
 

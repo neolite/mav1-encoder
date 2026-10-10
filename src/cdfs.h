@@ -11,6 +11,8 @@ typedef struct {
   uint16_t y_mode[BLOCK_SIZE_GROUPS][INTRA_MODES + 1];
   uint16_t uv_mode_cfl_not_allowed[INTRA_MODES][UV_INTRA_MODES_CFL_NOT_ALLOWED + 1];
   uint16_t uv_mode_cfl_allowed[INTRA_MODES][UV_INTRA_MODES_CFL_ALLOWED + 1];
+  uint16_t cfl_sign[CFL_JOINT_SIGNS + 1];
+  uint16_t cfl_alpha[CFL_ALPHA_CONTEXTS][CFL_ALPHABET_SIZE + 1];
   uint16_t angle_delta[DIRECTIONAL_MODES][(2 * MAX_ANGLE_DELTA + 1) + 1];
   uint16_t partition_w8[PARTITION_CONTEXTS][5];
   uint16_t partition_w16[PARTITION_CONTEXTS][11];

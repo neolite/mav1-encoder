@@ -33,6 +33,7 @@ typedef struct {
   int frame_type;      /* 0 key, 1 inter */
   size_t bytes;
   int num_blocks, num_inter_blocks;
+  int tool_use[16]; /* per-frame block counts per coding tool, see mav1_tool_names */
   double t_analysis, t_recon, t_filter, t_entropy; /* seconds */
 } Mav1FrameStats;
 
@@ -52,6 +53,7 @@ size_t mav1_sequence_header(const Mav1Encoder *e, uint8_t *out);
 void mav1_get_recon(const Mav1Encoder *e, uint8_t *const planes[3], const int strides[3]);
 const Mav1FrameStats *mav1_last_stats(const Mav1Encoder *e);
 const char *mav1_backend_name(const Mav1Encoder *e);
+extern const char *const mav1_tool_names[16];
 void mav1_destroy(Mav1Encoder *e);
 
 #ifdef __cplusplus

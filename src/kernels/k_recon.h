@@ -176,7 +176,8 @@ INLINE void recon_block(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const u
           a.haveAbove = AvailU || y > 0;
           a.haveAboveRight = BD(plane, (sbr >> subY) - 1, (sbc >> subX) + stepX);
           a.haveBelowLeft = BD(plane, (sbr >> subY) + stepY, (sbc >> subX) - 1);
-          a.mode = plane == 0 ? b->y_mode : b->uv_mode;
+          int isCfl = plane > 0 && b->uv_mode == UV_CFL_PRED;
+          a.mode = plane == 0 ? b->y_mode : (isCfl ? DC_PRED : b->uv_mode);
           a.angleDelta = plane == 0 ? b->angle_y : b->angle_uv;
           a.log2W = Tx_Width_Log2[txSz];
           a.log2H = Tx_Height_Log2[txSz];
@@ -185,6 +186,30 @@ INLINE void recon_block(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const u
           a.edgeFilter = 0;
           a.filterType = 0;
           predict_intra(px, stride, startX, startY, a, px + startY * stride + startX, stride);
+          if (isCfl) {
+            /* MaxLumaW/H: end of the (single) luma transform block. */
+            int lw = Tx_Width[Max_Tx_Size_Rect[bs]], lh = Tx_Height[Max_Tx_Size_Rect[bs]];
+            int maxLumaW = MiCol * 4 + lw, maxLumaH = MiRow * 4 + lh;
+            DEV int32_t *dc = scratch + S_TMP;
+            DEV uint8_t *d = px + startY * stride + startX;
+            int tw = Tx_Width[txSz], th = Tx_Height[txSz];
+            for (int i = 0; i < th; i++)
+              for (int j = 0; j < tw; j++) dc[i * tw + j] = d[i * stride + j];
+            DEV const uint8_t *luma = rec + fp->offset[0];
+            int alpha;
+            if (plane == 1) {
+              alpha = cfl_best_alpha(luma, fp->stride[0], startX, startY, maxLumaW, maxLumaH, a.log2W, a.log2H, dc,
+                                     spx + startY * stride + startX, stride, d, stride, 0);
+              b->cfl_alpha_u = alpha;
+            } else {
+              /* (0, 0) is not codable: V must be non-zero when U is zero. */
+              alpha = cfl_best_alpha(luma, fp->stride[0], startX, startY, maxLumaW, maxLumaH, a.log2W, a.log2H, dc,
+                                     spx + startY * stride + startX, stride, d, stride, b->cfl_alpha_u == 0);
+              b->cfl_alpha_v = alpha;
+            }
+            cfl_predict(luma, fp->stride[0], startX, startY, maxLumaW, maxLumaH, a.log2W, a.log2H, alpha, dc, d,
+                        stride);
+          }
         }
         int t = DCT_DCT;
         int eob = code_tx_block(fp, spx, px, stride, startX, startY, txSz, plane, cands, numCands,

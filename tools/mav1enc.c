@@ -82,6 +82,7 @@ int main(int argc, char **argv) {
   int count = 0;
   size_t total = 0;
   double psum[3] = {0, 0, 0};
+  long tools[16] = {0};
   double tsum[4] = {0, 0, 0, 0};
   while (count < nframes && fgets(line, sizeof line, fi)) {
     if (fread(frame, 1, ysz + 2 * csz, fi) != ysz + 2 * csz) break;
@@ -106,6 +107,7 @@ int main(int argc, char **argv) {
               "ana %.1fms rec %.1fms flt %.1fms ent %.1fms\n",
               count, st->frame_type ? 'P' : 'K', n, st->num_blocks, st->num_inter_blocks, py, pu, pv,
               st->t_analysis * 1e3, st->t_recon * 1e3, st->t_filter * 1e3, st->t_entropy * 1e3);
+    for (int k = 0; k < 16; k++) tools[k] += st->tool_use[k];
     total += n;
     count++;
   }
@@ -120,6 +122,10 @@ int main(int argc, char **argv) {
             mav1_backend_name(e), count, total, total * 8.0 / count * fn / fd / 1000.0, fn, fd,
             psum[0] / count, psum[1] / count, psum[2] / count, tsum[0] / count * 1e3, tsum[1] / count * 1e3,
             tsum[2] / count * 1e3, tsum[3] / count * 1e3);
+  fprintf(stderr, "tool usage (blocks):");
+  for (int k = 0; k < 16; k++)
+    if (mav1_tool_names[k][0]) fprintf(stderr, " %s=%ld", mav1_tool_names[k], tools[k]);
+  fprintf(stderr, "\n");
   mav1_destroy(e);
   free(frame);
   free(rec);

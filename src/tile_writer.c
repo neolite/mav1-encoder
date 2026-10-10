@@ -283,6 +283,14 @@ static void write_intra_modes(Tile *t, const BlockInfo *b, int availU, int avail
     ec_symbol(&t->ec, b->uv_mode, t->cdf.uv_mode_cfl_allowed[b->y_mode], UV_INTRA_MODES_CFL_ALLOWED);
   else
     ec_symbol(&t->ec, b->uv_mode, t->cdf.uv_mode_cfl_not_allowed[b->y_mode], UV_INTRA_MODES_CFL_NOT_ALLOWED);
+  if (b->uv_mode == UV_CFL_PRED) {
+    /* read_cfl_alphas: signs 0 = zero, 1 = neg, 2 = pos; joint = signU*3+signV-1 */
+    int au = b->cfl_alpha_u, av = b->cfl_alpha_v;
+    int signU = au == 0 ? 0 : (au < 0 ? 1 : 2), signV = av == 0 ? 0 : (av < 0 ? 1 : 2);
+    ec_symbol(&t->ec, signU * 3 + signV - 1, t->cdf.cfl_sign, CFL_JOINT_SIGNS);
+    if (signU) ec_symbol(&t->ec, k_abs(au) - 1, t->cdf.cfl_alpha[(signU - 1) * 3 + signV], CFL_ALPHABET_SIZE);
+    if (signV) ec_symbol(&t->ec, k_abs(av) - 1, t->cdf.cfl_alpha[(signV - 1) * 3 + signU], CFL_ALPHABET_SIZE);
+  }
   if (intra_is_directional(b->uv_mode))
     ec_symbol(&t->ec, b->angle_uv + MAX_ANGLE_DELTA, t->cdf.angle_delta[b->uv_mode - V_PRED], 2 * MAX_ANGLE_DELTA + 1);
 }

@@ -257,6 +257,19 @@ static void cdef_select(Mav1Encoder *e) {
   }
 }
 
+const char *const mav1_tool_names[16] = {"intra", "inter", "cfl", "angle_delta", "tx_non_dct", "skip",
+                                          "rect_part", "compound", "obmc", "", "", "", "", "", "", ""};
+
+static void count_tools(Mav1FrameStats *st, const BlockInfo *b) {
+  st->tool_use[0] += !b->is_inter;
+  st->tool_use[1] += b->is_inter;
+  st->tool_use[2] += !b->is_inter && b->uv_mode == UV_CFL_PRED;
+  st->tool_use[3] += !b->is_inter && (b->angle_y != 0 || b->angle_uv != 0);
+  st->tool_use[4] += b->eob[0] > 0 && b->tx_type != DCT_DCT;
+  st->tool_use[5] += b->eob[0] == 0 && b->eob[1] == 0 && b->eob[2] == 0;
+  st->tool_use[6] += Block_Width(b->bsize) != Block_Height(b->bsize);
+}
+
 int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int strides[3], uint8_t **out,
                 size_t *outSize) {
   int isKey = e->frame_num == 0 || (e->cfg.keyint > 0 && e->frame_num % e->cfg.keyint == 0);
@@ -298,7 +311,11 @@ int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int stride
   const BlockInfo *blocks = ENC_BLOCKS(e);
   for (int i = 0; i < e->num_sbs; i++) {
     e->last.num_blocks += sbs[i].num_blocks;
-    for (int k = 0; k < sbs[i].num_blocks; k++) e->last.num_inter_blocks += blocks[sbs[i].first_block + k].is_inter;
+    for (int k = 0; k < sbs[i].num_blocks; k++) {
+      const BlockInfo *b = &blocks[sbs[i].first_block + k];
+      e->last.num_inter_blocks += b->is_inter;
+      count_tools(&e->last, b);
+    }
   }
   e->last.bytes = pos;
   e->last.t_analysis = t1 - t0;

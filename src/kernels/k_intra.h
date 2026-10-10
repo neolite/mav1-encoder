@@ -247,4 +247,51 @@ INLINE void predict_intra(DEV const uint8_t *px, int stride, int x, int y, Intra
   }
 }
 
+/* Chroma-from-luma, spec 7.11.5. `luma` is the luma plane origin, `dst`
+ * the chroma tx block holding the DC prediction (overwritten). */
+INLINE void cfl_predict(DEV const uint8_t *luma, int lumaStride, int startX, int startY, int maxLumaW,
+                        int maxLumaH, int log2W, int log2H, int alpha, DEV const int32_t *dcPred,
+                        DEV uint8_t *dst, int dstStride) {
+  int w = 1 << log2W, h = 1 << log2H;
+  int lumaAvg = 0;
+  for (int pass = 0; pass < 2; pass++) {
+    for (int i = 0; i < h; i++) {
+      int lumaY = k_min((startY + i) << 1, maxLumaH - 2);
+      for (int j = 0; j < w; j++) {
+        int lumaX = k_min((startX + j) << 1, maxLumaW - 2);
+        DEV const uint8_t *l = luma + lumaY * lumaStride + lumaX;
+        int v = ((int)l[0] + l[1] + l[lumaStride] + l[lumaStride + 1]) << 1;
+        if (pass == 0) {
+          lumaAvg += v;
+        } else {
+          int scaled = Round2Signed(alpha * (v - lumaAvg), 6);
+          dst[i * dstStride + j] = (uint8_t)Clip3(0, 255, dcPred[i * w + j] + scaled);
+        }
+      }
+    }
+    if (pass == 0) lumaAvg = Round2(lumaAvg, log2W + log2H);
+  }
+}
+
+/* Picks the alpha in [-16, 16] minimising the SSE against `src`. */
+INLINE int cfl_best_alpha(DEV const uint8_t *luma, int lumaStride, int startX, int startY, int maxLumaW,
+                          int maxLumaH, int log2W, int log2H, DEV const int32_t *dcPred, DEV const uint8_t *src,
+                          int srcStride, DEV uint8_t *dst, int dstStride, int excludeZero) {
+  long best = -1;
+  int bestA = 0;
+  int w = 1 << log2W, h = 1 << log2H;
+  for (int a = -16; a <= 16; a++) {
+    if (a == 0 && excludeZero) continue;
+    cfl_predict(luma, lumaStride, startX, startY, maxLumaW, maxLumaH, log2W, log2H, a, dcPred, dst, dstStride);
+    long sse = 0;
+    for (int i = 0; i < h; i++)
+      for (int j = 0; j < w; j++) {
+        int d = (int)dst[i * dstStride + j] - (int)src[i * srcStride + j];
+        sse += d * d;
+      }
+    if (best < 0 || sse < best) { best = sse; bestA = a; }
+  }
+  return bestA;
+}
+
 #endif
