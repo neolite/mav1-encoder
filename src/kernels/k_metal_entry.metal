@@ -86,11 +86,17 @@ kernel void mav1_hpel(device const FrameParams *fp [[buffer(0)]],
                       device const uint8_t *ref [[buffer(1)]],
                       device const uint8_t *gold [[buffer(2)]],
                       device uint8_t *hp [[buffer(3)]],
+                      device const uint8_t *src [[buffer(4)]],
                       uint gid [[thread_position_in_grid]]) {
   int n = fp->frame_w * fp->frame_h;
   int r = (int)gid / n, o = (int)gid % n;
   if (r > 1 || (r == 1 && !fp->golden)) return;
-  qpel_build(fp, r ? gold : ref, hp + (long)r * 16 * n, o / fp->frame_w, o % fp->frame_w);
+  int y = o / fp->frame_w, x = o % fp->frame_w;
+  qpel_build(fp, r ? gold : ref, hp + (long)r * 16 * n, y, x);
+  if ((fp->turbo & T_ME_DEC) && y < dec_h(fp) && x < dec_w(fp)) {
+    dec_build(fp, r ? gold : ref, (device uint8_t *)dec_plane(fp, hp, 1 + r), y, x);
+    if (r == 0) dec_build(fp, src, (device uint8_t *)dec_plane(fp, hp, 0), y, x);
+  }
 }
 
 /* One SIMD group (32 lanes) per search node of one level. */
@@ -108,7 +114,9 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
   /* groups [0, nodes): LAST, [nodes, 2 * nodes): GOLDEN */
   int nn = 1 << (2 * level), nodes = fp->sb_cols * fp->sb_rows * nn;
   int g = (int)tg;
+  DEV const uint8_t *ds = dec_plane(fp, hp, 0), *dr = dec_plane(fp, hp, 1);
   if (g >= nodes) {
+    dr = dec_plane(fp, hp, 2);
     if (!fp->golden || g >= 2 * nodes) return;
     g -= nodes;
     ref = gold;
@@ -133,7 +141,7 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
     for (int k = (int)lane; k < m.count; k += 32) {
       int cy, cx;
       me_candidate(&m, k, &cy, &cx);
-      int c = me_cost(fp, src, ref, &m, cy, cx);
+      int c = me_cost(fp, src, ref, ds, dr, &m, cy, cx);
       if (c < best) {
         best = c;
         bestK = k;
@@ -559,6 +567,7 @@ INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, D
     DEV const uint8_t *py = src + fp->offset[0];
     coop_edges(fp, py, fp->stride[0], 0, x, y, w, h, A, L, lane);
     for (int mode = DC_PRED; mode <= PAETH_PRED; mode++) {
+      if (turbo_mode_off(fp, mode)) continue;
       long c = coop_intra_satd(py, fp->stride[0], x, y, lw, lh, mode, 0, A, L, lane) + (long)lam * mode_bits8(mode) / 8;
       if (best < 0 || c < best) { best = c; bestMode = mode; }
     }
@@ -585,16 +594,18 @@ INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, D
       coop_edges(fp, pp, fp->stride[p], p, cx, cy, w >> 1, h >> 1, A, L, lane);
       for (int m = DC_PRED; m <= PAETH_PRED; m++) {
         if (intra_is_directional(m) && m != V_PRED && m != H_PRED && m != bestMode) continue;
+        if (turbo_mode_off(fp, m)) continue;
         int delta = (m == bestMode) ? bestDelta : 0;
         cu[m] += coop_intra_satd(pp, fp->stride[p], cx, cy, clw, clh, m, delta, A, L, lane);
       }
     }
     for (int m = DC_PRED; m <= PAETH_PRED; m++) {
       if (intra_is_directional(m) && m != V_PRED && m != H_PRED && m != bestMode) continue;
+      if (turbo_mode_off(fp, m)) continue;
       long c = cu[m] + (long)lam * (m == DC_PRED ? 8 : 24) / 8;
       if (bestUv < 0 || c < bestUv) { bestUv = c; bestUvMode = m; }
     }
-    if (cfl_allowed(bsize, fp->lossless)) {
+    if (cfl_allowed(bsize, fp->lossless) && !turbo_no_cfl(fp)) {
       long c = (long)lam * 40 / 8;
       for (int p = 1; p < 3; p++) c += coop_cfl_satd(fp, src, p, cx, cy, clw, clh, x + w, y + h, A, L, lane);
       if (c < bestUv) { bestUv = c; bestUvMode = UV_CFL_PRED; }

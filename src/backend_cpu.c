@@ -4,6 +4,7 @@
  * reconstruction). */
 #include <dispatch/dispatch.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 
 #include "backend.h"
 #include "enc_internal.h"
@@ -26,7 +27,13 @@ static void cpu_motion_search(Backend *b, struct Mav1Encoder *e) {
     int W = fp->frame_w, H = fp->frame_h;
     dispatch_apply((size_t)H * nref, DISPATCH_APPLY_AUTO, ^(size_t g) {
       int r = (int)g / H, y = (int)g % H;
-      for (int x = 0; x < W; x++) qpel_build(fp, r ? e->gold.base : e->ref.base, e->hpel.base + (size_t)r * 16 * W * H, y, x);
+      for (int x = 0; x < W; x++) {
+        qpel_build(fp, r ? e->gold.base : e->ref.base, e->hpel.base + (size_t)r * 16 * W * H, y, x);
+        if ((fp->turbo & T_ME_DEC) && y < dec_h(fp) && x < dec_w(fp)) {
+          dec_build(fp, r ? e->gold.base : e->ref.base, (uint8_t *)dec_plane(fp, e->hpel.base, 1 + r), y, x);
+          if (r == 0) dec_build(fp, e->src.base, (uint8_t *)dec_plane(fp, e->hpel.base, 0), y, x);
+        }
+      }
     });
   }
   for (int level = 0; level < 4; level++) {
@@ -35,7 +42,8 @@ static void cpu_motion_search(Backend *b, struct Mav1Encoder *e) {
     dispatch_apply((size_t)nodes * nref, DISPATCH_APPLY_AUTO, ^(size_t g) {
       int r = (int)g / nodes, sb = ((int)g % nodes) / nn, i = (int)g % nn;
       me_node_serial(fp, sb, level, i, e->src.base, r ? e->gold.base : e->ref.base,
-                     e->hpel.base + (size_t)r * 16 * fp->frame_w * fp->frame_h,
+                     e->hpel.base + (size_t)r * 16 * fp->frame_w * fp->frame_h, dec_plane(fp, e->hpel.base, 0),
+                     dec_plane(fp, e->hpel.base, 1 + r),
                      (int32_t *)(r ? e->mvgold.base : e->mvfield.base),
                      (int32_t *)e->scratch.base + (size_t)sb * SCRATCH_INTS + r * (SCRATCH_INTS / 2));
     });
@@ -60,23 +68,44 @@ void cpu_backend_analyze(Backend *b, struct Mav1Encoder *e) {
   });
 }
 
+/* Superblock (r, c) needs its left and above-right neighbours (the
+ * wavefront order of the GPU recon, tiles ignored): each finished SB
+ * releases the SBs waiting on it, so no global wave barrier idles the
+ * cores. */
+static int recon_prereq(const struct Mav1Encoder *e, int r, int c, int *pre) {
+  int n = 0;
+  if (c > 0) pre[n++] = r * e->sb_cols + c - 1;
+  if (r > 0) pre[n++] = (r - 1) * e->sb_cols + k_min(c + 1, e->sb_cols - 1);
+  return n;
+}
+
 void cpu_backend_recon(Backend *b, struct Mav1Encoder *e) {
   (void)b;
   const FrameParams *fp = ENC_PARAMS(e);
-  int waves = e->sb_cols + 2 * (e->sb_rows - 1);
-  for (int t = 0; t < waves; t++) {
-    /* SBs with col + 2 * row == t */
-    int rmin = t - (e->sb_cols - 1);
-    rmin = rmin > 0 ? (rmin + 1) / 2 : 0;
-    int rmax = t / 2 < e->sb_rows - 1 ? t / 2 : e->sb_rows - 1;
-    if (rmax < rmin) continue;
-    dispatch_apply((size_t)(rmax - rmin + 1), DISPATCH_APPLY_AUTO, ^(size_t k) {
-      int r = rmin + (int)k, c = t - 2 * r;
-      int idx = r * e->sb_cols + c;
-      recon_sb(fp, ENC_SBS(e)[idx], ENC_BLOCKS(e), e->src.base, e->rec.base, e->ref.base, e->gold.base, ENC_COEFS(e),
-               (const int32_t *)e->mats.base, (int32_t *)e->scratch.base + (size_t)idx * SCRATCH_INTS);
-    });
+  int n = e->num_sbs;
+  _Atomic int *deps = calloc((size_t)n, sizeof *deps);
+  int (*next)[3] = calloc((size_t)n, sizeof *next); /* dependents: count, ids */
+  for (int i = 0; i < n; i++) {
+    int pre[2], k = recon_prereq(e, i / e->sb_cols, i % e->sb_cols, pre);
+    deps[i] = k;
+    for (int j = 0; j < k; j++) next[pre[j]][1 + next[pre[j]][0]++] = i;
   }
+  dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+  dispatch_group_t g = dispatch_group_create();
+  __block void (^run)(int);
+  void (^body)(int) = ^(int idx) {
+    recon_sb(fp, ENC_SBS(e)[idx], ENC_BLOCKS(e), e->src.base, e->rec.base, e->ref.base, e->gold.base, ENC_COEFS(e),
+             (const int32_t *)e->mats.base, (int32_t *)e->scratch.base + (size_t)idx * SCRATCH_INTS);
+    for (int j = 0; j < next[idx][0]; j++) {
+      int d = next[idx][1 + j];
+      if (atomic_fetch_sub(&deps[d], 1) == 1) dispatch_group_async(g, q, ^{ run(d); });
+    }
+  };
+  run = body;
+  dispatch_group_async(g, q, ^{ run(0); });
+  dispatch_group_wait(g, DISPATCH_TIME_FOREVER);
+  free((void *)deps);
+  free(next);
 }
 
 static void cpu_filter(Backend *b, struct Mav1Encoder *e) {

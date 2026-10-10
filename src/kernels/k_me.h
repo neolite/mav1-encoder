@@ -49,6 +49,35 @@ typedef struct {
 #define T_ME_L3COPY 4  /* 8x8 nodes take the 16x16 parent's vector */
 #define T_ME_KEEP 8    /* children keep the parent's sub-pel vector when the full-pel winner is the parent's */
 #define T_ME_HPEL 16   /* sub-pel refinement on precomputed quarter-pel planes */
+#define T_ME_CR2 64    /* children search +-2 full-pel around the parent */
+#define T_ME_DEC 32    /* 64x64 coarse grid (step 4) on 4x4-decimated planes */
+
+/* Decimated planes (T_ME_DEC): 4x4 means of the source (d = 0) and of the
+ * references (d = 1 + r), after the 32 quarter-pel planes. */
+INLINE int dec_w(DEV const FrameParams *fp) { return (fp->frame_w + 3) >> 2; }
+INLINE int dec_h(DEV const FrameParams *fp) { return (fp->frame_h + 3) >> 2; }
+INLINE DEV const uint8_t *dec_plane(DEV const FrameParams *fp, DEV const uint8_t *qpBase, int d) {
+  return qpBase + (size_t)32 * fp->frame_w * fp->frame_h + (size_t)d * dec_w(fp) * dec_h(fp);
+}
+INLINE void dec_build(DEV const FrameParams *fp, DEV const uint8_t *pl, DEV uint8_t *out, int y, int x) {
+  int s = 0;
+  for (int i = 0; i < 4; i++)
+    for (int j = 0; j < 4; j++)
+      s += pl[fp->offset[0] + Clip3(0, fp->frame_h - 1, 4 * y + i) * fp->stride[0] + Clip3(0, fp->frame_w - 1, 4 * x + j)];
+  out[(size_t)y * dec_w(fp) + x] = (uint8_t)((s + 8) >> 4);
+}
+/* SAD x16 of the w x w block at (x, y) on the decimated planes, offset
+ * (dy, dx) (multiples of 4). */
+INLINE int dec_sad(DEV const FrameParams *fp, DEV const uint8_t *ds, DEV const uint8_t *dr, int x, int y, int w, int dy,
+                   int dx) {
+  int W = dec_w(fp), H = dec_h(fp), n = w >> 2, x0 = x >> 2, y0 = y >> 2, oy = dy >> 2, ox = dx >> 2, sad = 0;
+  for (int i = 0; i < n; i++) {
+    int sy = k_min(y0 + i, H - 1), ry = Clip3(0, H - 1, y0 + i + oy);
+    for (int j = 0; j < n; j++)
+      sad += k_abs((int)ds[sy * W + k_min(x0 + j, W - 1)] - (int)dr[ry * W + Clip3(0, W - 1, x0 + j + ox)]);
+  }
+  return sad * 16;
+}
 
 /* Turbo: the node's search ends with the parent's vector (copy node, or the
  * full-pel winner is the parent's own position). */
@@ -79,7 +108,7 @@ INLINE MeNode me_node(DEV const FrameParams *fp, int sbIdx, int level, int i, DE
     m.pc = par[1];
     m.cy = par[0] >> 3;
     m.cx = par[1] >> 3;
-    m.range = k_min(m.range, (fp->turbo & T_ME_CR1) ? 1 : 4);
+    m.range = k_min(m.range, (fp->turbo & T_ME_CR1) ? 1 : (fp->turbo & T_ME_CR2) ? 2 : 4);
     m.copy = (fp->turbo & T_ME_L3COPY) && level == 3;
   }
   m.step = 1;
@@ -120,9 +149,11 @@ INLINE void me_candidate(THR const MeNode *m, int k, THR int *dy, THR int *dx) {
   *dx = m->cx - m->range + (k % side) * m->step;
 }
 
-INLINE int me_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref, THR const MeNode *m,
-                   int dy, int dx) {
+INLINE int me_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref, DEV const uint8_t *ds,
+                   DEV const uint8_t *dr, THR const MeNode *m, int dy, int dx) {
   int bits = 2 + 2 * FloorLog2(k_abs(dy) * 8 + 1) + 2 * FloorLog2(k_abs(dx) * 8 + 1);
+  if ((fp->turbo & T_ME_DEC) && m->step == ME_COARSE_STEP)
+    return dec_sad(fp, ds, dr, m->x, m->y, m->w, dy, dx) + fp->ac_q[0] * bits / 64;
   return me_sad(src + fp->offset[0], ref + fp->offset[0], fp->stride[0], fp->frame_w, fp->frame_h, m->x, m->y, m->w,
                 dy, dx) +
          fp->ac_q[0] * bits / 64;
@@ -235,7 +266,8 @@ INLINE int me_unit_satd_hp(DEV const FrameParams *fp, DEV const uint8_t *src, DE
 
 /* Serial search of one node (CPU backend). */
 INLINE void me_node_serial(DEV const FrameParams *fp, int sbIdx, int level, int i, DEV const uint8_t *src,
-                           DEV const uint8_t *ref, DEV const uint8_t *hp, DEV int32_t *mvField, DEV int32_t *scratch) {
+                           DEV const uint8_t *ref, DEV const uint8_t *hp, DEV const uint8_t *ds, DEV const uint8_t *dr,
+                           DEV int32_t *mvField, DEV int32_t *scratch) {
   MeNode m = me_node(fp, sbIdx, level, i, mvField);
   DEV int32_t *out = mvField + (sbIdx * NUM_NODES + NODE_BASE(level) + i) * 2;
   if (!m.valid) {
@@ -254,7 +286,7 @@ INLINE void me_node_serial(DEV const FrameParams *fp, int sbIdx, int level, int 
     for (int k = 0; k < m.count; k++) {
       int dy, dx;
       me_candidate(&m, k, &dy, &dx);
-      int c = me_cost(fp, src, ref, &m, dy, dx);
+      int c = me_cost(fp, src, ref, ds, dr, &m, dy, dx);
       if (best < 0 || c < best) {
         best = c;
         by = dy;

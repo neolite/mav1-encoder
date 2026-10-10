@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dispatch/dispatch.h>
 #include <time.h>
 
 #include "backend.h"
@@ -141,7 +142,7 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
     }
     ok |= buf_alloc(&e->ascratch, sizeof(int32_t) * mx);
   }
-  ok |= buf_alloc(&e->hpel, e->cfg.turbo ? (size_t)32 * e->w * e->h : 0);
+  ok |= buf_alloc(&e->hpel, e->cfg.turbo ? (size_t)32 * e->w * e->h + (size_t)3 * ((e->w + 3) >> 2) * ((e->h + 3) >> 2) : 0);
   ok |= buf_alloc(&e->mescratch, sizeof(int32_t) * ME_SB_INTS * (size_t)e->num_sbs);
   ok |= buf_alloc(&e->scratch, sizeof(int32_t) * SCRATCH_INTS * (size_t)e->num_sbs);
   ok |= buf_alloc(&e->lfmask, (size_t)e->mi_rows * e->mi_cols);
@@ -305,8 +306,9 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   fp->fast = e->cfg.fast;
   /* turbo savings (testing knob MAV1_TURBO): 1 square partitions only on
    * inter frames; motion search bits T_ME_* of k_me.h (2, 4, 8 cost
-   * quality, off by default; 16 quarter-pel planes) */
-  fp->turbo = e->cfg.turbo ? (getenv("MAV1_TURBO") ? (int)strtol(getenv("MAV1_TURBO"), NULL, 0) : 0x11) : 0;
+   * quality, off by default; 16 quarter-pel planes, 32 decimated coarse grid,
+   * 64 children +-2); 128 reduced intra search in inter frames */
+  fp->turbo = e->cfg.turbo ? (getenv("MAV1_TURBO") ? (int)strtol(getenv("MAV1_TURBO"), NULL, 0) : 0xF1) : 0;
   fp->leaf = e->cfg.leaf ? (e->leafopt & 1) : e->nonref && !getenv("MAV1_LEAFINTRA");
   if (e->leafopt & 16) fp->tx_search = 0;
   fp->depth_thr = getenv("MAV1_DT") ? atoi(getenv("MAV1_DT")) : 0;
@@ -375,7 +377,8 @@ static void build_filter_info(Mav1Encoder *e) {
 /* Chooses the CDEF parameter set of every superblock by SSE against the
  * source and assembles the final frame into `rec`. */
 static void cdef_select(Mav1Encoder *e) {
-  for (int sb = 0; sb < e->num_sbs; sb++) {
+  dispatch_apply((size_t)e->num_sbs, DISPATCH_APPLY_AUTO, ^(size_t sbi) {
+    int sb = (int)sbi;
     int sr = sb / e->sb_cols, sc = sb % e->sb_cols;
     long best = -1;
     int bestK = 0;
@@ -405,7 +408,7 @@ static void cdef_select(Mav1Encoder *e) {
         memcpy(e->rec.base + o + x0, out + o + x0, x1 - x0);
       }
     }
-  }
+  });
 }
 
 const char *const mav1_tool_names[16] = {"intra", "inter", "cfl", "angle_delta", "tx_non_dct", "skip",
@@ -447,8 +450,9 @@ static size_t run_frame(Mav1Encoder *e, int isKey, uint8_t **tile) {
 
   double t0 = now();
   if (!isKey) e->be->motion_search(e->be, e);
-  if (getenv("MAV1_TIMING")) fprintf(stderr, "me %.1fms\n", (now() - t0) * 1000);
+  double tme = now();
   e->be->analyze(e->be, e);
+  double tan = now();
   if (e->cfg.intra_edge_filter) edge_filter_types(e);
   double t1 = now();
   e->be->recon(e->be, e);
@@ -475,6 +479,9 @@ static size_t run_frame(Mav1Encoder *e, int isKey, uint8_t **tile) {
   double t3 = now();
   size_t tileSize = write_tile(e, tile);
   double t4 = now();
+  if (getenv("MAV1_TIMING"))
+    fprintf(stderr, "kind %d nonref %d: me %.1f ana %.1f edge %.1f rec %.1f flt %.1f ent %.1f ms\n", e->frame_kind, e->nonref,
+            (tme - t0) * 1e3, (tan - tme) * 1e3, (t1 - tan) * 1e3, (t2 - t1) * 1e3, (t3 - t2) * 1e3, (t4 - t3) * 1e3);
 
   const SbInfo *sbs = ENC_SBS(e);
   const BlockInfo *blocks = ENC_BLOCKS(e);

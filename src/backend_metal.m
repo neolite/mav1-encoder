@@ -72,6 +72,7 @@ static void mtl_motion_search(Backend *b, struct Mav1Encoder *e) {
       [enc setBuffer:wrap(s, &e->ref) offset:0 atIndex:1];
       [enc setBuffer:wrap(s, gold_buf(e)) offset:0 atIndex:2];
       [enc setBuffer:wrap(s, &e->hpel) offset:0 atIndex:3];
+      [enc setBuffer:wrap(s, &e->src) offset:0 atIndex:4];
       NSUInteger n = (NSUInteger)2 * fp->frame_w * fp->frame_h;
       [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
       [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];

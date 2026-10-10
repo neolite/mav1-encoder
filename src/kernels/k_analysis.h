@@ -35,6 +35,15 @@ INLINE int level_bsize(int l) {
   return l == 0 ? BLOCK_64X64 : l == 1 ? BLOCK_32X32 : l == 2 ? BLOCK_16X16 : BLOCK_8X8;
 }
 
+/* Turbo (FrameParams.turbo bit 128): intra blocks of inter frames search
+ * only DC / V / H / SMOOTH (luma and chroma) and no CfL. */
+#define T_INTRA 128
+INLINE int turbo_mode_off(DEV const FrameParams *fp, int mode) {
+  return (fp->turbo & T_INTRA) && !fp->frame_is_intra && mode != DC_PRED && mode != V_PRED && mode != H_PRED &&
+         mode != SMOOTH_PRED;
+}
+INLINE int turbo_no_cfl(DEV const FrameParams *fp) { return (fp->turbo & T_INTRA) && !fp->frame_is_intra; }
+
 /* Approximate cost (1/8 bit) of each luma intra mode. */
 INLINE int mode_bits8(int mode) {
   if (mode == DC_PRED) return 12;
@@ -205,6 +214,7 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
    * (SATD per pixel below a lambda-scaled bound) intra is not evaluated */
   int skipIntra = interCost >= 0 && (fp->leaf || (fp->fast && interCost * 16 < (long)w * h * lam * 16)); /* T64 */
   for (int mode = DC_PRED; mode <= PAETH_PRED && !skipIntra; mode++) {
+    if (turbo_mode_off(fp, mode)) continue;
     long c = intra_satd(fp, src + fp->offset[0], fp->stride[0], 0, x, y, lw, lh, mode, 0, pred, ps) +
              (long)lam * mode_bits8(mode) / 8;
     if (best < 0 || c < best) { best = c; bestMode = mode; }
@@ -227,13 +237,14 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
   int bestUvMode = DC_PRED;
   for (int m = DC_PRED; m <= PAETH_PRED && !skipUv; m++) {
     if (intra_is_directional(m) && m != V_PRED && m != H_PRED && m != bestMode) continue;
+    if (turbo_mode_off(fp, m)) continue;
     int delta = (m == bestMode) ? bestDelta : 0;
     long c = intra_satd(fp, src + fp->offset[1], fp->stride[1], 1, cx, cy, clw, clh, m, delta, pred, ps) +
              intra_satd(fp, src + fp->offset[2], fp->stride[2], 2, cx, cy, clw, clh, m, delta, pred, ps) +
              (long)lam * (m == DC_PRED ? 8 : 24) / 8;
     if (bestUv < 0 || c < bestUv) { bestUv = c; bestUvMode = m; }
   }
-  if (!skipUv && cfl_allowed(bsize, fp->lossless)) {
+  if (!skipUv && cfl_allowed(bsize, fp->lossless) && !turbo_no_cfl(fp)) {
     /* CfL estimated from source luma (recon picks the final alphas). */
     DEV int32_t *dc = tmpArea;
     int cw = 1 << clw, ch = 1 << clh;
