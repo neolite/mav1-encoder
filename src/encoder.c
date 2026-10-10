@@ -260,6 +260,7 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   fp->tx_mode_select = q != 0 && e->cfg.tx_depth;
   fp->switchable_interp = !isKey && e->cfg.switchable_interp;
   fp->fast = e->cfg.fast;
+  fp->leaf = e->nonref && !getenv("MAV1_LEAFINTRA");
   fp->depth_thr = getenv("MAV1_DT") ? atoi(getenv("MAV1_DT")) : 0;
   fp->tile_w_sb = e->tile_w_sb;
   long acq = fp->ac_q[0];
@@ -271,7 +272,7 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   /* Loop filter level from q (libaom's LPF_PICK_FROM_Q rule for 8-bit). */
   FrameHdr *h = &e->hdr;
   int lvl = 0;
-  if (e->cfg.loop_filter && q > 0) {
+  if (e->cfg.loop_filter && q > 0 && !(e->nonref && !getenv("MAV1_LEAFLF"))) {
     lvl = (int)((acq * 20723 + 1015158 + (1 << 17)) >> 18);
     if (!isKey) lvl -= 4;
     lvl = lvl < 0 ? 0 : (lvl > MAX_LOOP_FILTER ? MAX_LOOP_FILTER : lvl);
@@ -375,6 +376,7 @@ static int frame_qindex(const Mav1Encoder *e, int isKey) {
   int q = e->cfg.qindex;
   if (q == 0) return 0;
   int off = isKey ? env_or("MAV1_QK", -24) : (e->order_hint % 4 == 0 ? env_or("MAV1_Q4", -8) : env_or("MAV1_QP", 4));
+  if (!isKey && e->nonref) off = env_or("MAV1_QN", 12);
   q += off;
   return q < 1 ? 1 : q > 255 ? 255 : q;
 }
@@ -388,11 +390,14 @@ int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int stride
 
   FrameHdr *h = &e->hdr;
   memset(h, 0, sizeof(*h));
+  /* two-layer temporal hierarchy (single reference): odd frames are not
+   * kept as references, so they are the cheap "leaf" frames */
+  e->nonref = !isKey && e->cfg.nonref_odd && (e->order_hint & 1);
   h->frame_type = isKey ? KEY_FRAME : INTER_FRAME;
   h->base_q_idx = frame_qindex(e, isKey);
   if (isKey) e->order_hint = 0;
   h->order_hint = e->order_hint;
-  h->refresh_frame_flags = isKey ? 0xFF : 0x01;
+  h->refresh_frame_flags = isKey ? 0xFF : (e->nonref ? 0x00 : 0x01);
   setup_params(e, isKey);
 
   double t0 = now();
@@ -445,9 +450,11 @@ int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int stride
   e->last.t_entropy = t4 - t3;
 
   /* The reconstruction becomes the reference of the next frame. */
-  Buf tmp = e->ref;
-  e->ref = e->rec;
-  e->rec = tmp;
+  if (!e->nonref) {
+    Buf tmp = e->ref;
+    e->ref = e->rec;
+    e->rec = tmp;
+  }
   e->have_ref = 1;
   e->frame_num++;
   e->order_hint++;
@@ -462,6 +469,6 @@ void mav1_get_recon(const Mav1Encoder *e, uint8_t *const planes[3], const int st
     int pw = p ? (e->w + 1) >> 1 : e->w;
     int ph = p ? (e->h + 1) >> 1 : e->h;
     for (int y = 0; y < ph; y++)
-      memcpy(planes[p] + (size_t)y * strides[p], e->ref.base + e->offset[p] + (size_t)y * e->stride[p], pw);
+      memcpy(planes[p] + (size_t)y * strides[p], (e->nonref ? e->rec.base : e->ref.base) + e->offset[p] + (size_t)y * e->stride[p], pw);
   }
 }

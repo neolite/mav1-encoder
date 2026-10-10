@@ -62,6 +62,7 @@ struct Mav1Encoder {
   int num_cdef_presets;     /* 1 << cdef_bits */
   FrameHdr hdr;
   int frame_num;
+  int nonref; /* current frame is not kept as a reference */
   int order_hint;
   int have_ref;
   Backend *be;

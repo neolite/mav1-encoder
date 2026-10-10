@@ -445,7 +445,7 @@ INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, D
   }
   long best = -1;
   int bestMode = DC_PRED, bestDelta = 0;
-  int skipIntra = fp->fast && interCost >= 0 && interCost * 16 < (long)w * h * lam * 16;
+  int skipIntra = interCost >= 0 && (fp->leaf || (fp->fast && interCost * 16 < (long)w * h * lam * 16));
   if (!skipIntra) {
     DEV const uint8_t *py = src + fp->offset[0];
     coop_edges(fp, py, fp->stride[0], 0, x, y, w, h, A, L, lane);

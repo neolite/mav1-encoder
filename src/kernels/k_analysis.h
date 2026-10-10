@@ -141,7 +141,7 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
   int bestMode = DC_PRED, bestDelta = 0;
   /* fast preset, inter frames: when inter prediction is already good
    * (SATD per pixel below a lambda-scaled bound) intra is not evaluated */
-  int skipIntra = fp->fast && interCost >= 0 && interCost * 16 < (long)w * h * lam * 16; /* T64 */
+  int skipIntra = interCost >= 0 && (fp->leaf || (fp->fast && interCost * 16 < (long)w * h * lam * 16)); /* T64 */
   for (int mode = DC_PRED; mode <= PAETH_PRED && !skipIntra; mode++) {
     long c = intra_satd(fp, src + fp->offset[0], fp->stride[0], 0, x, y, lw, lh, mode, 0, pred, ps) +
              (long)lam * mode_bits8(mode) / 8;

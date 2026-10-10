@@ -62,6 +62,7 @@ typedef struct {
   int32_t tx_mode_select;             /* TxMode == TX_MODE_SELECT */
   int32_t tile_w_sb;                  /* uniform tile column width in SBs */
   int32_t fast;                       /* reduced analysis search */
+  int32_t leaf;                       /* non-reference frame: inter only */
   int32_t depth_thr;                  /* depth early exit: SATD per sample x16 */
   int32_t switchable_interp;          /* interpolation_filter == SWITCHABLE (dual filter) */
   int32_t lf_level[4];                /* loop_filter_level[] */
