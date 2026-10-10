@@ -22,12 +22,20 @@ static void cpu_motion_search(Backend *b, struct Mav1Encoder *e) {
   (void)b;
   const FrameParams *fp = ENC_PARAMS(e);
   int nref = fp->golden ? 2 : 1;
+  if (fp->turbo & T_ME_HPEL) {
+    int W = fp->frame_w, H = fp->frame_h;
+    dispatch_apply((size_t)H * nref, DISPATCH_APPLY_AUTO, ^(size_t g) {
+      int r = (int)g / H, y = (int)g % H;
+      for (int x = 0; x < W; x++) qpel_build(fp, r ? e->gold.base : e->ref.base, e->hpel.base + (size_t)r * 16 * W * H, y, x);
+    });
+  }
   for (int level = 0; level < 4; level++) {
     int nn = 1 << (2 * level), nodes = e->num_sbs * nn;
     /* LAST then GOLDEN nodes; each reference uses its half of the SB scratch */
     dispatch_apply((size_t)nodes * nref, DISPATCH_APPLY_AUTO, ^(size_t g) {
       int r = (int)g / nodes, sb = ((int)g % nodes) / nn, i = (int)g % nn;
       me_node_serial(fp, sb, level, i, e->src.base, r ? e->gold.base : e->ref.base,
+                     e->hpel.base + (size_t)r * 16 * fp->frame_w * fp->frame_h,
                      (int32_t *)(r ? e->mvgold.base : e->mvfield.base),
                      (int32_t *)e->scratch.base + (size_t)sb * SCRATCH_INTS + r * (SCRATCH_INTS / 2));
     });

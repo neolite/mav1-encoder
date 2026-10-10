@@ -81,6 +81,18 @@ INLINE int me_unit_satd(DEV const FrameParams *fp, DEV const uint8_t *src, DEV c
   return satd4x4(d);
 }
 
+/* Quarter-pel planes of LAST (and the second reference): one thread per sample. */
+kernel void mav1_hpel(device const FrameParams *fp [[buffer(0)]],
+                      device const uint8_t *ref [[buffer(1)]],
+                      device const uint8_t *gold [[buffer(2)]],
+                      device uint8_t *hp [[buffer(3)]],
+                      uint gid [[thread_position_in_grid]]) {
+  int n = fp->frame_w * fp->frame_h;
+  int r = (int)gid / n, o = (int)gid % n;
+  if (r > 1 || (r == 1 && !fp->golden)) return;
+  qpel_build(fp, r ? gold : ref, hp + (long)r * 16 * n, o / fp->frame_w, o % fp->frame_w);
+}
+
 /* One SIMD group (32 lanes) per search node of one level. */
 kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
                     device const uint8_t *src [[buffer(1)]],
@@ -90,6 +102,7 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
                     constant int &level [[buffer(5)]],
                     device const uint8_t *gold [[buffer(6)]],
                     device int32_t *mvFieldGold [[buffer(7)]],
+                    device const uint8_t *hp [[buffer(8)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint lane [[thread_index_in_simdgroup]]) {
   /* groups [0, nodes): LAST, [nodes, 2 * nodes): GOLDEN */
@@ -100,12 +113,17 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
     g -= nodes;
     ref = gold;
     mvField = mvFieldGold;
+    hp += 16 * (long)fp->frame_w * fp->frame_h;
   }
   int sbIdx = g / nn, i = g % nn;
   MeNode m = me_node(fp, sbIdx, level, i, mvField);
   device int32_t *out = mvField + (sbIdx * NUM_NODES + NODE_BASE(level) + i) * 2;
   if (!m.valid) {
     if (lane == 0) out[0] = out[1] = 0;
+    return;
+  }
+  if (m.copy) {
+    if (lane == 0) { out[0] = m.pr; out[1] = m.pc; }
     return;
   }
   int dy = 0, dx = 0;
@@ -126,6 +144,10 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
     int kmin = simd_min(best == gmin ? bestK : INT_MAX);
     me_candidate(&m, kmin, &dy, &dx);
   }
+  if (me_take_parent(fp, level, &m, dy, dx)) {
+    if (lane == 0) { out[0] = m.pr; out[1] = m.pc; }
+    return;
+  }
   /* sub-pel: the 9 candidates (centre + 8 neighbours) x 4x4 units are
    * spread over the lanes; per-candidate sums by simd_sum. The (cost, index)
    * minimum equals the serial first minimum of me_finish. */
@@ -139,7 +161,8 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
       int k = first + w / nUnits, u = w % nUnits;
       int dr = 0, dc = 0;
       if (k > 0) me_neighbour(k - 1, step, &dr, &dc);
-      sums[k] += me_unit_satd(fp, src, ref, &m, mvr + dr, mvc + dc, u);
+      sums[k] += (fp->turbo & T_ME_HPEL) ? me_unit_satd_hp(fp, src, ref, hp, &m, mvr + dr, mvc + dc, u)
+                                         : me_unit_satd(fp, src, ref, &m, mvr + dr, mvc + dc, u);
     }
     int bc = INT_MAX, bk = 0;
     for (int k = 0; k < ME_LANES; k++) {

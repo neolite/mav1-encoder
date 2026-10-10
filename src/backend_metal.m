@@ -11,12 +11,13 @@
 #include "enc_internal.h"
 #include "kernels_src.h"
 #include "kernels/k_analysis.h"
+#include "kernels/k_me.h"
 #include <dispatch/dispatch.h>
 
 @interface Mav1MetalState : NSObject
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
-@property(nonatomic, strong) id<MTLComputePipelineState> analyze, analyzeCoop, recon, me, lf, cdef, lr;
+@property(nonatomic, strong) id<MTLComputePipelineState> analyze, analyzeCoop, recon, me, hpel, lf, cdef, lr;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, id<MTLBuffer>> *buffers;
 @end
 @implementation Mav1MetalState
@@ -61,8 +62,22 @@ static void run(Mav1MetalState *s, void (^encode)(id<MTLComputeCommandEncoder>))
 
 static void mtl_motion_search(Backend *b, struct Mav1Encoder *e) {
   Mav1MetalState *s = ST(b);
+  int one = getenv("MAV1_MELEVEL") ? 1 : 0;
+  for (int L = 0; L <= (one ? 3 : 0); L++)
   run(s, ^(id<MTLComputeCommandEncoder> enc) {
+    const FrameParams *fp = ENC_PARAMS(e);
+    if ((fp->turbo & T_ME_HPEL) && L == 0) {
+      [enc setComputePipelineState:s.hpel];
+      [enc setBuffer:wrap(s, &e->params) offset:0 atIndex:0];
+      [enc setBuffer:wrap(s, &e->ref) offset:0 atIndex:1];
+      [enc setBuffer:wrap(s, gold_buf(e)) offset:0 atIndex:2];
+      [enc setBuffer:wrap(s, &e->hpel) offset:0 atIndex:3];
+      NSUInteger n = (NSUInteger)2 * fp->frame_w * fp->frame_h;
+      [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+      [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    }
     [enc setComputePipelineState:s.me];
+    [enc setBuffer:wrap(s, &e->hpel) offset:0 atIndex:8];
     [enc setBuffer:wrap(s, &e->params) offset:0 atIndex:0];
     [enc setBuffer:wrap(s, &e->src) offset:0 atIndex:1];
     [enc setBuffer:wrap(s, &e->ref) offset:0 atIndex:2];
@@ -73,7 +88,7 @@ static void mtl_motion_search(Backend *b, struct Mav1Encoder *e) {
     int nref = ENC_PARAMS(e)->golden ? 2 : 1;
     /* levels depend on their parents: one dispatch each, one SIMD group per
      * node and reference */
-    for (int level = 0; level < 4; level++) {
+    for (int level = one ? L : 0; level < (one ? L + 1 : 4); level++) {
       [enc setBytes:&level length:sizeof level atIndex:5];
       NSUInteger groups = ((NSUInteger)e->num_sbs << (2 * level)) * nref;
       [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
@@ -104,8 +119,8 @@ static void mtl_analyze(Backend *b, struct Mav1Encoder *e) {
     for (int level = one ? L : 0; level <= (one ? L : 3); level++) {
       [enc setBytes:&level length:sizeof level atIndex:7];
       NSUInteger n = (NSUInteger)e->num_sbs * (1u << (2 * level)) * level_slots(fp, level);
-      if (level <= 1) {
-        /* big blocks: one SIMD group per candidate block */
+      if (level <= 2) {
+        /* blocks >= 16x16: one SIMD group per candidate block */
         [enc setComputePipelineState:s.analyzeCoop];
         [enc dispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
       } else {
@@ -239,10 +254,11 @@ Backend *backend_metal_create(struct Mav1Encoder *e, char *err, size_t errlen) {
     s.analyzeCoop = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_analyze_coop"] error:&nerr];
     s.recon = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_recon"] error:&nerr];
     s.me = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_me"] error:&nerr];
+    s.hpel = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_hpel"] error:&nerr];
     s.lf = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_lf"] error:&nerr];
     s.cdef = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_cdef"] error:&nerr];
     s.lr = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_lr"] error:&nerr];
-    if (!s.analyze || !s.analyzeCoop || !s.recon || !s.me || !s.lf || !s.cdef || !s.lr) {
+    if (!s.analyze || !s.analyzeCoop || !s.recon || !s.me || !s.hpel || !s.lf || !s.cdef || !s.lr) {
       snprintf(err, errlen, "pipeline creation failed: %s", nerr.localizedDescription.UTF8String);
       return NULL;
     }

@@ -63,6 +63,11 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
   }
   Mav1Encoder *e = calloc(1, sizeof(*e));
   e->cfg = *cfg;
+  if (e->cfg.turbo) {
+    e->cfg.fast = 1;
+    if (e->cfg.altref < 2) e->cfg.altref = 4;
+    e->cfg.leaf = 1;
+  }
   if (e->cfg.altref == 1) e->cfg.altref = 0;
   if (e->cfg.altref > 16) e->cfg.altref = 16;
   if (e->cfg.altref) e->cfg.multi_ref = e->cfg.nonref_odd = 0; /* the second reference is ALTREF */
@@ -136,6 +141,7 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
     }
     ok |= buf_alloc(&e->ascratch, sizeof(int32_t) * mx);
   }
+  ok |= buf_alloc(&e->hpel, e->cfg.turbo ? (size_t)32 * e->w * e->h : 0);
   ok |= buf_alloc(&e->mescratch, sizeof(int32_t) * ME_SB_INTS * (size_t)e->num_sbs);
   ok |= buf_alloc(&e->scratch, sizeof(int32_t) * SCRATCH_INTS * (size_t)e->num_sbs);
   ok |= buf_alloc(&e->lfmask, (size_t)e->mi_rows * e->mi_cols);
@@ -189,6 +195,7 @@ void mav1_destroy(Mav1Encoder *e) {
   buf_free(&e->mvfield);
   buf_free(&e->scratch);
   buf_free(&e->mescratch);
+  buf_free(&e->hpel);
   buf_free(&e->acosts);
   buf_free(&e->ainfos);
   buf_free(&e->ascratch);
@@ -296,6 +303,10 @@ static void setup_params(Mav1Encoder *e, int isKey) {
     fp->compound = e->hdr.reference_select; /* LAST + ALTREF */
   }
   fp->fast = e->cfg.fast;
+  /* turbo savings (testing knob MAV1_TURBO): 1 square partitions only on
+   * inter frames; motion search bits T_ME_* of k_me.h (2, 4, 8 cost
+   * quality, off by default; 16 quarter-pel planes) */
+  fp->turbo = e->cfg.turbo ? (getenv("MAV1_TURBO") ? (int)strtol(getenv("MAV1_TURBO"), NULL, 0) : 0x11) : 0;
   fp->leaf = e->cfg.leaf ? (e->leafopt & 1) : e->nonref && !getenv("MAV1_LEAFINTRA");
   if (e->leafopt & 16) fp->tx_search = 0;
   fp->depth_thr = getenv("MAV1_DT") ? atoi(getenv("MAV1_DT")) : 0;

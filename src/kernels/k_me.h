@@ -40,7 +40,21 @@ typedef struct {
   int step;          /* grid spacing */
   int stages;        /* level 0: coarse grid, then a +-3 refinement */
   int count;         /* candidates of the current stage */
+  int pr, pc;        /* parent's vector (1/8 pel; levels > 0) */
+  int copy;          /* turbo: take the parent's vector without searching */
 } MeNode;
+
+/* turbo bits (FrameParams.turbo) of the motion search */
+#define T_ME_CR1 2     /* children search +-1 full-pel around the parent */
+#define T_ME_L3COPY 4  /* 8x8 nodes take the 16x16 parent's vector */
+#define T_ME_KEEP 8    /* children keep the parent's sub-pel vector when the full-pel winner is the parent's */
+#define T_ME_HPEL 16   /* sub-pel refinement on precomputed quarter-pel planes */
+
+/* Turbo: the node's search ends with the parent's vector (copy node, or the
+ * full-pel winner is the parent's own position). */
+INLINE int me_take_parent(DEV const FrameParams *fp, int level, THR const MeNode *m, int by, int bx) {
+  return level > 0 && (m->copy || ((fp->turbo & T_ME_KEEP) && by == m->cy && bx == m->cx));
+}
 
 #define ME_COARSE_STEP 4
 #define ME_REFINE 3
@@ -56,12 +70,17 @@ INLINE MeNode me_node(DEV const FrameParams *fp, int sbIdx, int level, int i, DE
   m.cy = 0;
   m.cx = 0;
   m.range = fp->me_range;
+  m.pr = m.pc = 0;
+  m.copy = 0;
   if (level > 0) {
     int pi = ((i / n) >> 1) * (n >> 1) + ((i % n) >> 1);
     DEV const int32_t *par = mvField + (sbIdx * NUM_NODES + NODE_BASE(level - 1) + pi) * 2;
+    m.pr = par[0];
+    m.pc = par[1];
     m.cy = par[0] >> 3;
     m.cx = par[1] >> 3;
-    m.range = k_min(m.range, 4);
+    m.range = k_min(m.range, (fp->turbo & T_ME_CR1) ? 1 : 4);
+    m.copy = (fp->turbo & T_ME_L3COPY) && level == 3;
   }
   m.step = 1;
   m.stages = 1;
@@ -126,8 +145,15 @@ INLINE void me_neighbour(int k, int step, THR int *dr, THR int *dc) {
   *dc = (k == 0 || k == 3 || k == 5) ? -step : ((k == 1 || k == 6) ? 0 : step);
 }
 
+INLINE int me_unit_satd_hp(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
+                           DEV const uint8_t *hp, THR const MeNode *m, int mvr, int mvc, int u);
 INLINE int me_subpel_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
-                          THR const MeNode *m, int mvr, int mvc, DEV int32_t *scratch) {
+                          DEV const uint8_t *hp, THR const MeNode *m, int mvr, int mvc, DEV int32_t *scratch) {
+  if (fp->turbo & T_ME_HPEL) {
+    int s = 0, nu = (m->w >> 2) * (m->w >> 2);
+    for (int u = 0; u < nu; u++) s += me_unit_satd_hp(fp, src, ref, hp, m, mvr, mvc, u);
+    return s;
+  }
   DEV uint8_t *pred = (DEV uint8_t *)scratch;
   predict_inter_block(ref + fp->offset[0], fp->stride[0], fp->frame_w, fp->frame_h, pred, m->w, m->x, m->y, m->w,
                       m->w, mvr, mvc, 0, 0, EIGHTTAP, scratch + (m->w * m->w + 3) / 4);
@@ -136,16 +162,16 @@ INLINE int me_subpel_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV
 
 /* Sub-pel refinement around the full-pel winner: steps of 4 (half) then 2
  * (quarter) in 1/8 units, first minimum of the 8 neighbours per step. */
-INLINE void me_finish(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref, THR const MeNode *m,
-                      int by, int bx, DEV int32_t *out, DEV int32_t *scratch) {
+INLINE void me_finish(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref, DEV const uint8_t *hp,
+                      THR const MeNode *m, int by, int bx, DEV int32_t *out, DEV int32_t *scratch) {
   int mvr = by * 8, mvc = bx * 8;
-  int bestS = me_subpel_cost(fp, src, ref, m, mvr, mvc, scratch);
+  int bestS = me_subpel_cost(fp, src, ref, hp, m, mvr, mvc, scratch);
   for (int step = 4; step >= 2; step >>= 1) {
     int cr = mvr, cc = mvc;
     for (int k = 0; k < 8; k++) {
       int dr, dc;
       me_neighbour(k, step, &dr, &dc);
-      int c = me_subpel_cost(fp, src, ref, m, cr + dr, cc + dc, scratch);
+      int c = me_subpel_cost(fp, src, ref, hp, m, cr + dr, cc + dc, scratch);
       if (c < bestS) {
         bestS = c;
         mvr = cr + dr;
@@ -157,9 +183,59 @@ INLINE void me_finish(DEV const FrameParams *fp, DEV const uint8_t *src, DEV con
   out[1] = mvc;
 }
 
+/* Quarter-pel planes (turbo T_ME_HPEL): for every luma sample (y, x) of a
+ * reference, plane fy * 4 + fx holds the EIGHTTAP prediction at
+ * (y + fy / 4, x + fx / 4), computed per sample like predict_inter_block
+ * (plane 0 is the reference itself). Layout: qp[((r * 16) + k) * W * H].
+ * The motion search reads its sub-pel candidates from them; the coded
+ * prediction stays normative. */
+INLINE void qpel_build(DEV const FrameParams *fp, DEV const uint8_t *ref, DEV uint8_t *qp, int y, int x) {
+  DEV const uint8_t *rp = ref + fp->offset[0];
+  int stride = fp->stride[0], W = fp->frame_w, H = fp->frame_h;
+  int hrow[4][8];
+  for (int t = 0; t < 8; t++) {
+    DEV const uint8_t *row = rp + Clip3(0, H - 1, y + t - 3) * stride;
+    int px[8];
+    for (int u = 0; u < 8; u++) px[u] = row[Clip3(0, W - 1, x + u - 3)];
+    for (int fx = 0; fx < 4; fx++) {
+      KCONST int32_t *f = Subpel_Filters[EIGHTTAP][4 * fx];
+      int s = 0;
+      for (int u = 0; u < 8; u++) s += f[u] * px[u];
+      hrow[fx][t] = Round2(s, 3);
+    }
+  }
+  size_t o = (size_t)y * W + x, n = (size_t)W * H;
+  for (int fy = 0; fy < 4; fy++) {
+    KCONST int32_t *f = Subpel_Filters[EIGHTTAP][4 * fy];
+    for (int fx = 0; fx < 4; fx++) {
+      int s = 0;
+      for (int t = 0; t < 8; t++) s += f[t] * hrow[fx][t];
+      qp[(size_t)(fy * 4 + fx) * n + o] = (uint8_t)Clip1(Round2(s, 11));
+    }
+  }
+}
+
+/* SATD of 4x4 unit u of the node against the quarter-pel-plane prediction
+ * at (mvr, mvc) (even, 1/8 units). */
+INLINE int me_unit_satd_hp(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
+                           DEV const uint8_t *qp, THR const MeNode *m, int mvr, int mvc, int u) {
+  int W = fp->frame_w, H = fp->frame_h;
+  int nu = m->w >> 2;
+  int ux = m->x + (u % nu) * 4, uy = m->y + (u / nu) * 4;
+  DEV const uint8_t *pl = qp + (size_t)(((mvr >> 1) & 3) * 4 + ((mvc >> 1) & 3)) * W * H;
+  int iy = uy + (mvr >> 3), ix = ux + (mvc >> 3);
+  int32_t d[16];
+  DEV const uint8_t *sp = src + fp->offset[0] + uy * fp->stride[0] + ux;
+  for (int r = 0; r < 4; r++) {
+    DEV const uint8_t *row = pl + (size_t)Clip3(0, H - 1, iy + r) * W;
+    for (int c = 0; c < 4; c++) d[r * 4 + c] = (int)sp[r * fp->stride[0] + c] - (int)row[Clip3(0, W - 1, ix + c)];
+  }
+  return satd4x4(d);
+}
+
 /* Serial search of one node (CPU backend). */
 INLINE void me_node_serial(DEV const FrameParams *fp, int sbIdx, int level, int i, DEV const uint8_t *src,
-                           DEV const uint8_t *ref, DEV int32_t *mvField, DEV int32_t *scratch) {
+                           DEV const uint8_t *ref, DEV const uint8_t *hp, DEV int32_t *mvField, DEV int32_t *scratch) {
   MeNode m = me_node(fp, sbIdx, level, i, mvField);
   DEV int32_t *out = mvField + (sbIdx * NUM_NODES + NODE_BASE(level) + i) * 2;
   if (!m.valid) {
@@ -167,6 +243,11 @@ INLINE void me_node_serial(DEV const FrameParams *fp, int sbIdx, int level, int 
     return;
   }
   int by = 0, bx = 0;
+  if (m.copy) {
+    out[0] = m.pr;
+    out[1] = m.pc;
+    return;
+  }
   for (int stage = 0; stage < m.stages; stage++) {
     if (stage > 0) me_refine_stage(&m, by, bx);
     int best = -1;
@@ -181,7 +262,12 @@ INLINE void me_node_serial(DEV const FrameParams *fp, int sbIdx, int level, int 
       }
     }
   }
-  me_finish(fp, src, ref, &m, by, bx, out, scratch + me_node_scratch(level, i));
+  if (me_take_parent(fp, level, &m, by, bx)) {
+    out[0] = m.pr;
+    out[1] = m.pc;
+    return;
+  }
+  me_finish(fp, src, ref, hp, &m, by, bx, out, scratch + me_node_scratch(level, i));
 }
 
 #endif

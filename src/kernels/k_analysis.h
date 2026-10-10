@@ -482,11 +482,15 @@ INLINE void slot_part(int slot, THR int *p, THR int *k) {
   else { *p = PARTITION_VERT_4; *k = slot - 9; }
 }
 
+/* Turbo: square partitions only (NONE / SPLIT) on inter frames. */
+INLINE int turbo_square(DEV const FrameParams *fp) { return (fp->turbo & 1) && !fp->frame_is_intra; }
+
 /* Partition p is searched at this node (the conditions of analyze_sb). */
 INLINE int part_allowed(DEV const FrameParams *fp, int level, int p, int hasRows, int hasCols) {
   if (p == PARTITION_SPLIT) return 0;
   if (level == 3 && p != PARTITION_NONE) return 0;
   if (fp->fast && p > PARTITION_SPLIT) return 0;
+  if (turbo_square(fp) && p != PARTITION_NONE) return 0;
   if (level == 2 && (p == PARTITION_HORZ_4 || p == PARTITION_VERT_4)) return 0;
   if (!(hasRows && hasCols))
     return (p == PARTITION_HORZ && hasCols && !hasRows) || (p == PARTITION_VERT && hasRows && !hasCols);
@@ -495,7 +499,7 @@ INLINE int part_allowed(DEV const FrameParams *fp, int level, int p, int hasRows
 
 /* Slots per node at a level (the dispatch size of pass 1). */
 INLINE int level_slots(DEV const FrameParams *fp, int level) {
-  if (level == 3) return 1;
+  if (level == 3 || turbo_square(fp)) return 1;
   if (level == 2 || fp->fast) return 5;
   return A_SLOTS;
 }
