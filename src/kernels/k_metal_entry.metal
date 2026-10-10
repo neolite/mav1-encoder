@@ -42,6 +42,45 @@ kernel void mav1_cdef(device const FrameParams *fp [[buffer(0)]],
   cdef_block(fp, cur, out, info, ((int)gid / bc) * 2, ((int)gid % bc) * 2, idx);
 }
 
+/* SATD of 4x4 unit u of the node against the EIGHTTAP luma prediction at
+ * (mvr, mvc); the prediction is evaluated per sample exactly as
+ * predict_inter_block( ) computes it (same intermediate rounding). */
+INLINE int me_unit_satd(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
+                        THR const MeNode *m, int mvr, int mvc, int u) {
+  int stride = fp->stride[0];
+  DEV const uint8_t *rp = ref + fp->offset[0];
+  int nu = m->w >> 2;
+  int ux = (u % nu) * 4, uy = (u / nu) * 4;
+  int startX = (m->x << SUBPEL_BITS) + 2 * mvc;
+  int startY = (m->y << SUBPEL_BITS) + 2 * mvr;
+  /* unscaled reference: the spec's startX = (((x << 4) + 2 * mv) << 6) + 32 */
+  startX = (startX << (SCALE_SUBPEL_BITS - SUBPEL_BITS)) + 32;
+  startY = (startY << (SCALE_SUBPEL_BITS - SUBPEL_BITS)) + 32;
+  int lastX = fp->frame_w - 1, lastY = fp->frame_h - 1;
+  KCONST int32_t *fh = Subpel_Filters[EIGHTTAP][(startX >> 6) & SUBPEL_MASK];
+  KCONST int32_t *fv = Subpel_Filters[EIGHTTAP][(startY >> 6) & SUBPEL_MASK];
+  int hrow[11][4];
+  for (int rr = 0; rr < 11; rr++) {
+    int ry = Clip3(0, lastY, (startY >> 10) + uy + rr - 3);
+    DEV const uint8_t *row = rp + ry * stride;
+    for (int c = 0; c < 4; c++) {
+      int sum = 0;
+      int bx = (startX >> 10) + ux + c - 3;
+      for (int t = 0; t < 8; t++) sum += fh[t] * row[Clip3(0, lastX, bx + t)];
+      hrow[rr][c] = Round2(sum, 3);
+    }
+  }
+  int32_t d[16];
+  DEV const uint8_t *sp = src + fp->offset[0] + (m->y + uy) * stride + m->x + ux;
+  for (int r = 0; r < 4; r++)
+    for (int c = 0; c < 4; c++) {
+      int sum = 0;
+      for (int t = 0; t < 8; t++) sum += fv[t] * hrow[r + t][c];
+      d[r * 4 + c] = (int)sp[r * stride + c] - Clip1(Round2(sum, 11));
+    }
+  return satd4x4(d);
+}
+
 /* One SIMD group (32 lanes) per search node of one level. */
 kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
                     device const uint8_t *src [[buffer(1)]],
@@ -78,25 +117,32 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
     int kmin = simd_min(best == gmin ? bestK : INT_MAX);
     me_candidate(&m, kmin, &dy, &dx);
   }
-  /* sub-pel: lane 0 holds the centre, lanes 1..8 the neighbours; the
-   * (cost, index) minimum equals the serial first minimum of me_finish */
-  device int32_t *ls = scratch + (long)sbIdx * ME_SB_INTS + ((long)i * ME_LANES + lane) * me_slot(level);
+  /* sub-pel: the 9 candidates (centre + 8 neighbours) x 4x4 units are
+   * spread over the lanes; per-candidate sums by simd_sum. The (cost, index)
+   * minimum equals the serial first minimum of me_finish. */
   int mvr = dy * 8, mvc = dx * 8, bestS = 0;
+  int nUnits = (m.w >> 2) * (m.w >> 2);
   for (int step = 4; step >= 2; step >>= 1) {
-    int c = INT_MAX;
-    if (lane == 0) {
-      c = step == 4 ? me_subpel_cost(fp, src, ref, &m, mvr, mvc, ls) : bestS;
-    } else if (lane < ME_LANES) {
-      int dr, dc;
-      me_neighbour((int)lane - 1, step, &dr, &dc);
-      c = me_subpel_cost(fp, src, ref, &m, mvr + dr, mvc + dc, ls);
+    int sums[ME_LANES];
+    for (int k = 0; k < ME_LANES; k++) sums[k] = 0;
+    int first = step == 4 ? 0 : 1; /* the quarter step reuses the centre cost */
+    for (int w = (int)lane; w < (ME_LANES - first) * nUnits; w += 32) {
+      int k = first + w / nUnits, u = w % nUnits;
+      int dr = 0, dc = 0;
+      if (k > 0) me_neighbour(k - 1, step, &dr, &dc);
+      sums[k] += me_unit_satd(fp, src, ref, &m, mvr + dr, mvc + dc, u);
     }
-    int gmin = simd_min(c);
-    int kmin = simd_min(c == gmin ? (int)lane : INT_MAX);
-    bestS = gmin;
-    if (kmin > 0) {
+    int bc = INT_MAX, bk = 0;
+    for (int k = 0; k < ME_LANES; k++) {
+      int c = (k == 0 && step == 2) ? bestS : simd_sum(sums[k]);
+      if (k >= first || step == 2) {
+        if (c < bc) { bc = c; bk = k; }
+      }
+    }
+    bestS = bc;
+    if (bk > 0) {
       int dr, dc;
-      me_neighbour(kmin - 1, step, &dr, &dc);
+      me_neighbour(bk - 1, step, &dr, &dc);
       mvr += dr;
       mvc += dc;
     }

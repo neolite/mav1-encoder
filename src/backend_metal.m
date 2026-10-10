@@ -51,6 +51,7 @@ static void run(Mav1MetalState *s, void (^encode)(id<MTLComputeCommandEncoder>))
     [enc endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
+    if (getenv("MAV1_GPUT")) fprintf(stderr, "gpu %.2fms\n", (cb.GPUEndTime - cb.GPUStartTime) * 1000);
     if (cb.error) fprintf(stderr, "mav1 metal: command buffer error: %s\n", cb.error.localizedDescription.UTF8String);
   }
 }
