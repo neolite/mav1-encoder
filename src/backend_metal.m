@@ -228,7 +228,7 @@ static void mtl_frame_core(Backend *b, struct Mav1Encoder *e) {
   Mav1MetalState *s = ST(b);
   const FrameParams *fp = ENC_PARAMS(e);
   int inter = !fp->frame_is_intra;
-  int rowsPer = getenv("MAV1_BAND") ? atoi(getenv("MAV1_BAND")) : 2;
+  int rowsPer = getenv("MAV1_BAND") ? atoi(getenv("MAV1_BAND")) : e->sb_rows >= 16 ? 4 : 2; /* bigger bands from 1080p on */
   if (rowsPer < 1) rowsPer = 1;
   int nb = (e->sb_rows + rowsPer - 1) / rowsPer;
   NSMutableArray<dispatch_semaphore_t> *done = [NSMutableArray arrayWithCapacity:(NSUInteger)nb + 1];
