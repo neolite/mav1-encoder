@@ -61,6 +61,8 @@ struct Mav1Encoder {
   /* Shared (CPU/GPU) buffers. */
   Buf src, rec, ref, gold, mvgold, params, blocks, sbs, coefs, mats, mvfield, scratch, lfmask, cdefbuf, mescratch, acosts, ainfos, ascratch;
   Buf dbk, lrout, lrunits;
+  unsigned ref_gen, gold_gen; /* generation of the pictures in ref / gold (0: unknown) */
+  unsigned slot_gen[8], gen;  /* generation of each slot's picture (bumped per refresh) */
   Buf hpel;                 /* turbo: quarter-pel planes of the motion search references */  /* deblocked copy, LR output, LrUnit per unit */
 
   MiInfo *mi;               /* mi_rows * mi_cols */

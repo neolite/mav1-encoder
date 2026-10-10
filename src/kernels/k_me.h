@@ -53,12 +53,19 @@ typedef struct {
 #define T_ME_REF2 512  /* 64x64 full-pel refinement +-2 around the coarse winner (instead of +-3) */
 #define T_ME_DEC 32    /* 64x64 coarse grid (step 4) on 4x4-decimated planes */
 
-/* Decimated planes (T_ME_DEC): 4x4 means of the source (d = 0) and of the
- * references (d = 1 + r), after the 32 quarter-pel planes. */
+/* Plane buffer of the turbo motion search: ME_QP_ENTRIES entries, each the
+ * 16 quarter-pel planes of one reference followed by its 4x4-decimated
+ * plane (T_ME_DEC), then the decimated source. Entries are reused across
+ * frames for the same reference picture. */
+#define ME_QP_ENTRIES 3
 INLINE int dec_w(DEV const FrameParams *fp) { return (fp->frame_w + 3) >> 2; }
 INLINE int dec_h(DEV const FrameParams *fp) { return (fp->frame_h + 3) >> 2; }
-INLINE DEV const uint8_t *dec_plane(DEV const FrameParams *fp, DEV const uint8_t *qpBase, int d) {
-  return qpBase + (size_t)32 * fp->frame_w * fp->frame_h + (size_t)d * dec_w(fp) * dec_h(fp);
+INLINE long qp_entry_bytes(DEV const FrameParams *fp) {
+  return 16L * fp->frame_w * fp->frame_h + (long)dec_w(fp) * dec_h(fp);
+}
+/* decimated plane of an entry */
+INLINE DEV const uint8_t *qp_dec(DEV const FrameParams *fp, DEV const uint8_t *entry) {
+  return entry + 16L * fp->frame_w * fp->frame_h;
 }
 INLINE void dec_build(DEV const FrameParams *fp, DEV const uint8_t *pl, DEV uint8_t *out, int y, int x) {
   int s = 0;

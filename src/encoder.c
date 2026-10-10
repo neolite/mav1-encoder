@@ -142,7 +142,7 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
     }
     ok |= buf_alloc(&e->ascratch, sizeof(int32_t) * mx);
   }
-  ok |= buf_alloc(&e->hpel, e->cfg.turbo ? (size_t)32 * e->w * e->h + (size_t)3 * ((e->w + 3) >> 2) * ((e->h + 3) >> 2) : 0);
+  ok |= buf_alloc(&e->hpel, e->cfg.turbo ? (size_t)(ME_QP_ENTRIES * 16 + 1) * e->w * e->h + (size_t)(ME_QP_ENTRIES + 1) * ((e->w + 3) >> 2) * ((e->h + 3) >> 2) : 0);
   ok |= buf_alloc(&e->mescratch, sizeof(int32_t) * ME_SB_INTS * (size_t)e->num_sbs);
   ok |= buf_alloc(&e->scratch, sizeof(int32_t) * SCRATCH_INTS * (size_t)e->num_sbs);
   ok |= buf_alloc(&e->lfmask, (size_t)e->mi_rows * e->mi_cols);
@@ -666,6 +666,8 @@ static void alt_code(Mav1Encoder *e, const uint8_t *frame, int disp, int isKey, 
     h->skip_mode_allowed = h->reference_select;
     memcpy(e->ref.base, e->slot[lastSlot].base, e->frame_bytes);
     if (arfSlot >= 0) memcpy(e->gold.base, e->slot[arfSlot].base, e->frame_bytes);
+    e->ref_gen = e->slot_gen[lastSlot];
+    e->gold_gen = arfSlot >= 0 ? e->slot_gen[arfSlot] : 0;
   }
   uint8_t *tile = NULL;
   size_t tileSize = run_frame(e, isKey, &tile);
@@ -681,8 +683,10 @@ static void alt_code(Mav1Encoder *e, const uint8_t *frame, int disp, int isKey, 
   *pos += write_frame_obu(e, tile, tileSize, *buf + *pos);
   free(tile);
   e->last.t_entropy += now() - t3;
+  if (h->refresh_frame_flags) e->gen++;
   for (int s = 0; s < 8; s++)
     if ((h->refresh_frame_flags >> s) & 1) {
+      e->slot_gen[s] = e->gen;
       e->slot_hint[s] = h->order_hint;
       if (e->slot[s].base) memcpy(e->slot[s].base, e->rec.base, e->frame_bytes);
     }

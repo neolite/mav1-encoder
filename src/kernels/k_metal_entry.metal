@@ -84,22 +84,24 @@ INLINE int me_unit_satd(DEV const FrameParams *fp, DEV const uint8_t *src, DEV c
   return satd4x4(d);
 }
 
-/* Quarter-pel planes of LAST (and the second reference): one thread per sample. */
+/* Quarter-pel and decimated planes of one reference into a plane-buffer
+ * entry (mode.x) and the decimated source (mode.y): one thread per sample. */
 kernel void mav1_hpel(device const FrameParams *fp [[buffer(0)]],
                       device const uint8_t *ref [[buffer(1)]],
-                      device const uint8_t *gold [[buffer(2)]],
-                      device uint8_t *hp [[buffer(3)]],
+                      device uint8_t *entry [[buffer(3)]],
                       device const uint8_t *src [[buffer(4)]],
+                      device uint8_t *srcDec [[buffer(5)]],
+                      constant int2 &mode [[buffer(6)]],
                       uint gid [[thread_position_in_grid]]) {
   int n = fp->frame_w * fp->frame_h;
-  int r = (int)gid / n, o = (int)gid % n;
-  if (r > 1 || (r == 1 && !fp->golden)) return;
-  int y = o / fp->frame_w, x = o % fp->frame_w;
-  qpel_build(fp, r ? gold : ref, hp + (long)r * 16 * n, y, x);
-  if ((fp->turbo & T_ME_DEC) && y < dec_h(fp) && x < dec_w(fp)) {
-    dec_build(fp, r ? gold : ref, (device uint8_t *)dec_plane(fp, hp, 1 + r), y, x);
-    if (r == 0) dec_build(fp, src, (device uint8_t *)dec_plane(fp, hp, 0), y, x);
+  if ((int)gid >= n) return;
+  int y = (int)gid / fp->frame_w, x = (int)gid % fp->frame_w;
+  int dec = (fp->turbo & T_ME_DEC) && y < dec_h(fp) && x < dec_w(fp);
+  if (mode.x) {
+    qpel_build(fp, ref, entry, y, x);
+    if (dec) dec_build(fp, ref, entry + 16L * n, y, x);
   }
+  if (mode.y && dec) dec_build(fp, src, srcDec, y, x);
 }
 
 /* One SIMD group (32 lanes) per search node of one level. */
@@ -113,21 +115,22 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
                     device int32_t *mvFieldGold [[buffer(7)]],
                     device const uint8_t *hp [[buffer(8)]],
                     constant int2 &band [[buffer(9)]],
+                    device const uint8_t *hpGold [[buffer(10)]],
+                    device const uint8_t *ds [[buffer(11)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint lane [[thread_index_in_simdgroup]]) {
   /* groups [0, nodes): LAST, [nodes, 2 * nodes): GOLDEN */
   /* superblocks [band.x, band.x + band.y) */
   int nn = 1 << (2 * level), nodes = band.y * nn;
   int g = (int)tg;
-  DEV const uint8_t *ds = dec_plane(fp, hp, 0), *dr = dec_plane(fp, hp, 1);
   if (g >= nodes) {
-    dr = dec_plane(fp, hp, 2);
     if (!fp->golden || g >= 2 * nodes) return;
     g -= nodes;
     ref = gold;
     mvField = mvFieldGold;
-    hp += 16 * (long)fp->frame_w * fp->frame_h;
+    hp = hpGold;
   }
+  DEV const uint8_t *dr = qp_dec(fp, hp);
   int sbIdx = band.x + g / nn, i = g % nn;
   MeNode m = me_node(fp, sbIdx, level, i, mvField);
   device int32_t *out = mvField + (sbIdx * NUM_NODES + NODE_BASE(level) + i) * 2;

@@ -24,16 +24,21 @@ static void cpu_motion_search(Backend *b, struct Mav1Encoder *e) {
   (void)b;
   const FrameParams *fp = ENC_PARAMS(e);
   int nref = fp->golden ? 2 : 1;
+  /* plane buffer entries 0 (LAST) and 1 (second reference), rebuilt every frame */
+  uint8_t *qp = e->hpel.base, *srcDec = qp + ME_QP_ENTRIES * qp_entry_bytes(fp);
   if (fp->turbo & T_ME_HPEL) {
     int W = fp->frame_w, H = fp->frame_h;
-    dispatch_apply((size_t)H * nref, DISPATCH_APPLY_AUTO, ^(size_t g) {
+    dispatch_apply((size_t)H * (nref + 1), DISPATCH_APPLY_AUTO, ^(size_t g) {
       int r = (int)g / H, y = (int)g % H;
       for (int x = 0; x < W; x++) {
-        qpel_build(fp, r ? e->gold.base : e->ref.base, e->hpel.base + (size_t)r * 16 * W * H, y, x);
-        if ((fp->turbo & T_ME_DEC) && y < dec_h(fp) && x < dec_w(fp)) {
-          dec_build(fp, r ? e->gold.base : e->ref.base, (uint8_t *)dec_plane(fp, e->hpel.base, 1 + r), y, x);
-          if (r == 0) dec_build(fp, e->src.base, (uint8_t *)dec_plane(fp, e->hpel.base, 0), y, x);
+        int dec = (fp->turbo & T_ME_DEC) && y < dec_h(fp) && x < dec_w(fp);
+        if (r == nref) {
+          if (dec) dec_build(fp, e->src.base, srcDec, y, x);
+          continue;
         }
+        uint8_t *ent = qp + r * qp_entry_bytes(fp);
+        qpel_build(fp, r ? e->gold.base : e->ref.base, ent, y, x);
+        if (dec) dec_build(fp, r ? e->gold.base : e->ref.base, ent + 16L * W * H, y, x);
       }
     });
   }
@@ -43,8 +48,7 @@ static void cpu_motion_search(Backend *b, struct Mav1Encoder *e) {
     dispatch_apply((size_t)nodes * nref, DISPATCH_APPLY_AUTO, ^(size_t g) {
       int r = (int)g / nodes, sb = ((int)g % nodes) / nn, i = (int)g % nn;
       me_node_serial(fp, sb, level, i, e->src.base, r ? e->gold.base : e->ref.base,
-                     e->hpel.base + (size_t)r * 16 * fp->frame_w * fp->frame_h, dec_plane(fp, e->hpel.base, 0),
-                     dec_plane(fp, e->hpel.base, 1 + r),
+                     qp + r * qp_entry_bytes(fp), srcDec, qp_dec(fp, qp + r * qp_entry_bytes(fp)),
                      (int32_t *)(r ? e->mvgold.base : e->mvfield.base),
                      (int32_t *)e->scratch.base + (size_t)sb * SCRATCH_INTS + r * (SCRATCH_INTS / 2));
     });

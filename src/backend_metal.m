@@ -26,6 +26,9 @@
 typedef struct {
   Backend base;
   void *state; /* retained Mav1MetalState */
+  /* plane buffer entries: reference generation held (0: none), last use */
+  unsigned qpGen[ME_QP_ENTRIES], qpUse[ME_QP_ENTRIES], qpClock;
+  int qpLast, qpGold; /* entries of the current frame's references */
 } MetalBackend;
 
 static Mav1MetalState *ST(Backend *b) { return (__bridge Mav1MetalState *)((MetalBackend *)b)->state; }
@@ -62,21 +65,55 @@ static void run(Mav1MetalState *s, void (^encode)(id<MTLComputeCommandEncoder>))
 
 /* Encoders of the motion search / analysis stages for superblocks
  * [sb0, sb0 + nsb) (bands of SB rows; the whole frame otherwise). */
-static void enc_qpel(Mav1MetalState *s, id<MTLComputeCommandEncoder> enc, struct Mav1Encoder *e) {
+/* Entry holding the planes of reference generation `gen` (0: never
+ * cached), never `avoid`; *build when it must be (re)computed. */
+static int qp_pick(MetalBackend *m, unsigned gen, int avoid, int *build) {
+  m->qpClock++;
+  for (int k = 0; k < ME_QP_ENTRIES; k++)
+    if (gen && m->qpGen[k] == gen && k != avoid) {
+      m->qpUse[k] = m->qpClock;
+      *build = 0;
+      return k;
+    }
+  int best = -1;
+  for (int k = 0; k < ME_QP_ENTRIES; k++)
+    if (k != avoid && (best < 0 || m->qpUse[k] < m->qpUse[best])) best = k;
+  m->qpGen[best] = gen;
+  m->qpUse[best] = m->qpClock;
+  *build = 1;
+  return best;
+}
+
+static void enc_qpel(Backend *b, id<MTLComputeCommandEncoder> enc, struct Mav1Encoder *e) {
+  MetalBackend *m = (MetalBackend *)b;
+  Mav1MetalState *s = ST(b);
   const FrameParams *fp = ENC_PARAMS(e);
+  long eb = qp_entry_bytes(fp);
+  int buildLast, buildGold = 0;
+  m->qpLast = qp_pick(m, e->ref_gen, -1, &buildLast);
+  m->qpGold = fp->golden ? qp_pick(m, e->gold_gen, m->qpLast, &buildGold) : m->qpLast;
+  NSUInteger n = (NSUInteger)fp->frame_w * fp->frame_h;
   [enc setComputePipelineState:s.hpel];
   [enc setBuffer:wrap(s, &e->params) offset:0 atIndex:0];
-  [enc setBuffer:wrap(s, &e->ref) offset:0 atIndex:1];
-  [enc setBuffer:wrap(s, gold_buf(e)) offset:0 atIndex:2];
-  [enc setBuffer:wrap(s, &e->hpel) offset:0 atIndex:3];
   [enc setBuffer:wrap(s, &e->src) offset:0 atIndex:4];
-  NSUInteger n = (NSUInteger)2 * fp->frame_w * fp->frame_h;
-  [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+  [enc setBuffer:wrap(s, &e->hpel) offset:(NSUInteger)(ME_QP_ENTRIES * eb) atIndex:5];
+  for (int r = 0; r < 2; r++) {
+    int bld = r ? buildGold : buildLast;
+    if (r && !bld) continue;
+    int mode[2] = {bld, r == 0};
+    [enc setBuffer:wrap(s, r ? gold_buf(e) : &e->ref) offset:0 atIndex:1];
+    [enc setBuffer:wrap(s, &e->hpel) offset:(NSUInteger)((r ? m->qpGold : m->qpLast) * eb) atIndex:3];
+    [enc setBytes:mode length:sizeof mode atIndex:6];
+    [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+  }
   [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
-static void enc_me(Mav1MetalState *s, id<MTLComputeCommandEncoder> enc, struct Mav1Encoder *e, int level, int sb0,
+static void enc_me(Backend *b, id<MTLComputeCommandEncoder> enc, struct Mav1Encoder *e, int level, int sb0,
                    int nsb) {
+  MetalBackend *mb = (MetalBackend *)b;
+  Mav1MetalState *s = ST(b);
+  long eb = qp_entry_bytes(ENC_PARAMS(e));
   [enc setComputePipelineState:s.me];
   [enc setBuffer:wrap(s, &e->params) offset:0 atIndex:0];
   [enc setBuffer:wrap(s, &e->src) offset:0 atIndex:1];
@@ -85,7 +122,9 @@ static void enc_me(Mav1MetalState *s, id<MTLComputeCommandEncoder> enc, struct M
   [enc setBuffer:wrap(s, &e->mescratch) offset:0 atIndex:4];
   [enc setBuffer:wrap(s, gold_buf(e)) offset:0 atIndex:6];
   [enc setBuffer:wrap(s, &e->mvgold) offset:0 atIndex:7];
-  [enc setBuffer:wrap(s, &e->hpel) offset:0 atIndex:8];
+  [enc setBuffer:wrap(s, &e->hpel) offset:(NSUInteger)(mb->qpLast * eb) atIndex:8];
+  [enc setBuffer:wrap(s, &e->hpel) offset:(NSUInteger)(mb->qpGold * eb) atIndex:10];
+  [enc setBuffer:wrap(s, &e->hpel) offset:(NSUInteger)(ME_QP_ENTRIES * eb) atIndex:11];
   int band[2] = {sb0, nsb};
   [enc setBytes:band length:sizeof band atIndex:9];
   int nref = ENC_PARAMS(e)->golden ? 2 : 1;
@@ -127,12 +166,12 @@ static void enc_ana(Mav1MetalState *s, id<MTLComputeCommandEncoder> enc, struct 
 static void mtl_motion_search(Backend *b, struct Mav1Encoder *e) {
   Mav1MetalState *s = ST(b);
   int one = getenv("MAV1_MELEVEL") ? 1 : 0; /* profiling: one command buffer per level (and the planes) */
-  if (one && (ENC_PARAMS(e)->turbo & T_ME_HPEL)) run(s, ^(id<MTLComputeCommandEncoder> enc) { enc_qpel(s, enc, e); });
+  if (one && (ENC_PARAMS(e)->turbo & T_ME_HPEL)) run(s, ^(id<MTLComputeCommandEncoder> enc) { enc_qpel(b, enc, e); });
   for (int L = 0; L <= (one ? 3 : 0); L++)
   run(s, ^(id<MTLComputeCommandEncoder> enc) {
-    if ((ENC_PARAMS(e)->turbo & T_ME_HPEL) && L == 0 && !one) enc_qpel(s, enc, e);
+    if ((ENC_PARAMS(e)->turbo & T_ME_HPEL) && L == 0 && !one) enc_qpel(b, enc, e);
     /* levels depend on their parents: one dispatch each */
-    for (int level = one ? L : 0; level < (one ? L + 1 : 4); level++) enc_me(s, enc, e, level, 0, e->num_sbs);
+    for (int level = one ? L : 0; level < (one ? L + 1 : 4); level++) enc_me(b, enc, e, level, 0, e->num_sbs);
   });
 }
 
@@ -184,12 +223,12 @@ static void mtl_frame_core(Backend *b, struct Mav1Encoder *e) {
       id<MTLCommandBuffer> cb = [s.queue commandBuffer];
       id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
       if (k < 0) {
-        if (inter && (fp->turbo & T_ME_HPEL)) enc_qpel(s, enc, e);
-        for (int l = 0; l < 2; l++) if (inter) enc_me(s, enc, e, l, 0, e->num_sbs);
+        if (inter && (fp->turbo & T_ME_HPEL)) enc_qpel(b, enc, e);
+        for (int l = 0; l < 2; l++) if (inter) enc_me(b, enc, e, l, 0, e->num_sbs);
         for (int l = 0; l < 2; l++) enc_ana(s, enc, e, l, 0, e->num_sbs);
       } else {
         int sb0 = k * rowsPer * e->sb_cols, nsb = k_min(e->num_sbs - sb0, rowsPer * e->sb_cols);
-        for (int l = 2; l < 4; l++) if (inter) enc_me(s, enc, e, l, sb0, nsb);
+        for (int l = 2; l < 4; l++) if (inter) enc_me(b, enc, e, l, sb0, nsb);
         for (int l = 2; l < 4; l++) enc_ana(s, enc, e, l, sb0, nsb);
       }
       [enc endEncoding];
