@@ -175,7 +175,7 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
    * minimum equals the serial first minimum of me_finish. */
   int mvr = m.stages ? dy * 8 : m.pr, mvc = m.stages ? dx * 8 : m.pc, bestS = 0;
   int nUnits = (m.w >> 2) * (m.w >> 2);
-  for (int step = 4; step >= 2; step >>= 1) {
+  for (int step = 4; step >= me_min_step(fp, m.w); step >>= 1) {
     int sums[ME_LANES];
     for (int k = 0; k < ME_LANES; k++) sums[k] = 0;
     int first = step == 4 ? 0 : 1; /* the quarter step reuses the centre cost */
@@ -1261,7 +1261,7 @@ kernel void mav1_me_tg(device const FrameParams *fp [[buffer(0)]],
   }
   int mvr = m.stages ? dy * 8 : m.pr, mvc = m.stages ? dx * 8 : m.pc, bestS = 0;
   int nUnits = (m.w >> 2) * (m.w >> 2);
-  for (int step = 4; step >= 2; step >>= 1) {
+  for (int step = 4; step >= me_min_step(fp, m.w); step >>= 1) {
     int bc = INT_MAX, bk = 0;
     for (int k = 0; k < 1 + me_nb_count(fp); k++) {
       int c;

@@ -84,6 +84,8 @@ typedef struct {
 #define T_ME_DEC 32    /* 64x64 coarse grid (step 4) on 4x4-decimated planes */
 #define T_ME_CROSS 8192 /* sub-pel steps try the 4 axial neighbours only */
 #define T_ME_G3COPY 16384 /* leaf frames: 8x8 nodes of the second reference take the 16x16 parent's vector */
+#define T_ME_HALF01 32768 /* 64x64 and 32x32 nodes: half-pel refinement only */
+INLINE int me_min_step(DEV const FrameParams *fp, int w) { return w >= 32 && (fp->turbo & T_ME_HALF01) ? 4 : 2; }
 INLINE int me_gold_copy(DEV const FrameParams *fp, int level) {
   return level == 3 && (fp->turbo & T_ME_G3COPY) && fp->leaf && !fp->frame_is_intra;
 }
@@ -248,7 +250,7 @@ INLINE void me_finish(DEV const FrameParams *fp, DEV const uint8_t *src, DEV con
                       THR const MeNode *m, int by, int bx, DEV int32_t *out, DEV int32_t *scratch) {
   int mvr = m->stages ? by * 8 : m->pr, mvc = m->stages ? bx * 8 : m->pc;
   int bestS = me_subpel_cost(fp, src, ref, hp, m, mvr, mvc, scratch);
-  for (int step = 4; step >= 2; step >>= 1) {
+  for (int step = 4; step >= me_min_step(fp, m->w); step >>= 1) {
     int cr = mvr, cc = mvc;
     for (int k = 0; k < me_nb_count(fp); k++) {
       int dr, dc;

@@ -363,8 +363,9 @@ static void setup_params(Mav1Encoder *e, int isKey) {
    * quality, off by default; 16 quarter-pel planes, 32 decimated coarse grid,
    * 64 children +-2, 512 64x64 refinement +-2); 128 reduced intra search in
    * inter frames; 256 square partitions on key frames too; 1024 no 8x8 in leaf frames (off by
-   * default); 2048 two CDEF sets (off and MAV1_CP, default preset 2) */
-  fp->turbo = e->cfg.turbo ? (getenv("MAV1_TURBO") ? (int)strtol(getenv("MAV1_TURBO"), NULL, 0) : 0xBF1) : 0;
+   * default); 2048 two CDEF sets (off and MAV1_CP, default preset 2); 4096, 8192, 16384 (off),
+   * 32768 half-pel only for 64x64 / 32x32 search nodes (k_me.h) */
+  fp->turbo = e->cfg.turbo ? (getenv("MAV1_TURBO") ? (int)strtol(getenv("MAV1_TURBO"), NULL, 0) : 0x8BF1) : 0;
   fp->leaf = e->cfg.leaf ? (e->leafopt & 1) : e->nonref && !getenv("MAV1_LEAFINTRA");
   if (e->leafopt & 16) fp->tx_search = 0;
   /* turbo depth pruning (SVT-style): a node is not split when an ancestor's
@@ -372,7 +373,8 @@ static void setup_params(Mav1Encoder *e, int isKey) {
    * the quantizer (MAV1_DT: the value at qindex 128) */
   {
     int dt = getenv("MAV1_DT") ? atoi(getenv("MAV1_DT")) : e->sb_rows >= 16 ? 288 : 352;
-    fp->depth_thr = e->cfg.turbo ? dt * q / 128 : 0;
+    int bias = getenv("MAV1_DTB") ? atoi(getenv("MAV1_DTB")) : 0;
+    fp->depth_thr = e->cfg.turbo ? dt * (q + bias) / (128 + bias) : 0;
   }
   fp->tile_w_sb = e->tile_w_sb;
   long acq = fp->ac_q[0];
