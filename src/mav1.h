@@ -32,6 +32,7 @@ typedef struct {
   int nonref_odd;       /* odd frames are non-reference leaf frames */
   int fast;              /* reduced mode/partition search */
   int multi_ref;         /* GOLDEN reference (slot 1, refreshed every 4th frame) besides LAST */
+  int altref;            /* ALTREF mini-GOP length (0: off): hidden future frame, shown by show_existing_frame */
   int switchable_interp; /* per-block dual interpolation filter choice */
   int lr_test;         /* testing: force Wiener / self-guided on alternate units, ignoring rate */
   int me_range;        /* full-pel motion search range */
@@ -54,6 +55,12 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen);
  * malloc'ed buffer the caller frees. Returns 0 on success. */
 int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int strides[3],
                 uint8_t **out, size_t *outSize);
+/* Queue interface (needed with altref, which reorders frames): send input
+ * frames (planes == NULL at the end of the stream), then receive temporal
+ * units until it returns 1. Every temporal unit shows exactly one frame, in
+ * display order; mav1_get_recon / mav1_last_stats then describe it. */
+int mav1_send_frame(Mav1Encoder *e, const uint8_t *const planes[3], const int strides[3]);
+int mav1_receive_packet(Mav1Encoder *e, uint8_t **out, size_t *outSize);
 /* Writes the sequence header OBU (with OBU header) and returns its size;
  * `out` must hold at least 64 bytes. */
 size_t mav1_sequence_header(const Mav1Encoder *e, uint8_t *out);

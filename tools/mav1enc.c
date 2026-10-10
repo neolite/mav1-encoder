@@ -10,7 +10,7 @@
 static void usage(void) {
   fprintf(stderr,
           "usage: mav1enc -i in.y4m -o out.ivf [-r recon.y4m] [-q qindex] [-n frames]\n"
-          "               [--cpu|--metal] [--keyint N] [--no-lf] [--no-cdef] [--no-txsearch] [--no-txdepth] [--no-lr] [--lr-test] [--no-switchable] [--fast] [--golden] [--no-edge] [--tiles LOG2]\n"
+          "               [--cpu|--metal] [--keyint N] [--no-lf] [--no-cdef] [--no-txsearch] [--no-txdepth] [--no-lr] [--lr-test] [--no-switchable] [--fast] [--golden] [--altref N] [--no-edge] [--tiles LOG2]\n"
           "               [--me-range N] [-v]\n");
   exit(2);
 }
@@ -28,7 +28,7 @@ static double psnr(const uint8_t *a, const uint8_t *b, size_t n) {
 
 int main(int argc, char **argv) {
   const char *in = NULL, *outp = NULL, *recp = NULL;
-  int q = 100, nframes = 1 << 30, metal = 1, keyint = 0, lf = 1, cdef = 1, txs = 1, txd = 1, lr = 1, lrt = 0, sw = 1, fast = 0, gold = 0, edge = 1, tiles = -1, verbose = 0, mer = 32;
+  int q = 100, nframes = 1 << 30, metal = 1, keyint = 0, lf = 1, cdef = 1, txs = 1, txd = 1, lr = 1, lrt = 0, sw = 1, fast = 0, gold = 0, altref = 0, edge = 1, tiles = -1, verbose = 0, mer = 32;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "-i") && i + 1 < argc) in = argv[++i];
     else if (!strcmp(argv[i], "-o") && i + 1 < argc) outp = argv[++i];
@@ -48,6 +48,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--no-switchable")) sw = 0;
     else if (!strcmp(argv[i], "--fast")) fast = 1;
     else if (!strcmp(argv[i], "--golden")) gold = 1;
+    else if (!strcmp(argv[i], "--altref") && i + 1 < argc) altref = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--no-edge")) edge = 0;
     else if (!strcmp(argv[i], "--tiles") && i + 1 < argc) tiles = atoi(argv[++i]);
     else if (!strcmp(argv[i], "-v")) verbose = 1;
@@ -80,6 +81,7 @@ int main(int argc, char **argv) {
   cfg.me_range = mer;
   cfg.fast = fast;
   cfg.multi_ref = gold;
+  cfg.altref = altref;
   cfg.nonref_odd = getenv("MAV1_NREF") ? 1 : 0;
   cfg.intra_edge_filter = edge;
   cfg.tile_cols_log2 = tiles >= 0 ? tiles : fast ? 3 : 0;
@@ -96,19 +98,30 @@ int main(int argc, char **argv) {
 
   int cw = (w + 1) / 2, ch = (h + 1) / 2;
   size_t ysz = (size_t)w * h, csz = (size_t)cw * ch;
-  uint8_t *frame = malloc(ysz + 2 * csz), *rec = malloc(ysz + 2 * csz);
-  int count = 0;
+  /* input frames are kept until their temporal unit comes out (reordering) */
+  int ring = altref + 2;
+  size_t fsz = ysz + 2 * csz;
+  uint8_t *frames = malloc(fsz * ring), *rec = malloc(fsz);
+  int count = 0, sent = 0, eos = 0;
   size_t total = 0;
   double psum[3] = {0, 0, 0};
   long tools[16] = {0};
   double tsum[4] = {0, 0, 0, 0};
-  while (count < nframes && fgets(line, sizeof line, fi)) {
-    if (fread(frame, 1, ysz + 2 * csz, fi) != ysz + 2 * csz) break;
-    const uint8_t *planes[3] = {frame, frame + ysz, frame + ysz + csz};
-    int strides[3] = {w, cw, cw};
+  int strides[3] = {w, cw, cw};
+  while (!eos) {
+    if (sent < nframes && fgets(line, sizeof line, fi) && fread(frames + fsz * (sent % ring), 1, fsz, fi) == fsz) {
+      uint8_t *frame = frames + fsz * (sent % ring);
+      const uint8_t *planes[3] = {frame, frame + ysz, frame + ysz + csz};
+      if (mav1_send_frame(e, planes, strides)) { fprintf(stderr, "encode failed\n"); return 1; }
+      sent++;
+    } else {
+      mav1_send_frame(e, NULL, NULL);
+      eos = 1;
+    }
     uint8_t *pkt;
     size_t n;
-    if (mav1_encode(e, planes, strides, &pkt, &n)) { fprintf(stderr, "encode failed\n"); return 1; }
+    while (!mav1_receive_packet(e, &pkt, &n)) {
+    uint8_t *frame = frames + fsz * (count % ring);
     put_le32(fo, (unsigned)n); put_le64(fo, (unsigned long long)count);
     fwrite(pkt, 1, n, fo);
     free(pkt);
@@ -128,6 +141,7 @@ int main(int argc, char **argv) {
     for (int k = 0; k < 16; k++) tools[k] += st->tool_use[k];
     total += n;
     count++;
+    }
   }
   fseek(fo, 24, SEEK_SET);
   put_le32(fo, count);
@@ -145,7 +159,7 @@ int main(int argc, char **argv) {
     if (mav1_tool_names[k][0]) fprintf(stderr, " %s=%ld", mav1_tool_names[k], tools[k]);
   fprintf(stderr, "\n");
   mav1_destroy(e);
-  free(frame);
+  free(frames);
   free(rec);
   return 0;
 }

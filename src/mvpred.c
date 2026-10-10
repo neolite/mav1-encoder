@@ -131,7 +131,8 @@ static void extra_search(MvStack *s) {
       if (!is_inside(s, r, c)) break;
       const MiInfo *m = mi_at(s->e, r, c);
       if (m->is_inter && m->ref0 > INTRA_FRAME) { /* candList 1 is NONE */
-        int cand[2] = {m->mv_row, m->mv_col}; /* equal sign bias: LAST and GOLDEN both precede the frame */
+        int cand[2] = {m->mv_row, m->mv_col};
+        if (s->e->sign_bias[m->ref0] != s->e->sign_bias[s->refFrame]) { cand[0] *= -1; cand[1] *= -1; }
         int i;
         for (i = 0; i < s->numMvFound; i++)
           if (cand[0] == s->stack[i][0] && cand[1] == s->stack[i][1]) break;
@@ -249,6 +250,34 @@ int mvpred_valid_newmv(int mvRow, int mvCol) {
 
 static int ref_count_ctx(int c0, int c1) { return c0 < c1 ? 0 : c0 == c1 ? 1 : 2; }
 
+/* count_refs( ) of the CDF selection process (9.3) */
+static int count_refs(struct Mav1Encoder *e, int r, int c, int ft) {
+  int n = 0;
+  if (r > 0) n += (mi_at(e, r - 1, c)->ref0 == ft) + (mi_at(e, r - 1, c)->ref1 == ft);
+  if (c > tile_col_start(ENC_PARAMS(e), c)) n += (mi_at(e, r, c - 1)->ref0 == ft) + (mi_at(e, r, c - 1)->ref1 == ft);
+  return n;
+}
+
+/* single_ref_p1..p5 for LAST_FRAME, GOLDEN_FRAME or ALTREF_FRAME. */
+static void write_single_ref(EntEnc *ec, CdfContext *cdf, struct Mav1Encoder *e, int r, int c, int ref) {
+  int cnt[ALTREF_FRAME + 1];
+  for (int f = LAST_FRAME; f <= ALTREF_FRAME; f++) cnt[f] = count_refs(e, r, c, f);
+  int fwd = cnt[LAST_FRAME] + cnt[LAST2_FRAME] + cnt[LAST3_FRAME] + cnt[GOLDEN_FRAME];
+  int bwd = cnt[BWDREF_FRAME] + cnt[ALTREF2_FRAME] + cnt[ALTREF_FRAME];
+  int p1 = ref >= BWDREF_FRAME;
+  ec_symbol(ec, p1, cdf->single_ref[ref_count_ctx(fwd, bwd)][0], 2);
+  if (p1) {
+    if (ref != ALTREF_FRAME) abort();
+    ec_symbol(ec, 1, cdf->single_ref[ref_count_ctx(cnt[BWDREF_FRAME] + cnt[ALTREF2_FRAME], cnt[ALTREF_FRAME])][1], 2);
+    return;
+  }
+  if (ref != LAST_FRAME && ref != GOLDEN_FRAME) abort();
+  int p3 = ref == GOLDEN_FRAME;
+  ec_symbol(ec, p3, cdf->single_ref[ref_count_ctx(cnt[LAST_FRAME] + cnt[LAST2_FRAME], cnt[LAST3_FRAME] + cnt[GOLDEN_FRAME])][2], 2);
+  if (p3) ec_symbol(ec, 1, cdf->single_ref[ref_count_ctx(cnt[LAST3_FRAME], cnt[GOLDEN_FRAME])][4], 2);
+  else ec_symbol(ec, 0, cdf->single_ref[ref_count_ctx(cnt[LAST_FRAME], cnt[LAST2_FRAME])][3], 2);
+}
+
 int write_inter_block(EntEnc *ec, CdfContext *cdf, struct Mav1Encoder *e, const BlockInfo *b) {
   MvStack s;
   memset(&s, 0, sizeof(s));
@@ -261,24 +290,8 @@ int write_inter_block(EntEnc *ec, CdfContext *cdf, struct Mav1Encoder *e, const 
   s.refFrame = b->ref_frame;
   int r = b->mi_row, c = b->mi_col;
 
-  /* read_ref_frames (single reference, LAST or GOLDEN): single_ref_p1 = 0,
-   * single_ref_p3 = (GOLDEN), then single_ref_p4 = 0 (LAST) or
-   * single_ref_p5 = 1 (GOLDEN). count_refs( ) over the above / left
-   * neighbours (RefFrames[][1] is NONE, no backward references). */
-  int lastCount = 0, goldCount = 0;
-  if (r > 0) {
-    lastCount += mi_at(e, r - 1, c)->ref0 == LAST_FRAME;
-    goldCount += mi_at(e, r - 1, c)->ref0 == GOLDEN_FRAME;
-  }
-  if (c > tile_col_start(ENC_PARAMS(e), c)) {
-    lastCount += mi_at(e, r, c - 1)->ref0 == LAST_FRAME;
-    goldCount += mi_at(e, r, c - 1)->ref0 == GOLDEN_FRAME;
-  }
-  int isGold = b->ref_frame == GOLDEN_FRAME;
-  ec_symbol(ec, 0, cdf->single_ref[ref_count_ctx(lastCount + goldCount, 0)][0], 2);
-  ec_symbol(ec, isGold, cdf->single_ref[ref_count_ctx(lastCount, goldCount)][2], 2);
-  if (isGold) ec_symbol(ec, 1, cdf->single_ref[ref_count_ctx(0, goldCount)][4], 2);
-  else ec_symbol(ec, 0, cdf->single_ref[ref_count_ctx(lastCount, 0)][3], 2);
+  /* read_ref_frames, single reference (LAST, GOLDEN or ALTREF). */
+  write_single_ref(ec, cdf, e, r, c, b->ref_frame);
 
   find_mv_stack(&s);
 

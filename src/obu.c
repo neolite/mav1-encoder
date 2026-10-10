@@ -85,6 +85,18 @@ size_t write_temporal_delimiter(uint8_t *out) {
   return 2;
 }
 
+/* Frame header OBU with show_existing_frame = 1 (a non-key frame). */
+size_t write_show_existing(int slot, uint8_t *out) {
+  BitWriter w;
+  bw_init(&w);
+  bw_f(&w, 1, 1); /* show_existing_frame */
+  bw_f(&w, 3, slot); /* frame_to_show_map_idx */
+  bw_trailing_bits(&w);
+  size_t n = wrap_obu(3 /* OBU_FRAME_HEADER */, w.buf, bw_bytes(&w), out);
+  bw_free(&w);
+  return n;
+}
+
 static int tile_log2(int blk, int target) {
   int k = 0;
   while ((blk << k) < target) k++;
@@ -96,7 +108,8 @@ static void frame_header(const struct Mav1Encoder *e, BitWriter *w) {
   int intra = h->frame_type == KEY_FRAME;
   bw_f(w, 1, 0);                 /* show_existing_frame */
   bw_f(w, 2, h->frame_type);
-  bw_f(w, 1, 1);                 /* show_frame */
+  bw_f(w, 1, h->show_frame);
+  if (!h->show_frame) bw_f(w, 1, h->showable_frame);
   if (!intra) bw_f(w, 1, 0);     /* error_resilient_mode */
   bw_f(w, 1, 0);                 /* disable_cdf_update */
   bw_f(w, 1, 0);                 /* frame_size_override_flag */
@@ -107,9 +120,7 @@ static void frame_header(const struct Mav1Encoder *e, BitWriter *w) {
     bw_f(w, 1, 0);               /* render_and_frame_size_different */
   } else {
     bw_f(w, 1, 0);               /* frame_refs_short_signaling */
-    /* ref_frame_idx: LAST -> slot 0, GOLDEN -> slot 1 (multi_ref), others slot 0 */
-    for (int i = 0; i < REFS_PER_FRAME; i++)
-      bw_f(w, 3, e->cfg.multi_ref && i == GOLDEN_FRAME - LAST_FRAME ? 1 : 0);
+    for (int i = 0; i < REFS_PER_FRAME; i++) bw_f(w, 3, h->ref_idx[i]); /* ref_frame_idx */
     bw_f(w, 1, 0);               /* render_and_frame_size_different */
     bw_f(w, 1, 0);               /* allow_high_precision_mv */
     if (e->cfg.switchable_interp) {
@@ -196,7 +207,8 @@ static void frame_header(const struct Mav1Encoder *e, BitWriter *w) {
     }
   }
   if (!codedLossless) bw_f(w, 1, e->cfg.tx_depth != 0); /* tx_mode_select: TX_MODE_SELECT or TX_MODE_LARGEST */
-  if (!intra) bw_f(w, 1, 0);     /* reference_select */
+  if (!intra) bw_f(w, 1, h->reference_select);
+  if (h->skip_mode_allowed) bw_f(w, 1, 0); /* skip_mode_present */
   bw_f(w, 1, 0);                 /* reduced_tx_set */
   if (!intra)
     for (int ref = LAST_FRAME; ref <= ALTREF_FRAME; ref++) bw_f(w, 1, 0); /* is_global */

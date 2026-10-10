@@ -277,7 +277,7 @@ INLINE void recon_block(DEV const FrameParams *fp, DEV BlockInfo *b, DEV const u
                         DEV const uint8_t *ref, DEV const uint8_t *gold, DEV int32_t *coefs,
                         DEV const int32_t *mats, DEV int32_t *scratch, THR uint8_t *bd) {
   int bs = b->bsize;
-  if (b->ref_frame == GOLDEN_FRAME) ref = gold;
+  if (b->is_inter && b->ref_frame != LAST_FRAME) ref = gold; /* second reference */
   int MiRow = b->mi_row, MiCol = b->mi_col;
   int maxLumaW = 0, maxLumaH = 0;
   b->tx_depth = 0;

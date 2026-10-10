@@ -65,7 +65,8 @@ typedef struct {
   int32_t leaf;                       /* non-reference frame: inter only */
   int32_t depth_thr;                  /* depth early exit: SATD per sample x16 */
   int32_t switchable_interp;          /* interpolation_filter == SWITCHABLE (dual filter) */
-  int32_t golden;                     /* inter blocks may also predict from GOLDEN_FRAME */
+  int32_t golden;                     /* inter blocks may also predict from a second reference */
+  int32_t ref2_frame;                 /* that reference: GOLDEN_FRAME or ALTREF_FRAME */
   int32_t lf_level[4];                /* loop_filter_level[] */
   int32_t lf_sharpness;
   int32_t cdef_damping, cdef_bits;
@@ -99,7 +100,7 @@ typedef struct {
   int32_t tx_types_lo, tx_types_hi;     /* luma TxType of each transform, 4 bits each (raster) */
   int32_t interp_filter;                /* interp_filter[0] | interp_filter[1] << 2;
                                          * bit 4/5: get_filter_type( ) for luma/chroma */
-  int32_t ref_frame;                    /* RefFrame[ 0 ] of inter blocks (LAST_FRAME or GOLDEN_FRAME) */
+  int32_t ref_frame;                    /* RefFrame[ 0 ] of inter blocks (LAST_FRAME or fp->ref2_frame) */
 } BlockInfo;
 
 /* Per-superblock index range into the block list. */

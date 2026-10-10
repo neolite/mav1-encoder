@@ -63,6 +63,9 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
   }
   Mav1Encoder *e = calloc(1, sizeof(*e));
   e->cfg = *cfg;
+  if (e->cfg.altref == 1) e->cfg.altref = 0;
+  if (e->cfg.altref > 16) e->cfg.altref = 16;
+  if (e->cfg.altref) e->cfg.multi_ref = e->cfg.nonref_odd = 0; /* the second reference is ALTREF */
   if (e->cfg.qindex < 0) e->cfg.qindex = 0;
   if (e->cfg.qindex > 255) e->cfg.qindex = 255;
   e->w = cfg->width;
@@ -100,14 +103,21 @@ Mav1Encoder *mav1_create(const Mav1Config *cfg, char *err, size_t errlen) {
   ok |= buf_alloc(&e->src, e->frame_bytes);
   ok |= buf_alloc(&e->rec, e->frame_bytes);
   ok |= buf_alloc(&e->ref, e->frame_bytes);
-  if (cfg->multi_ref) ok |= buf_alloc(&e->gold, e->frame_bytes);
+  int ref2 = e->cfg.multi_ref || e->cfg.altref;
+  if (ref2) ok |= buf_alloc(&e->gold, e->frame_bytes);
+  if (e->cfg.altref) {
+    ok |= buf_alloc(&e->slot[0], e->frame_bytes);
+    ok |= buf_alloc(&e->slot[2], e->frame_bytes);
+    ok |= buf_alloc(&e->slot[3], e->frame_bytes);
+    e->inq = calloc((size_t)e->cfg.altref + 1, sizeof *e->inq);
+  }
   ok |= buf_alloc(&e->params, sizeof(FrameParams));
   ok |= buf_alloc(&e->blocks, sizeof(BlockInfo) * MAX_BLOCKS_PER_SB * e->num_sbs);
   ok |= buf_alloc(&e->sbs, sizeof(SbInfo) * e->num_sbs);
   ok |= buf_alloc(&e->coefs, sizeof(int32_t) * COEFS_PER_SB * e->num_sbs);
   ok |= buf_alloc(&e->mats, sizeof(int32_t) * FWD_SLOT_SIZE * FWD_NUM_SLOTS);
   ok |= buf_alloc(&e->mvfield, sizeof(int32_t) * 2 * NUM_NODES * e->num_sbs);
-  ok |= buf_alloc(&e->mvgold, cfg->multi_ref ? sizeof(int32_t) * 2 * NUM_NODES * e->num_sbs : 0);
+  ok |= buf_alloc(&e->mvgold, ref2 ? sizeof(int32_t) * 2 * NUM_NODES * e->num_sbs : 0);
   ok |= buf_alloc(&e->acosts, sizeof(long) * A_ITEMS * (size_t)e->num_sbs);
   ok |= buf_alloc(&e->ainfos, sizeof(BlockInfo) * A_ITEMS * (size_t)e->num_sbs);
   {
@@ -156,6 +166,13 @@ void mav1_destroy(Mav1Encoder *e) {
   buf_free(&e->rec);
   buf_free(&e->ref);
   buf_free(&e->gold);
+  for (int i = 0; i < 8; i++) buf_free(&e->slot[i]);
+  for (int i = 0; i < e->inq_n; i++) free(e->inq[i]);
+  free(e->inq);
+  for (int i = e->out_pos; i < e->out_n; i++) { free(e->outq[i].data); free(e->outq[i].recon); }
+  free(e->outq);
+  free(e->shown_recon);
+  if (e->pending) free(e->pend_data);
   buf_free(&e->mvgold);
   buf_free(&e->params);
   buf_free(&e->blocks);
@@ -265,6 +282,11 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   fp->switchable_interp = !isKey && e->cfg.switchable_interp;
   /* GOLDEN only when it holds another frame than LAST */
   fp->golden = !isKey && e->cfg.multi_ref && e->gold_id != e->last_id;
+  fp->ref2_frame = GOLDEN_FRAME;
+  if (e->cfg.altref) { /* frames inside a mini-GOP: ALTREF */
+    fp->golden = !isKey && e->frame_kind == 2;
+    fp->ref2_frame = ALTREF_FRAME;
+  }
   fp->fast = e->cfg.fast;
   fp->leaf = e->nonref && !getenv("MAV1_LEAFINTRA");
   fp->depth_thr = getenv("MAV1_DT") ? atoi(getenv("MAV1_DT")) : 0;
@@ -362,7 +384,7 @@ static void cdef_select(Mav1Encoder *e) {
 }
 
 const char *const mav1_tool_names[16] = {"intra", "inter", "cfl", "angle_delta", "tx_non_dct", "skip",
-                                          "rect_part", "compound", "obmc", "lr_wiener_units", "lr_sgr_units", "golden", "", "", "", ""};
+                                          "rect_part", "compound", "obmc", "lr_wiener_units", "lr_sgr_units", "golden", "altref", "", "", ""};
 
 static void count_tools(Mav1FrameStats *st, const BlockInfo *b) {
   st->tool_use[0] += !b->is_inter;
@@ -373,6 +395,7 @@ static void count_tools(Mav1FrameStats *st, const BlockInfo *b) {
   st->tool_use[5] += b->eob[0] == 0 && b->eob[1] == 0 && b->eob[2] == 0;
   st->tool_use[6] += Block_Width(b->bsize) != Block_Height(b->bsize);
   st->tool_use[11] += b->is_inter && b->ref_frame == GOLDEN_FRAME;
+  st->tool_use[12] += b->is_inter && b->ref_frame == ALTREF_FRAME;
 }
 
 /* Frame-level quantizer cascade (low delay): the key frame and every 4th
@@ -384,29 +407,14 @@ static int frame_qindex(const Mav1Encoder *e, int isKey) {
   if (q == 0) return 0;
   int off = isKey ? env_or("MAV1_QK", -24) : (e->order_hint % 4 == 0 ? env_or("MAV1_Q4", -8) : env_or("MAV1_QP", 4));
   if (!isKey && e->nonref) off = env_or("MAV1_QN", 12);
+  if (!isKey && e->cfg.altref) off = e->frame_kind == 1 ? env_or("MAV1_QA", -8) : env_or("MAV1_QP", 4);
   q += off;
   return q < 1 ? 1 : q > 255 ? 255 : q;
 }
 
-int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int strides[3], uint8_t **out,
-                size_t *outSize) {
-  int isKey = e->frame_num == 0 || (e->cfg.keyint > 0 && e->frame_num % e->cfg.keyint == 0);
-  memset(&e->last, 0, sizeof(e->last));
-  e->last.frame_type = isKey ? 0 : 1;
-  load_source(e, planes, strides);
-
-  FrameHdr *h = &e->hdr;
-  memset(h, 0, sizeof(*h));
-  /* two-layer temporal hierarchy (single reference): odd frames are not
-   * kept as references, so they are the cheap "leaf" frames */
-  e->nonref = !isKey && e->cfg.nonref_odd && (e->order_hint & 1);
-  h->frame_type = isKey ? KEY_FRAME : INTER_FRAME;
-  h->base_q_idx = frame_qindex(e, isKey);
-  if (isKey) e->order_hint = 0;
-  h->order_hint = e->order_hint;
-  /* GOLDEN (slot 1): key frames and every 4th frame (the finer-q ones) */
-  e->golden_refresh = !isKey && !e->nonref && e->cfg.multi_ref && e->order_hint % 4 == 0;
-  h->refresh_frame_flags = isKey ? 0xFF : (e->nonref ? 0x00 : 0x01 | (e->golden_refresh ? 0x02 : 0));
+/* Runs every stage of one frame whose header fields (e->hdr) and source are
+ * set; returns the tile data. The final reconstruction is left in `rec`. */
+static size_t run_frame(Mav1Encoder *e, int isKey, uint8_t **tile) {
   setup_params(e, isKey);
 
   double t0 = now();
@@ -431,15 +439,7 @@ int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int stride
     e->lrout = t;
   }
   double t3 = now();
-
-  uint8_t *tile = NULL;
-  size_t tileSize = write_tile(e, &tile);
-  size_t cap = tileSize + 1024;
-  uint8_t *buf = malloc(cap);
-  size_t pos = write_temporal_delimiter(buf);
-  if (isKey) pos += write_sequence_header(e, buf + pos);
-  pos += write_frame_obu(e, tile, tileSize, buf + pos);
-  free(tile);
+  size_t tileSize = write_tile(e, tile);
   double t4 = now();
 
   const SbInfo *sbs = ENC_SBS(e);
@@ -452,11 +452,47 @@ int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int stride
       count_tools(&e->last, b);
     }
   }
-  e->last.bytes = pos;
   e->last.t_analysis = t1 - t0;
   e->last.t_recon = t2 - t1;
   e->last.t_filter = t3 - t2;
   e->last.t_entropy = t4 - t3;
+  return tileSize;
+}
+
+int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int strides[3], uint8_t **out,
+                size_t *outSize) {
+  int isKey = e->frame_num == 0 || (e->cfg.keyint > 0 && e->frame_num % e->cfg.keyint == 0);
+  memset(&e->last, 0, sizeof(e->last));
+  e->last.frame_type = isKey ? 0 : 1;
+  load_source(e, planes, strides);
+
+  FrameHdr *h = &e->hdr;
+  memset(h, 0, sizeof(*h));
+  /* two-layer temporal hierarchy (single reference): odd frames are not
+   * kept as references, so they are the cheap "leaf" frames */
+  e->nonref = !isKey && e->cfg.nonref_odd && (e->order_hint & 1);
+  h->frame_type = isKey ? KEY_FRAME : INTER_FRAME;
+  h->base_q_idx = frame_qindex(e, isKey);
+  if (isKey) e->order_hint = 0;
+  h->order_hint = e->order_hint;
+  h->show_frame = 1;
+  /* ref_frame_idx: LAST -> slot 0, GOLDEN -> slot 1 (multi_ref), others slot 0 */
+  if (e->cfg.multi_ref) h->ref_idx[GOLDEN_FRAME - LAST_FRAME] = 1;
+  /* GOLDEN (slot 1): key frames and every 4th frame (the finer-q ones) */
+  e->golden_refresh = !isKey && !e->nonref && e->cfg.multi_ref && e->order_hint % 4 == 0;
+  h->refresh_frame_flags = isKey ? 0xFF : (e->nonref ? 0x00 : 0x01 | (e->golden_refresh ? 0x02 : 0));
+
+  uint8_t *tile = NULL;
+  size_t tileSize = run_frame(e, isKey, &tile);
+  double t3 = now();
+  size_t cap = tileSize + 1024;
+  uint8_t *buf = malloc(cap);
+  size_t pos = write_temporal_delimiter(buf);
+  if (isKey) pos += write_sequence_header(e, buf + pos);
+  pos += write_frame_obu(e, tile, tileSize, buf + pos);
+  free(tile);
+  e->last.t_entropy += now() - t3;
+  e->last.bytes = pos;
 
   /* The reconstruction becomes the reference of the next frame. */
   if (!e->nonref) {
@@ -477,12 +513,235 @@ int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int stride
   return 0;
 }
 
-void mav1_get_recon(const Mav1Encoder *e, uint8_t *const planes[3], const int strides[3]) {
-  /* After mav1_encode the last reconstruction lives in `ref`. */
+static void copy_out(const Mav1Encoder *e, const uint8_t *frame, uint8_t *const planes[3], const int strides[3]) {
   for (int p = 0; p < 3; p++) {
     int pw = p ? (e->w + 1) >> 1 : e->w;
     int ph = p ? (e->h + 1) >> 1 : e->h;
     for (int y = 0; y < ph; y++)
-      memcpy(planes[p] + (size_t)y * strides[p], (e->nonref ? e->rec.base : e->ref.base) + e->offset[p] + (size_t)y * e->stride[p], pw);
+      memcpy(planes[p] + (size_t)y * strides[p], frame + e->offset[p] + (size_t)y * e->stride[p], pw);
   }
+}
+
+static size_t packed_size(const Mav1Encoder *e) {
+  size_t cw = (size_t)(e->w + 1) >> 1, ch = (size_t)(e->h + 1) >> 1;
+  return (size_t)e->w * e->h + 2 * cw * ch;
+}
+
+/* Packed I420 copy of a padded frame buffer. */
+static uint8_t *pack_frame(const Mav1Encoder *e, const uint8_t *frame) {
+  uint8_t *o = malloc(packed_size(e));
+  int cw = (e->w + 1) >> 1, ch = (e->h + 1) >> 1;
+  uint8_t *pl[3] = {o, o + (size_t)e->w * e->h, o + (size_t)e->w * e->h + (size_t)cw * ch};
+  int st[3] = {e->w, cw, cw};
+  copy_out(e, frame, pl, st);
+  return o;
+}
+
+void mav1_get_recon(const Mav1Encoder *e, uint8_t *const planes[3], const int strides[3]) {
+  if (e->cfg.altref > 0) {
+    int cw = (e->w + 1) >> 1, ch = (e->h + 1) >> 1;
+    const uint8_t *s = e->shown_recon;
+    if (!s) return;
+    const uint8_t *src[3] = {s, s + (size_t)e->w * e->h, s + (size_t)e->w * e->h + (size_t)cw * ch};
+    for (int p = 0; p < 3; p++) {
+      int pw = p ? cw : e->w, ph = p ? ch : e->h;
+      for (int y = 0; y < ph; y++) memcpy(planes[p] + (size_t)y * strides[p], src[p] + (size_t)y * pw, pw);
+    }
+    return;
+  }
+  /* After mav1_encode the last reconstruction lives in `ref`. */
+  copy_out(e, e->nonref ? e->rec.base : e->ref.base, planes, strides);
+}
+
+/* ------------------------------------------------------------------------ */
+/* ALTREF mini-GOPs: for display frames d+1 .. d+L (d the last shown         */
+/* reference) the frame d+L is coded first as a hidden ALTREF, then d+1 ..  */
+/* d+L-1 are coded as shown frames predicting from LAST (past) and ALTREF   */
+/* (future); a show_existing_frame header finally displays the ALTREF.      */
+/* Slots: 0 holds the frames inside the GOP, 2 / 3 alternate as the ALTREF  */
+/* slot (the previous ALTREF is the next GOP's anchor).                     */
+
+static int rel_dist(int a, int b) {
+  int d = (a - b) & ((1 << 7) - 1); /* OrderHintBits = 7 */
+  return d >= 64 ? d - 128 : d;
+}
+
+/* Codes one frame of the ALTREF driver: frame (packed I420, display index
+ * disp), with LAST from lastSlot and ALTREF from arfSlot (-1: none).
+ * Appends the frame OBU (and, for key frames, the TD and sequence header)
+ * to *buf. */
+static void alt_code(Mav1Encoder *e, const uint8_t *frame, int disp, int isKey, int kind, int lastSlot, int arfSlot,
+                     int refresh, uint8_t **buf, size_t *pos, size_t *cap) {
+  int cw = (e->w + 1) >> 1, ch = (e->h + 1) >> 1;
+  const uint8_t *pl[3] = {frame, frame + (size_t)e->w * e->h, frame + (size_t)e->w * e->h + (size_t)cw * ch};
+  int st[3] = {e->w, cw, cw};
+  load_source(e, pl, st);
+  if (isKey) e->key_disp = disp;
+  e->nonref = 0;
+  e->frame_kind = isKey ? 0 : kind;
+  e->order_hint = disp - e->key_disp;
+  FrameHdr *h = &e->hdr;
+  memset(h, 0, sizeof(*h));
+  h->frame_type = isKey ? KEY_FRAME : INTER_FRAME;
+  h->base_q_idx = frame_qindex(e, isKey);
+  h->order_hint = e->order_hint;
+  h->show_frame = kind != 1;
+  h->showable_frame = kind == 1;
+  h->refresh_frame_flags = isKey ? 0xFF : refresh;
+  memset(e->sign_bias, 0, sizeof e->sign_bias);
+  if (!isKey) {
+    for (int i = 0; i < REFS_PER_FRAME; i++) h->ref_idx[i] = lastSlot;
+    if (arfSlot >= 0) h->ref_idx[ALTREF_FRAME - LAST_FRAME] = arfSlot;
+    for (int i = 0; i < REFS_PER_FRAME; i++)
+      e->sign_bias[LAST_FRAME + i] = rel_dist(e->slot_hint[h->ref_idx[i]], h->order_hint) > 0;
+    memcpy(e->ref.base, e->slot[lastSlot].base, e->frame_bytes);
+    if (arfSlot >= 0) memcpy(e->gold.base, e->slot[arfSlot].base, e->frame_bytes);
+  }
+  uint8_t *tile = NULL;
+  size_t tileSize = run_frame(e, isKey, &tile);
+  double t3 = now();
+  if (*pos + tileSize + 1024 > *cap) {
+    *cap = *pos + tileSize + 1024;
+    *buf = realloc(*buf, *cap);
+  }
+  if (isKey) {
+    *pos += write_temporal_delimiter(*buf + *pos);
+    *pos += write_sequence_header(e, *buf + *pos);
+  }
+  *pos += write_frame_obu(e, tile, tileSize, *buf + *pos);
+  free(tile);
+  e->last.t_entropy += now() - t3;
+  for (int s = 0; s < 8; s++)
+    if ((h->refresh_frame_flags >> s) & 1) {
+      e->slot_hint[s] = h->order_hint;
+      if (e->slot[s].base) memcpy(e->slot[s].base, e->rec.base, e->frame_bytes);
+    }
+}
+
+static void alt_push(Mav1Encoder *e, uint8_t *data, size_t size, uint8_t *recon, const Mav1FrameStats *st) {
+  if (e->out_n == e->out_cap) {
+    e->out_cap = e->out_cap ? 2 * e->out_cap : 8;
+    e->outq = realloc(e->outq, sizeof(*e->outq) * e->out_cap);
+  }
+  struct AltPacket *p = &e->outq[e->out_n++];
+  p->data = data;
+  p->size = size;
+  p->recon = recon;
+  p->st = *st;
+  p->st.bytes = size;
+}
+
+static void stats_add(Mav1FrameStats *a, const Mav1FrameStats *b) {
+  a->num_blocks += b->num_blocks;
+  a->num_inter_blocks += b->num_inter_blocks;
+  for (int k = 0; k < 16; k++) a->tool_use[k] += b->tool_use[k];
+  a->t_analysis += b->t_analysis;
+  a->t_recon += b->t_recon;
+  a->t_filter += b->t_filter;
+  a->t_entropy += b->t_entropy;
+}
+
+/* Codes the queued frames that can be coded (all of them when flushing). */
+static void alt_drain(Mav1Encoder *e, int flush) {
+  int N = e->cfg.altref;
+  while (e->inq_n > 0) {
+    int d0 = e->in_disp - e->inq_n;
+    int isKey = d0 == 0 || (e->cfg.keyint > 0 && d0 % e->cfg.keyint == 0);
+    int L = isKey ? 1 : N;
+    if (!isKey && e->cfg.keyint > 0) L = k_min(L, (d0 / e->cfg.keyint + 1) * e->cfg.keyint - d0);
+    if (e->inq_n < L) {
+      if (!flush) return;
+      L = e->inq_n;
+    }
+    if (isKey || L == 1) {
+      /* key frame, or a regular frame predicting from the anchor */
+      uint8_t *buf = NULL;
+      size_t pos = 0, cap = 0;
+      if (!isKey) {
+        cap = 1024;
+        buf = malloc(cap);
+        pos = write_temporal_delimiter(buf);
+      }
+      memset(&e->last, 0, sizeof e->last);
+      e->last.frame_type = !isKey;
+      alt_code(e, e->inq[0], d0, isKey, 0, e->anchor_slot, -1, 0x01, &buf, &pos, &cap);
+      e->anchor_slot = 0;
+      alt_push(e, buf, pos, pack_frame(e, e->rec.base), &e->last);
+    } else {
+      int arfSlot = e->anchor_slot == 2 ? 3 : 2;
+      Mav1FrameStats arfSt;
+      uint8_t *buf = malloc(1024);
+      size_t pos = write_temporal_delimiter(buf), cap = 1024;
+      memset(&e->last, 0, sizeof e->last);
+      e->last.frame_type = 1;
+      alt_code(e, e->inq[L - 1], d0 + L - 1, 0, 1, e->anchor_slot, -1, 1 << arfSlot, &buf, &pos, &cap);
+      uint8_t *arfRecon = pack_frame(e, e->rec.base);
+      arfSt = e->last;
+      for (int i = 0; i < L - 1; i++) {
+        if (i > 0) {
+          buf = malloc(1024);
+          cap = 1024;
+          pos = write_temporal_delimiter(buf);
+        }
+        memset(&e->last, 0, sizeof e->last);
+        e->last.frame_type = 1;
+        alt_code(e, e->inq[i], d0 + i, 0, 2, i == 0 ? e->anchor_slot : 0, arfSlot, 0x01, &buf, &pos, &cap);
+        if (i == 0) stats_add(&e->last, &arfSt);
+        alt_push(e, buf, pos, pack_frame(e, e->rec.base), &e->last);
+      }
+      buf = malloc(64);
+      pos = write_temporal_delimiter(buf);
+      pos += write_show_existing(arfSlot, buf + pos);
+      memset(&e->last, 0, sizeof e->last);
+      e->last.frame_type = 1;
+      alt_push(e, buf, pos, arfRecon, &e->last);
+      e->anchor_slot = arfSlot;
+    }
+    for (int i = 0; i < L; i++) free(e->inq[i]);
+    memmove(e->inq, e->inq + L, sizeof(*e->inq) * (e->inq_n - L));
+    e->inq_n -= L;
+  }
+}
+
+int mav1_send_frame(Mav1Encoder *e, const uint8_t *const planes[3], const int strides[3]) {
+  if (e->cfg.altref <= 0) {
+    if (!planes) return 0;
+    if (e->pending) free(e->pend_data);
+    e->pending = 1;
+    return mav1_encode(e, planes, strides, &e->pend_data, &e->pend_size);
+  }
+  if (planes) {
+    uint8_t *f = malloc(packed_size(e));
+    int cw = (e->w + 1) >> 1, ch = (e->h + 1) >> 1;
+    for (int p = 0; p < 3; p++) {
+      int pw = p ? cw : e->w, ph = p ? ch : e->h;
+      uint8_t *d = f + (p ? (size_t)e->w * e->h + (p - 1) * (size_t)cw * ch : 0);
+      for (int y = 0; y < ph; y++) memcpy(d + (size_t)y * pw, planes[p] + (size_t)y * strides[p], pw);
+    }
+    e->inq[e->inq_n++] = f;
+    e->in_disp++;
+  }
+  alt_drain(e, planes == NULL);
+  return 0;
+}
+
+int mav1_receive_packet(Mav1Encoder *e, uint8_t **out, size_t *outSize) {
+  if (e->cfg.altref <= 0) {
+    if (!e->pending) return 1;
+    e->pending = 0;
+    *out = e->pend_data;
+    *outSize = e->pend_size;
+    return 0;
+  }
+  if (e->out_pos == e->out_n) {
+    e->out_pos = e->out_n = 0;
+    return 1;
+  }
+  struct AltPacket *p = &e->outq[e->out_pos++];
+  *out = p->data;
+  *outSize = p->size;
+  free(e->shown_recon);
+  e->shown_recon = p->recon;
+  e->last = p->st;
+  return 0;
 }

@@ -20,6 +20,7 @@ typedef struct {
   int8_t skip;      /* Skips */
   int8_t y_mode;    /* YModes */
   int8_t ref0;      /* RefFrames[0] (INTRA_FRAME = 0) */
+  int8_t ref1;      /* RefFrames[1] of compound blocks (else 0) */
   int8_t tx_size;   /* TxSizes (luma) */
   int16_t mv_row, mv_col; /* Mvs[0] */
   int8_t written;   /* decoded in the current frame */
@@ -32,6 +33,10 @@ typedef struct {
   int base_q_idx;
   int order_hint;
   int refresh_frame_flags;
+  int show_frame, showable_frame;
+  int ref_idx[7];          /* ref_frame_idx[ LAST_FRAME - 1 .. ALTREF_FRAME - 1 ] */
+  int reference_select;
+  int skip_mode_allowed;   /* skip_mode_present is coded (always 0) */
   int lf_level[4];
   int lf_sharpness;
   int cdef_damping, cdef_bits;
@@ -68,6 +73,20 @@ struct Mav1Encoder {
   int last_id, gold_id; /* frame_num of the frames held in the LAST / GOLDEN slots */
   int golden_refresh;   /* current frame refreshes the GOLDEN slot */
   Backend *be;
+  int sign_bias[8];     /* RefFrameSignBias[ ] of the current frame */
+
+  /* ALTREF mini-GOP driver (cfg.altref > 0) */
+  int frame_kind;       /* 0 regular, 1 hidden ALTREF, 2 frame inside the mini-GOP */
+  Buf slot[8];          /* reference slots (0, 2 and 3 are used) */
+  int slot_hint[8];     /* OrderHint of each slot */
+  int anchor_slot;      /* slot of the last shown reference frame */
+  uint8_t **inq;        /* queued input frames (packed I420), display order */
+  int inq_n, in_disp, key_disp;
+  struct AltPacket { uint8_t *data; size_t size; uint8_t *recon; Mav1FrameStats st; } *outq;
+  int out_n, out_pos, out_cap;
+  uint8_t *shown_recon; /* recon of the frame shown by the last received packet */
+  int pending;          /* non-altref send/receive: a packet waits */
+  uint8_t *pend_data; size_t pend_size;
 
   /* statistics of the last frame */
   Mav1FrameStats last;
@@ -89,5 +108,6 @@ int lr_unit_params(EntEnc *ec, int plane, const void *unit, int refW[2][3], int 
 size_t write_sequence_header(const struct Mav1Encoder *e, uint8_t *out);
 size_t write_frame_obu(const struct Mav1Encoder *e, const uint8_t *tile, size_t tileSize, uint8_t *out);
 size_t write_temporal_delimiter(uint8_t *out);
+size_t write_show_existing(int slot, uint8_t *out);
 
 #endif

@@ -471,7 +471,7 @@ INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, D
         interCost = g;
         mvr = gr;
         mvc = gc;
-        refFrame = GOLDEN_FRAME;
+        refFrame = fp->ref2_frame;
       }
     }
   }
