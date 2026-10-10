@@ -113,7 +113,7 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
   int lw = Mi_Width_Log2[bsize] + 2, lh = Mi_Height_Log2[bsize] + 2;
   int w = 1 << lw, h = 1 << lh;
   int x = miCol * 4, y = miRow * 4;
-  int lam = fp->ac_q[0];
+  int lam = fp->ac_q[0] / 16; /* SATD-domain lambda (tuned on crowd_run) */
 
   /* luma intra */
   long best = -1;
@@ -288,7 +288,7 @@ INLINE void analyze_sb(DEV const FrameParams *fp, int sbIdx, DEV const uint8_t *
   int sbRow = sbIdx / fp->sb_cols, sbCol = sbIdx % fp->sb_cols;
   long cost[NUM_NODES];
   long noneCost[NUM_NODES];
-  int lam = fp->ac_q[0];
+  int lam = fp->ac_q[0] / 16; /* SATD-domain lambda (tuned on crowd_run) */
   DEV SbInfo *sb = &sbs[sbIdx];
 
   for (int level = 3; level >= 0; level--) {
