@@ -80,7 +80,7 @@ INLINE int block_satd(DEV const uint8_t *src, int stride, DEV const uint8_t *pre
 }
 
 INLINE int intra_satd(DEV const FrameParams *fp, DEV const uint8_t *plane, int stride, int planeIdx,
-                      int x, int y, int log2W, int log2H, int mode, int delta, DEV uint8_t *pred) {
+                      int x, int y, int log2W, int log2H, int mode, int delta, DEV uint8_t *pred, int ps) {
   int sub = planeIdx > 0;
   IntraArgs a;
   a.haveLeft = x > 0;
@@ -95,8 +95,8 @@ INLINE int intra_satd(DEV const FrameParams *fp, DEV const uint8_t *plane, int s
   a.maxY = ((fp->mi_rows * 4) >> sub) - 1;
   a.edgeFilter = 0;
   a.filterType = 0;
-  predict_intra(plane, stride, x, y, a, pred, 64);
-  return block_satd(plane + y * stride + x, stride, pred, 1 << log2W, 1 << log2H);
+  predict_intra(plane, stride, x, y, a, pred, ps);
+  return block_satd_s(plane + y * stride + x, stride, pred, ps, 1 << log2W, 1 << log2H);
 }
 
 INLINE int mv_bits8(int mvr, int mvc) {
@@ -108,8 +108,10 @@ INLINE int mv_bits8(int mvr, int mvc) {
  * and fills the decision in *out. */
 INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
                        DEV const int32_t *mvField, int mvNode, int miRow, int miCol, int bsize,
-                       DEV int32_t *scratch, THR BlockInfo *out) {
-  DEV uint8_t *pred = (DEV uint8_t *)(scratch + A_PRED);
+                       DEV int32_t *scratch, int ps, THR BlockInfo *out) {
+  /* scratch: a ps x ps byte prediction, then the filter intermediate */
+  DEV uint8_t *pred = (DEV uint8_t *)scratch;
+  DEV int32_t *tmpArea = scratch + (ps * ps + 3) / 4;
   int lw = Mi_Width_Log2[bsize] + 2, lh = Mi_Height_Log2[bsize] + 2;
   int w = 1 << lw, h = 1 << lh;
   int x = miCol * 4, y = miRow * 4;
@@ -123,14 +125,14 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
     DEV const int32_t *mvp = mvField + (sbIdx * NUM_NODES + mvNode) * 2;
     mvr = mvp[0];
     mvc = mvp[1];
-    DEV int32_t *tmp = scratch + A_TMP;
-    predict_inter_block(ref + fp->offset[0], fp->stride[0], fp->frame_w, fp->frame_h, pred, 64, x, y, w, h,
+    DEV int32_t *tmp = tmpArea;
+    predict_inter_block(ref + fp->offset[0], fp->stride[0], fp->frame_w, fp->frame_h, pred, ps, x, y, w, h,
                         mvr, mvc, 0, 0, EIGHTTAP, tmp);
-    interCost = block_satd(src + fp->offset[0] + y * fp->stride[0] + x, fp->stride[0], pred, w, h);
+    interCost = block_satd_s(src + fp->offset[0] + y * fp->stride[0] + x, fp->stride[0], pred, ps, w, h);
     for (int p = 1; p < 3; p++) {
-      predict_inter_block(ref + fp->offset[p], fp->stride[p], fp->frame_w, fp->frame_h, pred, 64, cx, cy,
+      predict_inter_block(ref + fp->offset[p], fp->stride[p], fp->frame_w, fp->frame_h, pred, ps, cx, cy,
                           w >> 1, h >> 1, mvr, mvc, 1, 1, EIGHTTAP, tmp);
-      interCost += block_satd(src + fp->offset[p] + cy * fp->stride[p] + cx, fp->stride[p], pred, w >> 1, h >> 1);
+      interCost += block_satd_s(src + fp->offset[p] + cy * fp->stride[p] + cx, fp->stride[p], pred, ps, w >> 1, h >> 1);
     }
     interCost += (long)lam * (4 + mv_bits8(mvr, mvc)) / 8;
   }
@@ -141,7 +143,7 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
    * (SATD per pixel below a lambda-scaled bound) intra is not evaluated */
   int skipIntra = fp->fast && interCost >= 0 && interCost * 16 < (long)w * h * lam * 16; /* T64 */
   for (int mode = DC_PRED; mode <= PAETH_PRED && !skipIntra; mode++) {
-    long c = intra_satd(fp, src + fp->offset[0], fp->stride[0], 0, x, y, lw, lh, mode, 0, pred) +
+    long c = intra_satd(fp, src + fp->offset[0], fp->stride[0], 0, x, y, lw, lh, mode, 0, pred, ps) +
              (long)lam * mode_bits8(mode) / 8;
     if (best < 0 || c < best) { best = c; bestMode = mode; }
   }
@@ -150,7 +152,7 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
     int base = bestMode;
     for (int d = -MAX_ANGLE_DELTA; d <= MAX_ANGLE_DELTA; d++) {
       if (d == 0) continue;
-      long c = intra_satd(fp, src + fp->offset[0], fp->stride[0], 0, x, y, lw, lh, base, d, pred) +
+      long c = intra_satd(fp, src + fp->offset[0], fp->stride[0], 0, x, y, lw, lh, base, d, pred, ps) +
                (long)lam * (mode_bits8(base) + 16) / 8;
       if (c < best) { best = c; bestDelta = d; }
     }
@@ -164,25 +166,25 @@ INLINE long eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
   for (int m = DC_PRED; m <= PAETH_PRED && !skipUv; m++) {
     if (intra_is_directional(m) && m != V_PRED && m != H_PRED && m != bestMode) continue;
     int delta = (m == bestMode) ? bestDelta : 0;
-    long c = intra_satd(fp, src + fp->offset[1], fp->stride[1], 1, cx, cy, clw, clh, m, delta, pred) +
-             intra_satd(fp, src + fp->offset[2], fp->stride[2], 2, cx, cy, clw, clh, m, delta, pred) +
+    long c = intra_satd(fp, src + fp->offset[1], fp->stride[1], 1, cx, cy, clw, clh, m, delta, pred, ps) +
+             intra_satd(fp, src + fp->offset[2], fp->stride[2], 2, cx, cy, clw, clh, m, delta, pred, ps) +
              (long)lam * (m == DC_PRED ? 8 : 24) / 8;
     if (bestUv < 0 || c < bestUv) { bestUv = c; bestUvMode = m; }
   }
   if (!skipUv && cfl_allowed(bsize, fp->lossless)) {
     /* CfL estimated from source luma (recon picks the final alphas). */
-    DEV int32_t *dc = scratch + A_TMP;
+    DEV int32_t *dc = tmpArea;
     int cw = 1 << clw, ch = 1 << clh;
     long c = (long)lam * 40 / 8;
     for (int p = 1; p < 3; p++) {
-      intra_satd(fp, src + fp->offset[p], fp->stride[p], p, cx, cy, clw, clh, DC_PRED, 0, pred);
+      intra_satd(fp, src + fp->offset[p], fp->stride[p], p, cx, cy, clw, clh, DC_PRED, 0, pred, ps);
       for (int i = 0; i < ch; i++)
-        for (int j = 0; j < cw; j++) dc[i * cw + j] = pred[i * 64 + j];
+        for (int j = 0; j < cw; j++) dc[i * cw + j] = pred[i * ps + j];
       DEV const uint8_t *sp = src + fp->offset[p] + cy * fp->stride[p] + cx;
       int al = cfl_best_alpha(src + fp->offset[0], fp->stride[0], cx, cy, x + w, y + h, clw, clh, dc, sp,
-                              fp->stride[p], pred, 64, 0);
-      cfl_predict(src + fp->offset[0], fp->stride[0], cx, cy, x + w, y + h, clw, clh, al, dc, pred, 64);
-      c += block_satd(sp, fp->stride[p], pred, cw, ch);
+                              fp->stride[p], pred, ps, 0);
+      cfl_predict(src + fp->offset[0], fp->stride[0], cx, cy, x + w, y + h, clw, clh, al, dc, pred, ps);
+      c += block_satd_s(sp, fp->stride[p], pred, ps, cw, ch);
     }
     if (c < bestUv) { bestUv = c; bestUvMode = UV_CFL_PRED; }
   }
@@ -275,7 +277,7 @@ INLINE long part_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV con
       total += cc;
     } else {
       BlockInfo b;
-      total += eval_block(fp, src, ref, mvField, node, r + dr, c + dc, bs, scratch, &b);
+      total += eval_block(fp, src, ref, mvField, node, r + dr, c + dc, bs, scratch, 64, &b);
     }
   }
   return total;
@@ -369,7 +371,7 @@ INLINE void analyze_sb(DEV const FrameParams *fp, int sbIdx, DEV const uint8_t *
           int dr, dc;
           int bs = part_block(p, level_bsize(level), k, halfMi, &dr, &dc);
           BlockInfo b;
-          eval_block(fp, src, ref, mvField, node, r + dr, c + dc, bs, scratch, &b);
+          eval_block(fp, src, ref, mvField, node, r + dr, c + dc, bs, scratch, 64, &b);
           int w = Block_Width(bs), h = Block_Height(bs);
           b.coef_off[0] = coefOff;
           coefOff += w * h; /* room for split / lossless transforms */
