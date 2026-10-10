@@ -437,6 +437,18 @@ INLINE int analysis_slot_ints(int level) {
 }
 
 /* Pass 1: item (level, node i, slot) of superblock sbIdx. */
+/* Depth early exit (SVT-style): with --fast, a node is not split when its
+ * parent's NONE block is already cheap per sample. Needs the parent level
+ * done first, so levels run 0 -> 3. */
+INLINE int depth_pruned(DEV const FrameParams *fp, DEV const long *costs, int sbIdx, int level, int i) {
+  if (!fp->fast || level == 0 || fp->depth_thr == 0) return 0;
+  int n = 1 << level;
+  int pi = ((i / n) >> 1) * (n >> 1) + ((i % n) >> 1);
+  long pc = costs[(long)sbIdx * A_ITEMS + (NODE_BASE(level - 1) + pi) * A_SLOTS];
+  int pw = 128 >> level;
+  return pc >= 0 && pc * 16 < (long)pw * pw * fp->depth_thr;
+}
+
 INLINE void analyze_item(DEV const FrameParams *fp, int sbIdx, int level, int i, int slot, DEV const uint8_t *src,
                          DEV const uint8_t *ref, DEV const int32_t *mvField, DEV long *costs, DEV BlockInfo *infos,
                          DEV int32_t *scratch) {
@@ -447,6 +459,7 @@ INLINE void analyze_item(DEV const FrameParams *fp, int sbIdx, int level, int i,
   long idx = (long)sbIdx * A_ITEMS + node * A_SLOTS + slot;
   costs[idx] = -1;
   if (r >= fp->mi_rows || c >= fp->mi_cols) return;
+  if (depth_pruned(fp, costs, sbIdx, level, i)) return;
   int hasRows = (r + halfSz) < fp->mi_rows, hasCols = (c + halfSz) < fp->mi_cols;
   int p, k;
   slot_part(slot, &p, &k);
@@ -504,8 +517,9 @@ INLINE void analyze_sb_table(DEV const FrameParams *fp, int sbIdx, DEV const lon
       long bestC = -1;
       int bestP = PARTITION_SPLIT;
       if (level < 3) {
-        bestC = cost[cb + ci] + cost[cb + ci + 1] + cost[cb + ci + cn] + cost[cb + ci + cn + 1] +
-                (long)lam * 16 / 8;
+        long c0 = cost[cb + ci], c1 = cost[cb + ci + 1], c2 = cost[cb + ci + cn], c3 = cost[cb + ci + cn + 1];
+        /* a pruned child (depth early exit) has no cost: no SPLIT */
+        if (c0 >= 0 && c1 >= 0 && c2 >= 0 && c3 >= 0) bestC = c0 + c1 + c2 + c3 + (long)lam * 16 / 8;
       }
       for (int p = PARTITION_NONE; p <= PARTITION_VERT_4; p++) {
         if (!part_allowed(fp, level, p, hasRows, hasCols)) continue;

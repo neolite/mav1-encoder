@@ -37,7 +37,7 @@ void cpu_backend_analyze(Backend *b, struct Mav1Encoder *e) {
   long *costs = (long *)e->acosts.base;
   BlockInfo *infos = (BlockInfo *)e->ainfos.base;
   dispatch_apply((size_t)e->num_sbs, DISPATCH_APPLY_AUTO, ^(size_t i) {
-    for (int level = 3; level >= 0; level--) {
+    for (int level = 0; level < 4; level++) {
       int ns = level_slots(fp, level);
       for (int node = 0; node < (1 << (2 * level)); node++)
         for (int slot = 0; slot < ns; slot++)

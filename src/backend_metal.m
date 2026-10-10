@@ -78,7 +78,7 @@ static void mtl_motion_search(Backend *b, struct Mav1Encoder *e) {
 static void mtl_analyze(Backend *b, struct Mav1Encoder *e) {
   Mav1MetalState *s = ST(b);
   int one = getenv("MAV1_ALEVEL") ? 1 : 0; /* profiling: one command buffer per level */
-  for (int L = 3; L >= (one ? 0 : 3); L--) {
+  for (int L = 0; L <= (one ? 3 : 0); L++) {
   run(s, ^(id<MTLComputeCommandEncoder> enc) {
     [enc setComputePipelineState:s.analyze];
     [enc setBuffer:wrap(s, &e->params) offset:0 atIndex:0];
@@ -92,7 +92,7 @@ static void mtl_analyze(Backend *b, struct Mav1Encoder *e) {
     const FrameParams *fp = ENC_PARAMS(e);
     /* levels are independent; they share the scratch buffer, so they run as
      * consecutive (serial) dispatches */
-    for (int level = one ? L : 3; level >= (one ? L : 0); level--) {
+    for (int level = one ? L : 0; level <= (one ? L : 3); level++) {
       [enc setBytes:&level length:sizeof level atIndex:7];
       NSUInteger n = (NSUInteger)e->num_sbs * (1u << (2 * level)) * level_slots(fp, level);
       if (level <= 1) {

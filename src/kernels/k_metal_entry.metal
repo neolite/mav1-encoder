@@ -541,7 +541,7 @@ kernel void mav1_analyze_coop(device const FrameParams *fp [[buffer(0)]],
   int node = NODE_BASE(level) + i;
   int r = sbRow * 16 + (i / n) * size4, c = sbCol * 16 + (i % n) * size4;
   long idx = (long)sbIdx * A_ITEMS + node * A_SLOTS + slot;
-  if (r >= fp->mi_rows || c >= fp->mi_cols) { if (lane == 0) costs[idx] = -1; return; }
+  if (r >= fp->mi_rows || c >= fp->mi_cols || depth_pruned(fp, costs, sbIdx, level, i)) { if (lane == 0) costs[idx] = -1; return; }
   int hasRows = (r + halfSz) < fp->mi_rows, hasCols = (c + halfSz) < fp->mi_cols;
   int p, k;
   slot_part(slot, &p, &k);

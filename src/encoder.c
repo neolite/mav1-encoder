@@ -260,6 +260,7 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   fp->tx_mode_select = q != 0 && e->cfg.tx_depth;
   fp->switchable_interp = !isKey && e->cfg.switchable_interp;
   fp->fast = e->cfg.fast;
+  fp->depth_thr = getenv("MAV1_DT") ? atoi(getenv("MAV1_DT")) : 0;
   fp->tile_w_sb = e->tile_w_sb;
   long acq = fp->ac_q[0];
   fp->lambda = (int32_t)(acq * acq * 256 / 430);
