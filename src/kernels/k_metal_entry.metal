@@ -42,14 +42,42 @@ kernel void mav1_cdef(device const FrameParams *fp [[buffer(0)]],
   cdef_block(fp, cur, out, info, ((int)gid / bc) * 2, ((int)gid % bc) * 2, idx);
 }
 
+/* One SIMD group (32 lanes) per search node of one level. */
 kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
                     device const uint8_t *src [[buffer(1)]],
                     device const uint8_t *ref [[buffer(2)]],
                     device int32_t *mvField [[buffer(3)]],
                     device int32_t *scratch [[buffer(4)]],
-                    uint gid [[thread_position_in_grid]]) {
-  if ((int)gid >= fp->sb_cols * fp->sb_rows) return;
-  me_sb(fp, (int)gid, src, ref, mvField, scratch + (long)gid * SCRATCH_INTS);
+                    constant int &level [[buffer(5)]],
+                    uint tg [[threadgroup_position_in_grid]],
+                    uint lane [[thread_index_in_simdgroup]]) {
+  int nn = 1 << (2 * level);
+  int sbIdx = (int)tg / nn, i = (int)tg % nn;
+  if (sbIdx >= fp->sb_cols * fp->sb_rows) return;
+  MeNode m = me_node(fp, sbIdx, level, i, mvField);
+  device int32_t *out = mvField + (sbIdx * NUM_NODES + NODE_BASE(level) + i) * 2;
+  if (!m.valid) {
+    if (lane == 0) out[0] = out[1] = 0;
+    return;
+  }
+  int best = INT_MAX, bestK = INT_MAX;
+  for (int k = (int)lane; k < m.count; k += 32) {
+    int dy, dx;
+    me_candidate(&m, k, &dy, &dx);
+    int c = me_cost(fp, src, ref, &m, dy, dx);
+    if (c < best) {
+      best = c;
+      bestK = k;
+    }
+  }
+  /* lexicographic (cost, k) minimum = the serial first minimum */
+  int gmin = simd_min(best);
+  int kmin = simd_min(best == gmin ? bestK : INT_MAX);
+  if (lane == 0) {
+    int dy, dx;
+    me_candidate(&m, kmin, &dy, &dx);
+    me_finish(fp, src, ref, &m, dy, dx, out, scratch + (long)sbIdx * SCRATCH_INTS + me_node_scratch(level, i));
+  }
 }
 
 kernel void mav1_analyze(device const FrameParams *fp [[buffer(0)]],

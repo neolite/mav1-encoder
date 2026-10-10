@@ -60,8 +60,13 @@ static void mtl_motion_search(Backend *b, struct Mav1Encoder *e) {
     [enc setBuffer:wrap(s, &e->ref) offset:0 atIndex:2];
     [enc setBuffer:wrap(s, &e->mvfield) offset:0 atIndex:3];
     [enc setBuffer:wrap(s, &e->scratch) offset:0 atIndex:4];
-    NSUInteger tg = MIN((NSUInteger)32, s.me.maxTotalThreadsPerThreadgroup);
-    [enc dispatchThreads:MTLSizeMake(e->num_sbs, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    /* levels depend on their parents: one dispatch each, one SIMD group per node */
+    for (int level = 0; level < 4; level++) {
+      [enc setBytes:&level length:sizeof level atIndex:5];
+      NSUInteger groups = (NSUInteger)e->num_sbs << (2 * level);
+      [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+      [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    }
   });
 }
 
