@@ -126,7 +126,7 @@ struct Mav1Encoder {
   void *wq;             /* dispatch queue (NULL: everything inline) */
   WCtx wctx[NUM_WCTX];
   int wnext, flushing;
-  void *outmu;          /* pthread mutex of outq */
+  void *outmu, *outcv;   /* outq lock + packet-arrival signal */
   /* turbo: frame engines (complete encoders without driver) coding frames
    * concurrently; frames wait for the slots they reference */
 #define NUM_ENG 4 /* engine 0 codes the reference frames, 1..3 the others */

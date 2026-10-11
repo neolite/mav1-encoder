@@ -774,6 +774,9 @@ static int wctx_init(Mav1Encoder *e) {
   pthread_mutex_t *mu = malloc(sizeof *mu);
   pthread_mutex_init(mu, NULL);
   e->outmu = mu;
+  pthread_cond_t *cv = malloc(sizeof *cv);
+  pthread_cond_init(cv, NULL);
+  e->outcv = cv;
   return ok;
 }
 
@@ -797,6 +800,8 @@ static void wctx_free(Mav1Encoder *e) {
   e->wq = NULL;
   pthread_mutex_destroy(e->outmu);
   free(e->outmu);
+  pthread_cond_destroy(e->outcv);
+  free(e->outcv);
 }
 
 static dispatch_qos_class_t qos_ent(void) {
@@ -957,6 +962,7 @@ static void alt_push(Mav1Encoder *e, uint8_t *data, size_t size, uint8_t *recon,
   p->recon = recon;
   p->st = *st;
   p->st.bytes = size;
+  if (e->outcv) pthread_cond_broadcast((pthread_cond_t *)e->outcv);
   if (e->outmu) pthread_mutex_unlock(e->outmu);
 }
 
@@ -1329,6 +1335,31 @@ int mav1_receive_packet(Mav1Encoder *e, uint8_t **out, size_t *outSize) {
   }
   struct AltPacket p = e->outq[e->out_pos++];
   if (e->outmu) pthread_mutex_unlock(e->outmu);
+  *out = p.data;
+  *outSize = p.size;
+  free(e->shown_recon);
+  e->shown_recon = p.recon;
+  e->last = p.st;
+  return 0;
+}
+
+int mav1_receive_packet_wait(Mav1Encoder *e, uint8_t **out, size_t *outSize, int timeout_ms) {
+  if (!mav1_receive_packet(e, out, outSize)) return 0;
+  if (!e->outmu || !e->outcv) return 1;
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  ts.tv_nsec += (long)timeout_ms * 1000000;
+  if (ts.tv_nsec >= 1000000000) { ts.tv_sec += ts.tv_nsec / 1000000000; ts.tv_nsec %= 1000000000; }
+  pthread_mutex_lock((pthread_mutex_t *)e->outmu);
+  while (e->out_pos == e->out_n)
+    if (pthread_cond_timedwait((pthread_cond_t *)e->outcv, (pthread_mutex_t *)e->outmu, &ts)) break;
+  if (e->out_pos == e->out_n) {
+    e->out_pos = e->out_n = 0;
+    pthread_mutex_unlock((pthread_mutex_t *)e->outmu);
+    return 1;
+  }
+  struct AltPacket p = e->outq[e->out_pos++];
+  pthread_mutex_unlock((pthread_mutex_t *)e->outmu);
   *out = p.data;
   *outSize = p.size;
   free(e->shown_recon);

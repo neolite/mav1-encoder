@@ -98,6 +98,10 @@ int main(int argc, char **argv) {
   /* turbo: 2 tile columns (BD -2..-3% vs 8 at the same speed) */
   cfg.tile_cols_log2 = tiles >= 0 ? tiles : turbo ? 2 : fast ? 3 : 0;
   if (fast) cfg.tx_search = cfg.tx_depth = cfg.restoration = cfg.switchable_interp = 0;
+  if (getenv("MAV1_TXS")) cfg.tx_search = atoi(getenv("MAV1_TXS"));
+  if (getenv("MAV1_TXD")) cfg.tx_depth = atoi(getenv("MAV1_TXD"));
+  if (getenv("MAV1_LR")) cfg.restoration = atoi(getenv("MAV1_LR"));
+  if (getenv("MAV1_SW")) cfg.switchable_interp = atoi(getenv("MAV1_SW"));
   char err[256];
   Mav1Encoder *e = mav1_create(&cfg, err, sizeof err);
   if (!e) { fprintf(stderr, "mav1_create: %s\n", err); return 1; }
