@@ -64,3 +64,25 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all asan install clean
+
+# iOS static library (ios/mav1cam links build/ios/libmav1.a).
+IOSSDK  := $(shell xcrun -sdk iphoneos --show-sdk-path 2>/dev/null)
+IOSCC   := xcrun -sdk iphoneos clang
+IOSFLAGS := -O3 -target arm64-apple-ios17.0 -isysroot $(IOSSDK) -Isrc -std=gnu11 -w
+IOSB    := $(BUILD)/ios
+IOS_OBJS := $(patsubst src/%.c,$(IOSB)/%.o,$(CORE)) $(IOSB)/backend_metal.o
+
+$(IOSB):
+	mkdir -p $(IOSB)
+
+$(IOSB)/%.o: src/%.c $(HDRS) | $(IOSB)
+	$(IOSCC) $(IOSFLAGS) -c $< -o $@
+
+$(IOSB)/backend_metal.o: src/backend_metal.m $(HDRS) $(BUILD)/kernels_src.h | $(IOSB)
+	$(IOSCC) $(IOSFLAGS) -fobjc-arc -I$(BUILD) -c $< -o $@
+
+ios: $(IOSB)/libmav1.a
+$(IOSB)/libmav1.a: $(IOS_OBJS)
+	rm -f $@ && xcrun -sdk iphoneos ar rcs $@ $^
+
+.PHONY: ios
