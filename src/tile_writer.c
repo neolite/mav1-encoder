@@ -35,30 +35,6 @@ static int tx_class(int t) {
   return TX_CLASS_2D;
 }
 
-static int coeff_base_ctx(int txSz, int txClass, const int32_t *quant, int pos) {
-  int adj = Adjusted_Tx_Size[txSz];
-  int bwl = Tx_Width_Log2[adj];
-  int width = 1 << bwl, height = Tx_Height[adj];
-  int row = pos >> bwl, col = pos - (row << bwl);
-  int mag = 0;
-  for (int idx = 0; idx < SIG_REF_DIFF_OFFSET_NUM; idx++) {
-    int rr = row + Sig_Ref_Diff_Offset[txClass][idx][0];
-    int cc = col + Sig_Ref_Diff_Offset[txClass][idx][1];
-    if (rr >= 0 && cc >= 0 && rr < height && cc < width) {
-      int q = abs(quant[(rr << bwl) + cc]);
-      mag += q < 3 ? q : 3;
-    }
-  }
-  int ctx = (mag + 1) >> 1;
-  if (ctx > 4) ctx = 4;
-  if (txClass == TX_CLASS_2D) {
-    if (row == 0 && col == 0) return 0;
-    return ctx + Coeff_Base_Ctx_Offset[txSz][row < 4 ? row : 4][col < 4 ? col : 4];
-  }
-  int idx = (txClass == TX_CLASS_VERT) ? row : col;
-  return ctx + Coeff_Base_Pos_Ctx_Offset[idx < 2 ? idx : 2];
-}
-
 static int coeff_base_eob_ctx(int txSz, int c) {
   int adj = Adjusted_Tx_Size[txSz];
   int area = Tx_Height[adj] << Tx_Width_Log2[adj];
@@ -66,28 +42,6 @@ static int coeff_base_eob_ctx(int txSz, int c) {
   if (c <= area / 8) return 1;
   if (c <= area / 4) return 2;
   return 3;
-}
-
-static int coeff_br_ctx(int txSz, int txClass, const int32_t *quant, int pos) {
-  int adj = Adjusted_Tx_Size[txSz];
-  int bwl = Tx_Width_Log2[adj];
-  int txw = Tx_Width[adj], txh = Tx_Height[adj];
-  int row = pos >> bwl, col = pos - (row << bwl);
-  int mag = 0;
-  for (int idx = 0; idx < 3; idx++) {
-    int rr = row + Mag_Ref_Offset_With_Tx_Class[txClass][idx][0];
-    int cc = col + Mag_Ref_Offset_With_Tx_Class[txClass][idx][1];
-    if (rr >= 0 && cc >= 0 && rr < txh && cc < (1 << bwl)) {
-      int q = quant[rr * txw + cc];
-      mag += q < COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1 ? q : COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1;
-    }
-  }
-  mag = (mag + 1) >> 1;
-  if (mag > 6) mag = 6;
-  if (pos == 0) return mag;
-  if (txClass == TX_CLASS_2D) return (row < 2 && col < 2) ? mag + 7 : mag + 14;
-  if (txClass == TX_CLASS_HORIZ) return col == 0 ? mag + 7 : mag + 14;
-  return row == 0 ? mag + 7 : mag + 14;
 }
 
 static int inv_index(KCONST int32_t *tab, int n, int v) {
@@ -197,34 +151,67 @@ static void write_coeffs(Tile *t, int plane, int startX, int startY, int txSz, i
       }
     }
     /* Levels, from the last coefficient backwards. `lv` mirrors the
-     * decoder's Quant[] (levels of already decoded positions). */
-    int32_t lv[1024];
-    /* the contexts read inside the (at most 32 x 32) adjusted transform */
-    memset(lv, 0, sizeof(int32_t) * (w < 32 ? w : 32) * (h < 32 ? h : 32));
+     * decoder's Quant[] (levels of already decoded positions) inside the
+     * (at most 32 x 32) adjusted transform, with 4 zero columns and rows of
+     * padding so that the context neighbours need no bounds checks. */
+    int adj = Adjusted_Tx_Size[txSz];
+    int bwl = Tx_Width_Log2[adj], aw = 1 << bwl, ah = Tx_Height[adj], S = aw + 4;
+    int32_t lv[36 * 36];
+    memset(lv, 0, sizeof(int32_t) * (size_t)S * (ah + 4));
+    int sig[SIG_REF_DIFF_OFFSET_NUM], mag3[3];
+    for (int i = 0; i < SIG_REF_DIFF_OFFSET_NUM; i++)
+      sig[i] = Sig_Ref_Diff_Offset[txClass][i][0] * S + Sig_Ref_Diff_Offset[txClass][i][1];
+    for (int i = 0; i < 3; i++)
+      mag3[i] = Mag_Ref_Offset_With_Tx_Class[txClass][i][0] * S + Mag_Ref_Offset_With_Tx_Class[txClass][i][1];
+    KCONST int32_t(*baseOff)[5] = Coeff_Base_Ctx_Offset[txSz];
+    uint16_t(*cdfBase)[4 + 1] = t->cdf.coeff_base[txSzCtx][ptype];
+    uint16_t(*cdfBr)[BR_CDF_SIZE + 1] = t->cdf.coeff_br[txSzCtx < TX_32X32 ? txSzCtx : TX_32X32][ptype];
     for (int c = eob - 1; c >= 0; c--) {
       int pos = scan[c];
       int level = abs(q[pos]);
-      int coded;
+      int row = pos >> bwl, col = pos & (aw - 1);
+      int32_t *l = lv + row * S + col;
+      int coded = level < 3 ? level : 3;
       if (c == eob - 1) {
-        int cctx = coeff_base_eob_ctx(txSz, c);
-        coded = (level < 3 ? level : 3);
-        ec_symbol(&t->ec, coded - 1, t->cdf.coeff_base_eob[txSzCtx][ptype][cctx], 3);
+        ec_symbol(&t->ec, coded - 1, t->cdf.coeff_base_eob[txSzCtx][ptype][coeff_base_eob_ctx(txSz, c)], 3);
       } else {
-        int cctx = coeff_base_ctx(txSz, txClass, lv, pos);
-        coded = level < 3 ? level : 3;
-        ec_symbol(&t->ec, coded, t->cdf.coeff_base[txSzCtx][ptype][cctx], 4);
+        /* get_coeff_base_ctx( ) */
+        int mag = 0;
+        for (int i = 0; i < SIG_REF_DIFF_OFFSET_NUM; i++) {
+          int v = l[sig[i]];
+          mag += v < 3 ? v : 3;
+        }
+        int ctx = (mag + 1) >> 1;
+        if (ctx > 4) ctx = 4;
+        if (txClass == TX_CLASS_2D) ctx = pos == 0 ? 0 : ctx + baseOff[row < 4 ? row : 4][col < 4 ? col : 4];
+        else {
+          int idx = txClass == TX_CLASS_VERT ? row : col;
+          ctx += Coeff_Base_Pos_Ctx_Offset[idx < 2 ? idx : 2];
+        }
+        ec_symbol(&t->ec, coded, cdfBase[ctx], 4);
       }
       if (coded > NUM_BASE_LEVELS) {
-        int bctx = coeff_br_ctx(txSz, txClass, lv, pos);
+        /* coeff_br context */
+        int mag = 0;
+        for (int i = 0; i < 3; i++) {
+          int v = l[mag3[i]];
+          mag += v < COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1 ? v : COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1;
+        }
+        mag = (mag + 1) >> 1;
+        if (mag > 6) mag = 6;
+        int bctx = pos == 0 ? mag
+                   : txClass == TX_CLASS_2D ? ((row < 2 && col < 2) ? mag + 7 : mag + 14)
+                   : txClass == TX_CLASS_HORIZ ? (col == 0 ? mag + 7 : mag + 14)
+                                               : (row == 0 ? mag + 7 : mag + 14);
         for (int idx = 0; idx < COEFF_BASE_RANGE / (BR_CDF_SIZE - 1); idx++) {
           int rem = level - coded;
           int br = rem < BR_CDF_SIZE - 1 ? rem : BR_CDF_SIZE - 1;
-          ec_symbol(&t->ec, br, t->cdf.coeff_br[txSzCtx < TX_32X32 ? txSzCtx : TX_32X32][ptype][bctx], BR_CDF_SIZE);
+          ec_symbol(&t->ec, br, cdfBr[bctx], BR_CDF_SIZE);
           coded += br;
           if (br < BR_CDF_SIZE - 1) break;
         }
       }
-      lv[pos] = coded;
+      *l = coded;
     }
     /* Signs and Golomb remainders, in forward scan order. */
     int dctx = 0;
