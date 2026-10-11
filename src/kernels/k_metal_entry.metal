@@ -150,7 +150,7 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
   }
   int dy = 0, dx = 0;
   for (int stage = 0; stage < m.stages; stage++) {
-    if (stage > 0) me_refine_stage(fp, &m, dy, dx);
+    if (stage > 0) me_refine_stage(fp, &m, dy, dx, stage);
     int best = INT_MAX, bestK = INT_MAX;
     for (int k = (int)lane; k < m.count; k += 32) {
       int cy, cx;
@@ -1227,10 +1227,11 @@ kernel void mav1_me_tg(device const FrameParams *fp [[buffer(0)]],
   }
   int dy = 0, dx = 0;
   for (int stage = 0; stage < m.stages; stage++) {
-    if (stage > 0) me_refine_stage(fp, &m, dy, dx);
+    if (stage > 0) me_refine_stage(fp, &m, dy, dx, stage);
     /* each candidate's rows split over R adjacent threads */
-    int dec = (fp->turbo & T_ME_DEC) && m.step == ME_COARSE_STEP;
-    int rows = dec ? m.w >> 2 : m.w, R = dec ? 2 : 8;
+    int dec = (fp->turbo & T_ME_DEC) && m.step >= ME_COARSE_STEP;
+    int rs = (fp->turbo & T_ME_RSUB) && m.step == 1 ? 2 : 1;
+    int rows = dec ? m.w >> 2 : m.w / rs, R = dec ? 2 : 8;
     int best = INT_MAX, bestK = INT_MAX;
     for (int it0 = 0; it0 < m.count * R; it0 += (int)tpg) {
       int it = it0 + (int)tid, k = it / R, part = it % R, sad = 0, cy = 0, cx = 0;
@@ -1251,17 +1252,19 @@ kernel void mav1_me_tg(device const FrameParams *fp [[buffer(0)]],
           if (x + cx >= 0 && x + cx + w <= W && y + cy >= 0 && y + cy + w <= H) {
             uint4 acc = 0;
             for (int ii = i0; ii < i1; ii++) {
-              DEV const packed_uchar4 *s4 = (DEV const packed_uchar4 *)(sp + (y + ii) * stride + x);
-              DEV const packed_uchar4 *r4 = (DEV const packed_uchar4 *)(rp + (y + ii + cy) * stride + x + cx);
+              DEV const packed_uchar4 *s4 = (DEV const packed_uchar4 *)(sp + (y + ii * rs) * stride + x);
+              DEV const packed_uchar4 *r4 =
+                  (DEV const packed_uchar4 *)(rp + (y + ii * rs + cy) * stride + x + cx);
               for (int j = 0; j < (w >> 2); j++) acc += uint4(absdiff(uchar4(s4[j]), uchar4(r4[j])));
             }
-            sad = (int)(acc.x + acc.y + acc.z + acc.w);
+            sad = (int)(acc.x + acc.y + acc.z + acc.w) * rs;
           } else {
             for (int ii = i0; ii < i1; ii++) {
-              int ry = Clip3(0, H - 1, y + ii + cy);
+              int ry = Clip3(0, H - 1, y + ii * rs + cy);
               for (int j = 0; j < w; j++)
-                sad += k_abs((int)sp[(y + ii) * stride + x + j] - (int)rp[ry * stride + Clip3(0, W - 1, x + j + cx)]);
+                sad += k_abs((int)sp[(y + ii * rs) * stride + x + j] - (int)rp[ry * stride + Clip3(0, W - 1, x + j + cx)]);
             }
+            sad *= rs;
           }
         }
       }

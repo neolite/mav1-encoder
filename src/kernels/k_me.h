@@ -34,22 +34,24 @@ INLINE int satd4x4_v(int4 r0, int4 r1, int4 r2, int4 r3) {
 }
 #endif
 
+/* rs > 1 (turbo T_ME_RSUB): rows are strided and the sum scaled back, a
+ * subsampled SAD for the small refinement windows. */
 INLINE int me_sad(DEV const uint8_t *src, DEV const uint8_t *ref, int stride, int frameW, int frameH, int x, int y,
-                  int w, int dy, int dx) {
+                  int w, int dy, int dx, int rs) {
 #ifdef __METAL_VERSION__
   if (x + dx >= 0 && x + dx + w <= frameW && y + dy >= 0 && y + dy + w <= frameH) {
     /* no clamping: 4 samples per load */
     uint4 acc = 0;
-    for (int i = 0; i < w; i++) {
+    for (int i = 0; i < w; i += rs) {
       DEV const packed_uchar4 *s = (DEV const packed_uchar4 *)(src + (y + i) * stride + x);
       DEV const packed_uchar4 *r = (DEV const packed_uchar4 *)(ref + (y + i + dy) * stride + x + dx);
       for (int j = 0; j < (w >> 2); j++) acc += uint4(absdiff(uchar4(s[j]), uchar4(r[j])));
     }
-    return (int)(acc.x + acc.y + acc.z + acc.w);
+    return (int)(acc.x + acc.y + acc.z + acc.w) * rs;
   }
 #endif
   int sad = 0;
-  for (int i = 0; i < w; i++) {
+  for (int i = 0; i < w; i += rs) {
     int ry = Clip3(0, frameH - 1, y + i + dy);
     DEV const uint8_t *s = src + (y + i) * stride + x;
     DEV const uint8_t *r = ref + ry * stride;
@@ -58,7 +60,7 @@ INLINE int me_sad(DEV const uint8_t *src, DEV const uint8_t *ref, int stride, in
       sad += k_abs((int)s[j] - (int)r[rx]);
     }
   }
-  return sad;
+  return sad * rs;
 }
 
 /* One search node: block position and the candidate grid. */
@@ -83,6 +85,8 @@ typedef struct {
 #define T_ME_REF2 512  /* 64x64 full-pel refinement +-2 around the coarse winner (instead of +-3) */
 #define T_ME_DEC 32    /* 64x64 coarse grid (step 4) on 4x4-decimated planes */
 #define T_ME_CROSS 8192 /* sub-pel steps try the 4 axial neighbours only */
+#define T_ME_RSUB 65536 /* refinement-window full-pel SADs skip every other row */
+#define T_ME_HME3 131072 /* level 0: step-8 coarse grid, then +-4 step-4, on the decimated planes */
 #define T_ME_G3COPY 16384 /* leaf frames: 8x8 nodes of the second reference take the 16x16 parent's vector */
 #define T_ME_HALF01 32768 /* 64x64 and 32x32 nodes: half-pel refinement only */
 INLINE int me_min_step(DEV const FrameParams *fp, int w) { return w >= 32 && (fp->turbo & T_ME_HALF01) ? 4 : 2; }
@@ -159,10 +163,11 @@ INLINE MeNode me_node(DEV const FrameParams *fp, int sbIdx, int level, int i, DE
   m.step = 1;
   m.stages = 1;
   if (level == 0) {
-    /* stage 0: grid of spacing 4 over +-range around (0, 0) */
-    m.step = ME_COARSE_STEP;
-    m.range = (m.range / ME_COARSE_STEP) * ME_COARSE_STEP;
-    m.stages = 2;
+    /* stage 0: grid of spacing 4 over +-range around (0, 0); T_ME_HME3
+     * widens it to spacing 8 and adds a +-4 step-4 middle stage */
+    m.step = (fp->turbo & T_ME_HME3) ? 2 * ME_COARSE_STEP : ME_COARSE_STEP;
+    m.range = (m.range / m.step) * m.step;
+    m.stages = (fp->turbo & T_ME_HME3) ? 3 : 2;
   }
   /* turbo T_ME_L3SUB: 8x8 nodes refine the parent's vector at sub-pel only */
   if (level == 3 && (fp->turbo & T_ME_L3SUB)) m.stages = 0;
@@ -171,13 +176,19 @@ INLINE MeNode me_node(DEV const FrameParams *fp, int sbIdx, int level, int i, DE
   return m;
 }
 
-/* Second stage of level 0: +-3 full-pel around the coarse winner. */
-INLINE void me_refine_stage(DEV const FrameParams *fp, THR MeNode *m, int wy, int wx) {
+/* Later stages of level 0: +-4 step-4 on the decimated planes (middle stage
+ * of T_ME_HME3), then +-3 (+-2 with T_ME_REF2) full-pel around the winner. */
+INLINE void me_refine_stage(DEV const FrameParams *fp, THR MeNode *m, int wy, int wx, int stage) {
   m->cy = wy;
   m->cx = wx;
-  m->range = (fp->turbo & T_ME_REF2) ? 2 : ME_REFINE;
-  m->step = 1;
-  int side = 2 * m->range + 1;
+  if (stage == 1 && (fp->turbo & T_ME_HME3)) {
+    m->range = ME_COARSE_STEP;
+    m->step = ME_COARSE_STEP;
+  } else {
+    m->range = (fp->turbo & T_ME_REF2) ? 2 : ME_REFINE;
+    m->step = 1;
+  }
+  int side = 2 * (m->range / m->step) + 1;
   m->count = 1 + side * side;
 }
 
@@ -199,10 +210,11 @@ INLINE void me_candidate(THR const MeNode *m, int k, THR int *dy, THR int *dx) {
 INLINE int me_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref, DEV const uint8_t *ds,
                    DEV const uint8_t *dr, THR const MeNode *m, int dy, int dx) {
   int bits = 2 + 2 * FloorLog2(k_abs(dy) * 8 + 1) + 2 * FloorLog2(k_abs(dx) * 8 + 1);
-  if ((fp->turbo & T_ME_DEC) && m->step == ME_COARSE_STEP)
+  if ((fp->turbo & T_ME_DEC) && m->step >= ME_COARSE_STEP)
     return dec_sad(fp, ds, dr, m->x, m->y, m->w, dy, dx) + fp->ac_q[0] * bits / 64;
+  int rs = (fp->turbo & T_ME_RSUB) && m->step == 1 ? 2 : 1;
   return me_sad(src + fp->offset[0], ref + fp->offset[0], fp->stride[0], fp->frame_w, fp->frame_h, m->x, m->y, m->w,
-                dy, dx) +
+                dy, dx, rs) +
          fp->ac_q[0] * bits / 64;
 }
 
@@ -344,7 +356,7 @@ INLINE void me_node_serial(DEV const FrameParams *fp, int sbIdx, int level, int 
     return;
   }
   for (int stage = 0; stage < m.stages; stage++) {
-    if (stage > 0) me_refine_stage(fp, &m, by, bx);
+    if (stage > 0) me_refine_stage(fp, &m, by, bx, stage);
     int best = -1;
     for (int k = 0; k < m.count; k++) {
       int dy, dx;

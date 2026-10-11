@@ -445,7 +445,7 @@ static void setup_params(Mav1Encoder *e, int isKey) {
    * inter frames; 256 square partitions on key frames too; 1024 no 8x8 in leaf frames (off by
    * default); 2048 two CDEF sets (off and MAV1_CP, default preset 2); 4096, 8192, 16384 (off),
    * 32768 half-pel only for 64x64 / 32x32 search nodes (k_me.h) */
-  fp->turbo = e->cfg.turbo ? (getenv("MAV1_TURBO") ? (int)strtol(getenv("MAV1_TURBO"), NULL, 0) : 0x8BF1) : 0;
+  fp->turbo = e->cfg.turbo ? (getenv("MAV1_TURBO") ? (int)strtol(getenv("MAV1_TURBO"), NULL, 0) : 0x3CBF1) : 0;
   fp->leaf = e->cfg.leaf ? (e->leafopt & 1) : e->nonref && !getenv("MAV1_LEAFINTRA");
   if (e->leafopt & 16) fp->tx_search = 0;
   /* turbo depth pruning (SVT-style): a node is not split when an ancestor's
