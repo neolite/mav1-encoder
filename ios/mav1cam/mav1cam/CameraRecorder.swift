@@ -84,16 +84,15 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
     }
 
     /// 30 fps capture + continuous autofocus/exposure (without these the
-    /// focus point sticks wherever the device happened to open).
+    /// focus point sticks wherever the device happened to open). The
+    /// session preset picks the capture format; don't override it with a
+    /// possibly low-res entry from dev.formats.
     private func tuneDevice(_ dev: AVCaptureDevice) {
         try? dev.lockForConfiguration()
-        if let f = dev.formats.first(where: {
-            $0.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 })
-                && CMFormatDescriptionGetMediaSubType($0.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-        }) {
-            dev.activeFormat = f
-            dev.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
-            dev.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+        let t = CMTime(value: 1, timescale: 30)
+        if dev.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 }) {
+            dev.activeVideoMinFrameDuration = t
+            dev.activeVideoMaxFrameDuration = t
         }
         if dev.isFocusModeSupported(.continuousAutoFocus) { dev.focusMode = .continuousAutoFocus }
         if dev.isSmoothAutoFocusSupported { dev.isSmoothAutoFocusEnabled = true }
