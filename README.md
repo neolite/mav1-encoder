@@ -45,8 +45,15 @@ cd ffmpeg && git apply /path/to/ffmpeg-n8.1.3-libmav1.patch
 ./configure --enable-libmav1 \
   --extra-cflags=-I/opt/mav1/include --extra-ldflags=-L/opt/mav1/lib
 make -j8
-./ffmpeg -i in.y4m -c:v libmav1 -turbo 1 -qindex 125 out.ivf
+./ffmpeg -thread_queue_size 512 -i in.y4m -c:v libmav1 -turbo 1 -qindex 125 out.ivf
 ```
+
+> **Throughput note:** FFmpeg hands the encoder one input frame per
+> `receive_packet` call and, with the default shallow thread queues, delivers
+> input at consumption pace. That starves mav1's engine pipeline (~10 fps on
+> 1080p). Passing `-thread_queue_size 512` (or larger) on the input lets the
+> demuxer run ahead and restores near-CLI throughput (~55 fps on M1 Pro,
+> ~1.4x libsvtav1). Without it the output is still correct, just slower.
 
 Codec options: `-metal 0|1`, `-turbo 0|1`, `-qindex N`, `-lf`, `-cdef`,
 `-txsearch`, `-txdepth`, `-lr`, `-dualfilter`, `-me_range N`, `-g` (GOP).
