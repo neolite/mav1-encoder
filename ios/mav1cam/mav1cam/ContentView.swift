@@ -25,6 +25,14 @@ struct ContentView: View {
     @State private var preset = 1 // 0: 720p, 1: 1080p, 2: 4K
     @State private var cam = 1 // index into rec.cameras
 
+    private func share(_ url: URL) {
+        let av = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+           let root = scene.windows.first?.rootViewController {
+            root.present(av, animated: true)
+        }
+    }
+
     var body: some View {
         ZStack {
             PreviewView(session: rec.session)
@@ -50,12 +58,23 @@ struct ContentView: View {
 
                 Spacer()
 
-                Text(rec.status)
-                    .font(.system(.caption, design: .monospaced))
-                    .padding(8)
-                    .background(.black.opacity(0.55))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                    .padding(.bottom, 4)
+                HStack {
+                    Text(rec.status)
+                        .font(.system(.caption, design: .monospaced))
+                        .padding(8)
+                        .background(.black.opacity(0.55))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    if let url = rec.lastShareURL {
+                        Button(action: { share(url) }) {
+                            Image(systemName: "square.and.arrow.up")
+                                .font(.title3.bold())
+                                .padding(8)
+                                .background(.black.opacity(0.55))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                        }
+                    }
+                }
+                .padding(.bottom, 4)
 
                 // camera / zoom selector just above the record button
                 HStack(spacing: 18) {

@@ -37,6 +37,8 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
 
     @Published private(set) var recording = false
     @Published var status = "ready"
+    /// last finished .mp4 — share-sheet source
+    @Published var lastShareURL: URL?
 
     // MARK: session
 
@@ -90,13 +92,22 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
     private func tuneDevice(_ dev: AVCaptureDevice) {
         try? dev.lockForConfiguration()
         // HDR: pick a 10-bit-capable HDR format so the output can deliver
-        // P010; SDR keeps whatever the session preset chose (don't pick the
-        // first format blindly — it may be a low-res entry)
-        if hdrRequested, let f = dev.formats.first(where: {
-            $0.isVideoHDRSupported
-                && $0.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 })
-        }) {
-            dev.activeFormat = f
+        // P010. dev.formats also lists tiny preview/HDR entries — pick one
+        // matching the preset's resolution, else the largest available.
+        if hdrRequested {
+            let target = CMVideoFormatDescriptionGetDimensions(dev.activeFormat.formatDescription)
+            let hdrFmts = dev.formats.filter {
+                $0.isVideoHDRSupported
+                    && $0.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 })
+            }
+            func size(_ f: AVCaptureDevice.Format) -> Int {
+                let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+                return Int(d.width) * Int(d.height)
+            }
+            if let f = hdrFmts.first(where: { size($0) == Int(target.width) * Int(target.height) })
+                     ?? hdrFmts.max(by: { size($0) < size($1) }) {
+                dev.activeFormat = f
+            }
         }
         let t = CMTime(value: 1, timescale: 30)
         if dev.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 }) {
@@ -188,8 +199,9 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         cfg.fps_den = 1
         cfg.keyint = 0
         cfg.rc = MAV1_RC_CQP
-        // phone memory: 4 full engines ~1.4GB at 1080p; 2 fit comfortably
-        cfg.threads = 2
+        // phone memory: per-engine ME scratch ~197MB + qpel ~100MB at 1080p
+        // (~4x at 4K) — 2 engines fit for <=1080p, single engine for 4K
+        cfg.threads = w * h >= 3840 * 2160 ? 1 : 2
         if is10bit {
             cfg.bitdepth = 10
             // iPhone captures HDR in HLG (Dolby Vision is a mux-level side
@@ -237,7 +249,7 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
 
         // .mov mux for Photos: pass-through av01 samples in an MP4 container
         // (the A17+ decoder plays them back in the gallery)
-        movURL = url.deletingPathExtension().appendingPathExtension("mov")
+        movURL = url.deletingPathExtension().appendingPathExtension("mp4")
         try? FileManager.default.removeItem(at: movURL!)
         setupMovWriter(width: w, height: h, bitdepth: cfg.bitdepth, enc: enc!)
 
@@ -460,7 +472,7 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         guard rc == noErr, let fd else { return }
         av1Desc = fd
 
-        guard let w = try? AVAssetWriter(outputURL: movURL, fileType: .mov) else { return }
+        guard let w = try? AVAssetWriter(outputURL: movURL, fileType: .mp4) else { return }
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: fd)
         input.expectsMediaDataInRealTime = true
         guard w.canAdd(input) else { return }
@@ -505,20 +517,11 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
             guard let self, let url else { return }
             guard w?.status == .completed else {
                 DispatchQueue.main.async {
-                    self.status = "mov failed: \(w?.error?.localizedDescription ?? "\(String(describing: w?.status))")"
+                    self.status = "mp4 failed: \(w?.error?.localizedDescription ?? "\(String(describing: w?.status))")"
                 }
                 return
             }
-            PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
-                guard status == .authorized || status == .limited else { return }
-                PHPhotoLibrary.shared().performChanges {
-                    PHAssetCreationRequest.forAsset().addResource(with: .video, fileURL: url, options: nil)
-                } completionHandler: { ok, err in
-                    DispatchQueue.main.async {
-                        self.status = ok ? "saved to Photos ✓" : "Photos save failed: \(err?.localizedDescription ?? "?")"
-                    }
-                }
-            }
+            DispatchQueue.main.async { self.lastShareURL = url }
         }
     }
 

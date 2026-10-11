@@ -211,10 +211,10 @@ static Mav1Encoder *create_enc(const Mav1Config *cfg, int isEngine, char *err, s
     /* engine count: cfg.threads (app) or MAV1_ENG, clamped to [2, NUM_ENG];
      * engine 0 codes reference frames, 1..N-1 the rest */
     int ne = NUM_ENG;
-    if (cfg->threads > 0) ne = k_min(NUM_ENG, k_max(2, cfg->threads));
+    if (cfg->threads > 0) ne = k_min(NUM_ENG, k_max(1, cfg->threads));
     else if (getenv("MAV1_ENG")) ne = k_min(NUM_ENG, k_max(2, atoi(getenv("MAV1_ENG"))));
     e->num_eng = ne;
-    e->eng_next = 1;
+    e->eng_next = ne > 1 ? 1 : 0;
     for (int i = 0; i < ne; i++) {
       e->eng[i] = create_enc(cfg, 1, err, errlen);
       if (!e->eng[i]) {
