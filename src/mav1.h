@@ -65,6 +65,10 @@ int mav1_send_frame(Mav1Encoder *e, const uint8_t *const planes[3], const int st
 int mav1_receive_packet(Mav1Encoder *e, uint8_t **out, size_t *outSize);
 /* like mav1_receive_packet but waits up to timeout_ms for a packet */
 int mav1_receive_packet_wait(Mav1Encoder *e, uint8_t **out, size_t *outSize, int timeout_ms);
+/* number of finished packets queued for receive (peek, non-destructive) */
+int mav1_pending_packets(Mav1Encoder *e);
+/* nonzero while input frames or engine/writer work remain in flight */
+int mav1_busy(Mav1Encoder *e);
 /* Writes the sequence header OBU (with OBU header) and returns its size;
  * `out` must hold at least 64 bytes. */
 size_t mav1_sequence_header(const Mav1Encoder *e, uint8_t *out);

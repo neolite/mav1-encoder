@@ -8,6 +8,7 @@
 #include <dispatch/dispatch.h>
 #include <time.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #include "backend.h"
 #include "enc_internal.h"
@@ -1163,6 +1164,7 @@ static uint8_t *alt_code(Mav1Encoder *e, uint8_t **framep, int disp, int isKey, 
       }
     }
     dispatch_semaphore_wait((dispatch_semaphore_t)e->inflight, DISPATCH_TIME_FOREVER);
+    atomic_fetch_add(&e->jobs_live, 1);
     dispatch_group_async((dispatch_group_t)e->eng_busy[ei], (dispatch_queue_t)e->eng_q[ei], ^{
       setup();
       if (gateIn) {
@@ -1216,6 +1218,7 @@ static uint8_t *alt_code(Mav1Encoder *e, uint8_t **framep, int disp, int isKey, 
     stats_add(&t->st, &st2);
     if (job->c) dispatch_semaphore_signal((dispatch_semaphore_t)job->c->free);
     free(job);
+    atomic_fetch_sub(&e->jobs_live, 1);
     if (e->inflight) dispatch_semaphore_signal((dispatch_semaphore_t)e->inflight);
     if (tl) fprintf(stderr, "%7.1f wq   d%d written\n", (now() - tl0) * 1e3, disp);
   });
@@ -1343,16 +1346,40 @@ int mav1_receive_packet(Mav1Encoder *e, uint8_t **out, size_t *outSize) {
   return 0;
 }
 
+int mav1_busy(Mav1Encoder *e) {
+  return e->inq_n > 0 || atomic_load(&e->jobs_live) > 0 || e->pending;
+}
+
+int mav1_pending_packets(Mav1Encoder *e) {
+  if (e->cfg.altref <= 0) return e->pending ? 1 : 0;
+  int n;
+  if (e->outmu) pthread_mutex_lock((pthread_mutex_t *)e->outmu);
+  n = e->out_n - e->out_pos;
+  if (e->outmu) pthread_mutex_unlock((pthread_mutex_t *)e->outmu);
+  return n;
+}
+
 int mav1_receive_packet_wait(Mav1Encoder *e, uint8_t **out, size_t *outSize, int timeout_ms) {
   if (!mav1_receive_packet(e, out, outSize)) return 0;
   if (!e->outmu || !e->outcv) return 1;
+  if (e->flushing && !mav1_busy(e)) return 1; /* nothing else can arrive */
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
   ts.tv_nsec += (long)timeout_ms * 1000000;
   if (ts.tv_nsec >= 1000000000) { ts.tv_sec += ts.tv_nsec / 1000000000; ts.tv_nsec %= 1000000000; }
   pthread_mutex_lock((pthread_mutex_t *)e->outmu);
-  while (e->out_pos == e->out_n)
-    if (pthread_cond_timedwait((pthread_cond_t *)e->outcv, (pthread_mutex_t *)e->outmu, &ts)) break;
+  for (;;) {
+    if (e->out_pos != e->out_n) break;
+    if (e->flushing && !mav1_busy(e)) break;
+    if (pthread_cond_timedwait((pthread_cond_t *)e->outcv, (pthread_mutex_t *)e->outmu, &ts)) {
+      /* while flushing, engine work in flight can legitimately exceed the
+       * timeout — keep waiting; the timeout only bounds live-stream polls */
+      if (!e->flushing || !mav1_busy(e)) break;
+      clock_gettime(CLOCK_REALTIME, &ts);
+      ts.tv_nsec += (long)timeout_ms * 1000000;
+      if (ts.tv_nsec >= 1000000000) { ts.tv_sec += ts.tv_nsec / 1000000000; ts.tv_nsec %= 1000000000; }
+    }
+  }
   if (e->out_pos == e->out_n) {
     e->out_pos = e->out_n = 0;
     pthread_mutex_unlock((pthread_mutex_t *)e->outmu);

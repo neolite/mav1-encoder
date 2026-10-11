@@ -60,10 +60,10 @@ index 695214f..003819e 100644
  extern const FFCodec ff_libspeex_encoder;
 diff --git a/libavcodec/libmav1.c b/libavcodec/libmav1.c
 new file mode 100644
-index 0000000..56a9b34
+index 0000000..95902f8
 --- /dev/null
 +++ b/libavcodec/libmav1.c
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,217 @@
 +/*
 + * AV1 encoding through mav1 (Metal GPU / CPU kernels)
 + *
@@ -203,10 +203,13 @@ index 0000000..56a9b34
 +        }
 +    }
 +
-+    /* block briefly for in-flight engine output; the wait is bounded so
-+     * new input frames can still be fed (they release gates the pending
-+     * jobs may be waiting on) */
-+    ret = mav1_receive_packet_wait(ctx->enc, &out, &size, 50);
++    /* Non-flush calls must return instantly: lavc's encoder thread runs a
++     * serial send/receive loop, so any waiting inside this callback throttles
++     * the whole feed rate. While flushing, wait until the engines and the
++     * writer queue drain so no in-flight frame is lost. */
++    ret = ctx->flushing
++        ? mav1_receive_packet_wait(ctx->enc, &out, &size, 2000)
++        : mav1_receive_packet(ctx->enc, &out, &size);
 +    if (ret)
 +        return ctx->flushing ? AVERROR_EOF : AVERROR(EAGAIN);
 +
