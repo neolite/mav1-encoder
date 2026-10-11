@@ -129,7 +129,7 @@ struct Mav1Encoder {
   void *outmu;          /* pthread mutex of outq */
   /* turbo: frame engines (complete encoders without driver) coding frames
    * concurrently; frames wait for the slots they reference */
-#define NUM_ENG 3 /* engine 0 codes the reference frames, 1 and 2 the others */
+#define NUM_ENG 4 /* engine 0 codes the reference frames, 1..3 the others */
   struct Mav1Encoder *eng[NUM_ENG];
   int eng_next, is_engine;
   void *eng_q[NUM_ENG], *eng_busy[NUM_ENG]; /* serial dispatch queue, group of its jobs */
