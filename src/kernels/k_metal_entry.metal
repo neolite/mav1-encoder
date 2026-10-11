@@ -174,13 +174,14 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
    * spread over the lanes; per-candidate sums by simd_sum. The (cost, index)
    * minimum equals the serial first minimum of me_finish. */
   int mvr = m.stages ? dy * 8 : m.pr, mvc = m.stages ? dx * 8 : m.pc, bestS = 0;
-  int nUnits = (m.w >> 2) * (m.w >> 2);
+  int ustride = (fp->turbo & T_ME_USUB) && m.w >= 32 ? 2 : 1;
+  int nUnits = ((m.w >> 2) * (m.w >> 2)) / ustride;
   for (int step = 4; step >= me_min_step(fp, m.w); step >>= 1) {
     int sums[ME_LANES];
     for (int k = 0; k < ME_LANES; k++) sums[k] = 0;
     int first = step == 4 ? 0 : 1; /* the quarter step reuses the centre cost */
     for (int w = (int)lane; w < (1 + me_nb_count(fp) - first) * nUnits; w += 32) {
-      int k = first + w / nUnits, u = w % nUnits;
+      int k = first + w / nUnits, u = (w % nUnits) * ustride;
       int dr = 0, dc = 0;
       if (k > 0) me_nb(fp, k - 1, step, &dr, &dc);
       sums[k] += (fp->turbo & T_ME_HPEL) ? me_unit_satd_hp(fp, src, ref, hp, &m, mvr + dr, mvc + dc, u)
@@ -340,9 +341,12 @@ INLINE long coop_compound_cost(DEV const FrameParams *fp, DEV const uint8_t *src
   long c = 0;
   for (int p = 0; p < 3; p++) {
     int sub = p > 0, bw = w >> sub, bh = h >> sub, n = (bw >> 2) * (bh >> 2), s = 0;
-    for (int u = (int)lane; u < n; u += 32)
+    int us = eval_sub(fp) && bw >= 32 ? 2 : 1, ni = n / us;
+    for (int uu = (int)lane; uu < ni; uu += 32) {
+      int u = us > 1 ? satd_sub_unit(uu, bw >> 2) : uu;
       s += coop_comp_unit(fp, src, ref, ref2, hp, hp2, p, x >> sub, y >> sub, bw, bh, mvr, mvc, mvr2, mvc2, u);
-    c += simd_sum(s);
+    }
+    c += simd_sum(s) * us;
   }
   return c + (long)lam * (8 + mv_bits8(mvr, mvc) + mv_bits8(mvr2, mvc2) + COMPOUND_BITS8) / 8;
 }
@@ -355,8 +359,17 @@ INLINE void coop_inter3(DEV const FrameParams *fp, DEV const uint8_t *src, DEV c
   int a0 = 0, a1 = 0, a2 = 0;
   /* (plane, unit) items of all planes in one sweep */
   int n0 = (w >> 2) * (h >> 2), nc = n0 >> 2;
-  for (int wi = (int)lane; wi < n0 + 2 * nc; wi += 32) {
-    int p = wi < n0 ? 0 : (wi < n0 + nc ? 1 : 2), u = p == 0 ? wi : wi - n0 - (p - 1) * nc;
+  int us0 = eval_sub(fp) && w >= 32 ? 2 : 1, usc = eval_sub(fp) && (w >> 1) >= 32 ? 2 : 1;
+  int n0i = n0 / us0, nci = nc;
+  for (int wi = (int)lane; wi < n0i + 2 * nci; wi += 32) {
+    int p = wi < n0i ? 0 : (wi < n0i + nci ? 1 : 2);
+    int k = p == 0 ? wi : wi - n0i - (p - 1) * nci;
+    int u;
+    if (p == 0) u = us0 > 1 ? satd_sub_unit(k, w >> 2) : k;
+    else if (usc > 1) {
+      if ((k % (w >> 3) + k / (w >> 3)) % 2) continue;
+      u = k;
+    } else u = k;
     int sub = p > 0, bw = w >> sub, bh = h >> sub, bx = x >> sub, by = y >> sub, nu = bw >> 2;
     int stride = fp->stride[p];
     {
@@ -372,9 +385,10 @@ INLINE void coop_inter3(DEV const FrameParams *fp, DEV const uint8_t *src, DEV c
           d1[k] = sv - pr2[k];
           d2[k] = sv - ((pr[k] + pr2[k] + 1) >> 1);
         }
-      a0 += satd4x4(d0);
-      a1 += satd4x4(d1);
-      a2 += satd4x4(d2);
+      int us = p == 0 ? us0 : usc;
+      a0 += satd4x4(d0) * us;
+      a1 += satd4x4(d1) * us;
+      a2 += satd4x4(d2) * us;
     }
   }
   s[0] = simd_sum(a0);
@@ -385,7 +399,11 @@ INLINE void coop_inter3(DEV const FrameParams *fp, DEV const uint8_t *src, DEV c
 INLINE int coop_inter_satd(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref, int p,
                            int bx, int by, int bw, int bh, int mvr, int mvc, uint lane) {
   int n = (bw >> 2) * (bh >> 2), s = 0;
-  for (int u = (int)lane; u < n; u += 32) s += coop_inter_unit(fp, src, ref, 0, p, bx, by, bw, bh, mvr, mvc, u);
+  int us = eval_sub(fp) && bw >= 32 ? 2 : 1, ni = n / us;
+  for (int uu = (int)lane; uu < ni; uu += 32) {
+    int u = us > 1 ? satd_sub_unit(uu, bw >> 2) : uu;
+    s += coop_inter_unit(fp, src, ref, 0, p, bx, by, bw, bh, mvr, mvc, u);
+  }
   return simd_sum(s);
 }
 
@@ -511,13 +529,14 @@ INLINE int coop_intra_unit(DEV const uint8_t *px, int stride, int x, int y, int 
 }
 
 /* intra_satd( ) with the work spread over the lanes (edges prebuilt). */
-INLINE int coop_intra_satd(DEV const uint8_t *px, int stride, int x, int y, int log2W, int log2H, int mode,
+INLINE int coop_intra_satd(DEV const FrameParams *fp, DEV const uint8_t *px, int stride, int x, int y, int log2W, int log2H, int mode,
                            int delta, threadgroup const uint8_t *A, threadgroup const uint8_t *L, uint lane) {
   int w = 1 << log2W, h = 1 << log2H;
   int pAngle, dx, dy, dcAvg;
   coop_intra_params(mode, delta, x > 0, y > 0, w, h, log2W, log2H, A, L, &pAngle, &dx, &dy, &dcAvg);
   int n = (w >> 2) * (h >> 2), s = 0;
-  for (int u = (int)lane; u < n; u += 32) s += coop_intra_unit(px, stride, x, y, log2W, log2H, mode, pAngle, dx, dy, dcAvg, u, A, L);
+  for (int u = (int)lane; u < n; u += 32)
+    s += coop_intra_unit(px, stride, x, y, log2W, log2H, mode, pAngle, dx, dy, dcAvg, u, A, L);
   return simd_sum(s);
 }
 
@@ -529,7 +548,8 @@ INLINE void coop_intra_multi(DEV const FrameParams *fp, DEV const uint8_t *src, 
                              int log2H, THR const int *ml, int nm, threadgroup const uint8_t *A0,
                              threadgroup const uint8_t *L0, threadgroup const uint8_t *A1,
                              threadgroup const uint8_t *L1, uint lane, THR long *out) {
-  int w = 1 << log2W, h = 1 << log2H, n = (w >> 2) * (h >> 2), np = chroma ? 2 : 1;
+  int w = 1 << log2W, h = 1 << log2H, np = chroma ? 2 : 1;
+  int us = 1, n = (w >> 2) * (h >> 2) / us;
   int per = n * np, items = nm * per;
   int haveLeft = x > 0, haveAbove = y > 0;
   /* DC_PRED averages of the planes (edge sums over the lanes) */
@@ -551,7 +571,7 @@ INLINE void coop_intra_multi(DEV const FrameParams *fp, DEV const uint8_t *src, 
     int wi = base + (int)lane, s = 0, mi = -1;
     if (wi < items) {
       mi = wi / per;
-      int pl = (wi / n) % np, u = wi % n;
+      int pl = (wi / n) % np, u = us > 1 ? satd_sub_unit(wi % n, w >> 2) : wi % n;
       int mode = ml[mi], pAngle = 0, dx = 0, dy = 0;
       threadgroup const uint8_t *A = pl ? A1 : A0, *L = pl ? L1 : L0;
       if (intra_is_directional(mode)) {
@@ -591,7 +611,7 @@ INLINE void coop_intra_multi(DEV const FrameParams *fp, DEV const uint8_t *src, 
       s = coop_intra_unit(src + fp->offset[p], fp->stride[p], x, y, log2W, log2H, mode, pAngle, dx, dy, dcs[pl], u, A, L);
     }
     int m0 = base / per, m1 = k_min(nm - 1, (base + 31) / per);
-    for (int k = m0; k <= m1; k++) out[k] += simd_sum(mi == k ? s : 0);
+    for (int k = m0; k <= m1; k++) out[k] += simd_sum(mi == k ? s : 0) * us;
   }
 }
 
@@ -670,12 +690,19 @@ INLINE long coop_inter_cost(DEV const FrameParams *fp, DEV const uint8_t *src, D
   DEV const int32_t *mvp = mvField + (sbIdx * NUM_NODES + mvNode) * 2;
   *mvr = mvp[0];
   *mvc = mvp[1];
-  /* (plane, unit) items of all planes in one sweep */
+  /* (plane, unit) items of all planes in one sweep; T_ANA_USUB: every other
+   * unit per plane (checkerboard), scaled x2 — the same subset as
+   * block_satd_sub on the CPU. */
   int n0 = (w >> 2) * (h >> 2), nc = n0 >> 2, s = 0;
-  for (int wi = (int)lane; wi < n0 + 2 * nc; wi += 32) {
-    int p = wi < n0 ? 0 : (wi < n0 + nc ? 1 : 2), u = p == 0 ? wi : wi - n0 - (p - 1) * nc;
-    s += p ? coop_inter_unit(fp, src, ref, hp, p, cx, cy, w >> 1, h >> 1, *mvr, *mvc, u)
-           : coop_inter_unit(fp, src, ref, hp, 0, x, y, w, h, *mvr, *mvc, u);
+  int us0 = eval_sub(fp) && w >= 32 ? 2 : 1, usc = eval_sub(fp) && (w >> 1) >= 32 ? 2 : 1;
+  int n0i = n0 / us0, nci = nc / usc;
+  for (int wi = (int)lane; wi < n0i + 2 * nci; wi += 32) {
+    int p = wi < n0i ? 0 : (wi < n0i + nci ? 1 : 2);
+    int k = p == 0 ? wi : wi - n0i - (p - 1) * nci;
+    int u = (p == 0 ? us0 : usc) > 1 ? satd_sub_unit(k, (w >> 2) >> (p > 0)) : k;
+    s += (p ? coop_inter_unit(fp, src, ref, hp, p, cx, cy, w >> 1, h >> 1, *mvr, *mvc, u)
+            : coop_inter_unit(fp, src, ref, hp, 0, x, y, w, h, *mvr, *mvc, u)) *
+         (p == 0 ? us0 : usc);
   }
   long c = simd_sum(s);
   return c + (long)lam * (4 + mv_bits8(*mvr, *mvc)) / 8;
@@ -768,7 +795,7 @@ INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, D
       int base = bestMode;
       for (int d = -MAX_ANGLE_DELTA; d <= MAX_ANGLE_DELTA; d++) {
         if (d == 0) continue;
-        long c = coop_intra_satd(py, fp->stride[0], x, y, lw, lh, base, d, A, L, lane) +
+        long c = coop_intra_satd(fp, py, fp->stride[0], x, y, lw, lh, base, d, A, L, lane) +
                  (long)lam * (mode_bits8(base) + 16) / 8;
         if (c < best) { best = c; bestDelta = d; }
       }
@@ -803,7 +830,7 @@ INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, D
         if (intra_is_directional(m) && m != V_PRED && m != H_PRED && m != bestMode) continue;
         if (turbo_mode_off(fp, m)) continue;
         int delta = (m == bestMode) ? bestDelta : 0;
-        cu[m] += coop_intra_satd(pp, fp->stride[p], cx, cy, clw, clh, m, delta, A, L, lane);
+        cu[m] += coop_intra_satd(fp, pp, fp->stride[p], cx, cy, clw, clh, m, delta, A, L, lane);
       }
     }
     for (int m = DC_PRED; m <= PAETH_PRED; m++) {
@@ -1286,6 +1313,7 @@ kernel void mav1_me_tg(device const FrameParams *fp [[buffer(0)]],
     return;
   }
   int mvr = m.stages ? dy * 8 : m.pr, mvc = m.stages ? dx * 8 : m.pc, bestS = 0;
+  int ustride = (fp->turbo & T_ME_USUB) && m.w >= 32 ? 2 : 1;
   int nUnits = (m.w >> 2) * (m.w >> 2);
   for (int step = 4; step >= me_min_step(fp, m.w); step >>= 1) {
     int bc = INT_MAX, bk = 0;
@@ -1297,10 +1325,10 @@ kernel void mav1_me_tg(device const FrameParams *fp [[buffer(0)]],
         int r0 = 0, c0 = 0;
         if (k > 0) me_nb(fp, k - 1, step, &r0, &c0);
         int s = 0;
-        for (int u = (int)tid; u < nUnits; u += (int)tpg)
+        for (int u = (int)tid * ustride; u < nUnits; u += (int)tpg * ustride)
           s += (fp->turbo & T_ME_HPEL) ? me_unit_satd_hp(fp, src, ref, hp, &m, mvr + r0, mvc + c0, u)
                                        : me_unit_satd(fp, src, ref, &m, mvr + r0, mvc + c0, u);
-        c = tg_sum(s, tid, tpg, red);
+        c = tg_sum(s, tid, tpg, red) * ustride;
       }
       if (c < bc) { bc = c; bk = k; }
     }

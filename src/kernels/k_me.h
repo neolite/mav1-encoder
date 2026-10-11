@@ -87,6 +87,7 @@ typedef struct {
 #define T_ME_CROSS 8192 /* sub-pel steps try the 4 axial neighbours only */
 #define T_ME_RSUB 65536 /* refinement-window full-pel SADs skip every other row */
 #define T_ME_HME3 131072 /* level 0: step-8 coarse grid, then +-4 step-4, on the decimated planes */
+#define T_ME_USUB 262144 /* sub-pel SATD on every other 4x4 unit for blocks >= 32 */
 #define T_ME_G3COPY 16384 /* leaf frames: 8x8 nodes of the second reference take the 16x16 parent's vector */
 #define T_ME_HALF01 32768 /* 64x64 and 32x32 nodes: half-pel refinement only */
 INLINE int me_min_step(DEV const FrameParams *fp, int w) { return w >= 32 && (fp->turbo & T_ME_HALF01) ? 4 : 2; }
@@ -246,9 +247,9 @@ INLINE int me_unit_satd_hp(DEV const FrameParams *fp, DEV const uint8_t *src, DE
 INLINE int me_subpel_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
                           DEV const uint8_t *hp, THR const MeNode *m, int mvr, int mvc, DEV int32_t *scratch) {
   if (fp->turbo & T_ME_HPEL) {
-    int s = 0, nu = (m->w >> 2) * (m->w >> 2);
-    for (int u = 0; u < nu; u++) s += me_unit_satd_hp(fp, src, ref, hp, m, mvr, mvc, u);
-    return s;
+    int s = 0, nu = (m->w >> 2) * (m->w >> 2), st = (fp->turbo & T_ME_USUB) && m->w >= 32 ? 2 : 1;
+    for (int u = 0; u < nu; u += st) s += me_unit_satd_hp(fp, src, ref, hp, m, mvr, mvc, u);
+    return s * st;
   }
   DEV uint8_t *pred = (DEV uint8_t *)scratch;
   predict_inter_block(ref + fp->offset[0], fp->stride[0], fp->frame_w, fp->frame_h, pred, m->w, m->x, m->y, m->w,

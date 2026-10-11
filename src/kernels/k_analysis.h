@@ -38,6 +38,9 @@ INLINE int level_bsize(int l) {
 /* Turbo (FrameParams.turbo bit 128): intra blocks of inter frames search
  * only DC / V / H / SMOOTH (luma and chroma) and no CfL. */
 #define T_INTRA 128
+/* Turbo bit 4194304: analysis SATDs sample every other 4x4 unit
+ * (checkerboard, cost x2) — the same subset on CPU and GPU. */
+#define T_ANA_USUB 4194304
 INLINE int turbo_mode_off(DEV const FrameParams *fp, int mode) {
   return (fp->turbo & T_INTRA) && !fp->frame_is_intra && mode != DC_PRED && mode != V_PRED && mode != H_PRED &&
          mode != SMOOTH_PRED;
@@ -69,6 +72,30 @@ INLINE int satd4x4(THR const int32_t *d) {
   return s;
 }
 
+INLINE int eval_sub(DEV const FrameParams *fp) { return (fp->turbo & T_ANA_USUB) != 0; }
+/* unit index of checkerboard item k of a nu-unit-wide grid (nu even),
+ * matching block_satd_sub's row+col-even set. */
+INLINE int satd_sub_unit(int k, int nu) {
+  int r = k / (nu >> 1), c = ((k % (nu >> 1)) << 1) + (r & 1);
+  return r * nu + c;
+}
+
+/* block_satd_s on every other 4x4 unit (checkerboard), scaled x2. */
+INLINE int block_satd_sub(DEV const uint8_t *src, int stride, DEV const uint8_t *pred, int predStride, int w,
+                          int h) {
+  int total = 0;
+  int32_t d[16];
+  for (int by = 0; by < h; by += 4)
+    for (int bx = 0; bx < w; bx += 4) {
+      if (((by >> 2) + (bx >> 2)) & 1) continue;
+      for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+          d[i * 4 + j] = (int)src[(by + i) * stride + bx + j] - (int)pred[(by + i) * predStride + bx + j];
+      total += satd4x4(d);
+    }
+  return total * 2;
+}
+
 /* SATD between a source block and a prediction stored with stride predStride. */
 INLINE int block_satd_s(DEV const uint8_t *src, int stride, DEV const uint8_t *pred, int predStride, int w, int h) {
   int total = 0;
@@ -81,6 +108,14 @@ INLINE int block_satd_s(DEV const uint8_t *src, int stride, DEV const uint8_t *p
       total += satd4x4(d);
     }
   return total;
+}
+
+INLINE int block_satd_e(DEV const FrameParams *fp, DEV const uint8_t *src, int stride, DEV const uint8_t *pred,
+                        int predStride, int w, int h) {
+  /* w >= 32: the plane has >= 8 units per row (the GPU subsamples by the
+   * same condition, per plane) */
+  return eval_sub(fp) && w >= 32 ? block_satd_sub(src, stride, pred, predStride, w, h)
+                                : block_satd_s(src, stride, pred, predStride, w, h);
 }
 
 /* SATD against a prediction stored with stride 64. */
@@ -125,11 +160,11 @@ INLINE long inter_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV co
   *mvc = mvp[1];
   predict_inter_block(ref + fp->offset[0], fp->stride[0], fp->frame_w, fp->frame_h, pred, ps, x, y, w, h, *mvr,
                       *mvc, 0, 0, EIGHTTAP, tmp);
-  long c = block_satd_s(src + fp->offset[0] + y * fp->stride[0] + x, fp->stride[0], pred, ps, w, h);
+  long c = block_satd_e(fp, src + fp->offset[0] + y * fp->stride[0] + x, fp->stride[0], pred, ps, w, h);
   for (int p = 1; p < 3; p++) {
     predict_inter_block(ref + fp->offset[p], fp->stride[p], fp->frame_w, fp->frame_h, pred, ps, cx, cy, w >> 1,
                         h >> 1, *mvr, *mvc, 1, 1, EIGHTTAP, tmp);
-    c += block_satd_s(src + fp->offset[p] + cy * fp->stride[p] + cx, fp->stride[p], pred, ps, w >> 1, h >> 1);
+    c += block_satd_e(fp, src + fp->offset[p] + cy * fp->stride[p] + cx, fp->stride[p], pred, ps, w >> 1, h >> 1);
   }
   return c + (long)lam * (4 + mv_bits8(*mvr, *mvc)) / 8;
 }
@@ -156,7 +191,7 @@ INLINE long compound_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV
                         mvr2, mvc2, sub, sub, EIGHTTAP, tmp);
     for (int i = 0; i < bh; i++)
       for (int j = 0; j < bw; j++) pred[i * ps + j] = (uint8_t)((pred[i * ps + j] + pred2[i * ps + j] + 1) >> 1);
-    c += block_satd_s(src + fp->offset[p] + by * fp->stride[p] + bx, fp->stride[p], pred, ps, bw, bh);
+    c += block_satd_e(fp, src + fp->offset[p] + by * fp->stride[p] + bx, fp->stride[p], pred, ps, bw, bh);
   }
   return c + (long)lam * (8 + mv_bits8(mvr, mvc) + mv_bits8(mvr2, mvc2) + COMPOUND_BITS8) / 8;
 }
@@ -177,8 +212,11 @@ INLINE void inter3_satd(DEV const FrameParams *fp, DEV const uint8_t *src, DEV c
                         sub, sub, EIGHTTAP, tmp);
     DEV const uint8_t *sp = src + fp->offset[p] + by * stride + bx;
     int32_t d0[16], d1[16], d2[16];
+    int usub = eval_sub(fp) && bw >= 32 ? 2 : 1;
+    long ls0 = 0, ls1 = 0, ls2 = 0;
     for (int uy = 0; uy < bh; uy += 4)
       for (int ux = 0; ux < bw; ux += 4) {
+        if (usub > 1 && (((uy >> 2) + (ux >> 2)) & 1)) continue;
         for (int i = 0; i < 4; i++)
           for (int j = 0; j < 4; j++) {
             int sv = sp[(uy + i) * stride + ux + j], a = pred[(uy + i) * ps + ux + j], b = pred2[(uy + i) * ps + ux + j];
@@ -186,10 +224,13 @@ INLINE void inter3_satd(DEV const FrameParams *fp, DEV const uint8_t *src, DEV c
             d1[i * 4 + j] = sv - b;
             d2[i * 4 + j] = sv - ((a + b + 1) >> 1);
           }
-        s[0] += satd4x4(d0);
-        s[1] += satd4x4(d1);
-        s[2] += satd4x4(d2);
+        ls0 += satd4x4(d0);
+        ls1 += satd4x4(d1);
+        ls2 += satd4x4(d2);
       }
+    s[0] += ls0 * usub;
+    s[1] += ls1 * usub;
+    s[2] += ls2 * usub;
   }
 }
 
