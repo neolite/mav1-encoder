@@ -161,14 +161,19 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
 
     private func _start(presetIndex: Int) {
         let preset = presets[presetIndex]
-        let want10 = hdrRequested && videoOutput.availableVideoPixelFormatTypes.contains(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+        // ask for whatever 10-bit biplanar variant the output actually offers
+        let tenBit: OSType? = [
+            kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
+        ].first { videoOutput.availableVideoPixelFormatTypes.contains($0) }
+        let want10 = hdrRequested && tenBit != nil
         session.beginConfiguration()
         session.sessionPreset = preset
         if let dev = camInput?.device { tuneDevice(dev) }
         // P010 keeps 10-bit pixels through the capture chain on devices that
         // support HDR capture; anything else falls back to 8-bit NV12.
         videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String:
-            want10 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            want10 ? tenBit!
                    : videoOutput.availableVideoPixelFormatTypes.contains(kCVPixelFormatType_420YpCbCr8Planar)
                      ? kCVPixelFormatType_420YpCbCr8Planar
                      : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange]
@@ -206,7 +211,7 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         cfg.rc = MAV1_RC_CQP
         // phone memory: per-engine ME scratch ~197MB + qpel ~100MB at 1080p
         // (~4x at 4K) — 2 engines fit for <=1080p, single engine for 4K
-        cfg.threads = w * h >= 3840 * 2160 ? 1 : 2
+        cfg.threads = w * h >= 3840 * 2160 ? 2 : 2 // try 2 engines at 4K; jetsam decides
         if is10bit {
             cfg.bitdepth = 10
             // iPhone captures HDR in HLG (Dolby Vision is a mux-level side
@@ -321,14 +326,17 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         let fmt = CVPixelBufferGetPixelFormatType(pb)
 
         if enc == nil {
-            guard lazyCreate(w: w, h: h, is10bit: fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) else { return }
+            let is10 = fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+                    || fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+            guard lazyCreate(w: w, h: h, is10bit: is10) else { return }
         }
         guard let enc, let file else { return }
 
         var pl: [UnsafePointer<UInt8>?]
         var st: [Int32]
 
-        if fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange {
+        if fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            || fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange {
             // P010: uint16 MSB-justified -> LSB-justified I420-10bit.
             let cw = (w + 1) / 2, ch = (h + 1) / 2
             if yBytes < w * h * 2 {
