@@ -15,6 +15,12 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
     private var uBuf: UnsafeMutableRawPointer?
     private var vBuf: UnsafeMutableRawPointer?
     private var uvBytes = 0
+    private var yBuf: UnsafeMutableRawPointer?
+    private var yBytes = 0
+    /// 10-bit HDR capture (P010 -> I420-10bit) requested for the next
+    /// recording. iPhone 12+ delivers 10-bit when the output format allows it.
+    @Published var hdrRequested = false
+    private(set) var hdrActive = false
 
     private var framesSent = 0
     private var packets = 0
@@ -89,9 +95,18 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
 
     private func _start(presetIndex: Int) {
         let preset = presets[presetIndex]
+        let want10 = hdrRequested && videoOutput.availableVideoPixelFormatTypes.contains(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
         session.beginConfiguration()
         session.sessionPreset = preset
+        // P010 keeps 10-bit pixels through the capture chain on devices that
+        // support HDR capture; anything else falls back to 8-bit NV12.
+        videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String:
+            want10 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+                   : videoOutput.availableVideoPixelFormatTypes.contains(kCVPixelFormatType_420YpCbCr8Planar)
+                     ? kCVPixelFormatType_420YpCbCr8Planar
+                     : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange]
         session.commitConfiguration()
+        hdrActive = want10
 
         let dim = preset == .hd4K3840x2160 ? (3840, 2160) : preset == .hd1920x1080 ? (1920, 1080) : (1280, 720)
 
@@ -104,7 +119,20 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         cfg.fps_den = 1
         cfg.keyint = 0
         cfg.rc = MAV1_RC_CQP
-        cfg.bitdepth = 8
+        if hdrActive {
+            cfg.bitdepth = 10
+            // iPhone captures HDR in HLG (Dolby Vision is a mux-level side
+            // channel; the raw frames are HLG-tagged BT.2020 10-bit)
+            cfg.color_primaries = 9          // BT.2020
+            cfg.transfer_characteristics = 18 // HLG
+            cfg.matrix_coefficients = 9      // BT.2020 NCL
+            cfg.color_range = 0
+            cfg.hdr = 1
+            cfg.max_cll = 1000
+            cfg.max_fall = 400
+        } else {
+            cfg.bitdepth = 8
+        }
 
         var errbuf = [CChar](repeating: 0, count: 256)
         enc = errbuf.withUnsafeMutableBufferPointer { mav1_create(&cfg, $0.baseAddress, $0.count) }
@@ -140,7 +168,7 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         startTime = CACurrentMediaTime()
         DispatchQueue.main.async {
             self.recording = true
-            self.status = "recording \(dim.0)x\(dim.1) turbo"
+            self.status = "recording \(dim.0)x\(dim.1)\(self.hdrActive ? " HDR10" : "") turbo"
         }
         startSession()
     }
@@ -171,7 +199,8 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         self.enc = nil
         uBuf.map { free($0) }; uBuf = nil
         vBuf.map { free($0) }; vBuf = nil
-        uvBytes = 0
+        yBuf.map { free($0) }; yBuf = nil
+        uvBytes = 0; yBytes = 0
 
         let name = outURL?.lastPathComponent ?? ""
         DispatchQueue.main.async {
@@ -194,7 +223,51 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         var pl: [UnsafePointer<UInt8>?]
         var st: [Int32]
 
-        if fmt == kCVPixelFormatType_420YpCbCr8Planar {
+        if fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange {
+            // P010: uint16 MSB-justified -> LSB-justified I420-10bit.
+            let cw = (w + 1) / 2, ch = (h + 1) / 2
+            if yBytes < w * h * 2 {
+                yBuf?.deallocate()
+                yBuf = UnsafeMutableRawPointer.allocate(byteCount: w * h * 2, alignment: 16)
+                yBytes = w * h * 2
+            }
+            if uvBytes < cw * ch * 2 {
+                uBuf?.deallocate(); vBuf?.deallocate()
+                uBuf = UnsafeMutableRawPointer.allocate(byteCount: cw * ch * 2, alignment: 16)
+                vBuf = UnsafeMutableRawPointer.allocate(byteCount: cw * ch * 2, alignment: 16)
+                uvBytes = cw * ch * 2
+            }
+            guard let yb = yBuf, let ub = uBuf, let vb = vBuf,
+                  let yp = CVPixelBufferGetBaseAddressOfPlane(pb, 0),
+                  let uvp = CVPixelBufferGetBaseAddressOfPlane(pb, 1) else { return }
+            let ys = CVPixelBufferGetBytesPerRowOfPlane(pb, 0) / 2
+            let uvs = CVPixelBufferGetBytesPerRowOfPlane(pb, 1) / 2
+            let src = yp.assumingMemoryBound(to: UInt16.self)
+            yb.withMemoryRebound(to: UInt16.self, capacity: w * h) { dst in
+                for y in 0..<h {
+                    let s = src + y * ys, d = dst + y * w
+                    for x in 0..<w { d[x] = s[x] >> 6 }
+                }
+            }
+            let uvr = uvp.assumingMemoryBound(to: UInt16.self)
+            ub.withMemoryRebound(to: UInt16.self, capacity: cw * ch) { up in
+                vb.withMemoryRebound(to: UInt16.self, capacity: cw * ch) { vp in
+                    for y in 0..<ch {
+                        let s = uvr + y * uvs, d = y * cw
+                        for x in 0..<cw {
+                            up[d + x] = s[2 * x] >> 6
+                            vp[d + x] = s[2 * x + 1] >> 6
+                        }
+                    }
+                }
+            }
+            pl = [
+                UnsafePointer(yb.assumingMemoryBound(to: UInt8.self)),
+                UnsafePointer(ub.assumingMemoryBound(to: UInt8.self)),
+                UnsafePointer(vb.assumingMemoryBound(to: UInt8.self)),
+            ]
+            st = [Int32(w * 2), Int32(cw * 2), Int32(cw * 2)]
+        } else if fmt == kCVPixelFormatType_420YpCbCr8Planar {
             pl = [
                 CVPixelBufferGetBaseAddressOfPlane(pb, 0).map { UnsafePointer($0.assumingMemoryBound(to: UInt8.self)) },
                 CVPixelBufferGetBaseAddressOfPlane(pb, 1).map { UnsafePointer($0.assumingMemoryBound(to: UInt8.self)) },

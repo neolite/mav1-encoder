@@ -40,6 +40,13 @@ struct ContentView: View {
                 .padding(.top, 8)
                 .disabled(rec.recording)
 
+                Toggle("HDR 10-bit", isOn: $rec.hdrRequested)
+                    .font(.caption.bold())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal)
+                    .padding(.top, 4)
+                    .disabled(rec.recording)
+
                 Spacer()
 
                 Text(rec.status)

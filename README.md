@@ -10,6 +10,11 @@ a comparable bitrate, with a small BD-rate delta at high bitrates.
 ## Status
 
 - AV1 output decodes in dav1d, libaom (`aomdec`) and FFmpeg's decoder.
+- Bitdepth: 8-bit and 10-bit (profile 0, YUV 4:2:0) with native uint16 pixel paths
+  in both CPU and Metal GPU kernels.
+- HDR10 metadata: SMPTE 2084 (PQ), BT.2020 primaries, mastering display color
+  volume (MDCV), and content light level (CLL) metadata OBUs.
+- Rate control: CQP (default), VBR (single-pass target bitrate), and CBR (VBV buffer).
 - The FFmpeg wrapper produces bit-exact output to the `mav1enc` CLI.
 - Platform: macOS / Apple Silicon (Metal). A CPU-only path exists for
   correctness checking (`--cpu`, `MAV1_CPU=1`), the production path is Metal.
@@ -27,10 +32,20 @@ script).
 ## CLI
 
 ```sh
+# 8-bit SDR
 build/mav1enc --metal -i in.y4m -o out.ivf -n 200 --turbo -q 125
+
+# 10-bit HDR10 (BT.2020 + PQ, 1000 nits mastering display)
+build/mav1enc --metal -i in_10bit.y4m -o hdr.ivf --bitdepth 10 --hdr 1000 --cll 1000,400 --turbo -q 110
+
+# Single-pass VBR rate control
+build/mav1enc --metal -i in.y4m -o vbr.ivf --rc vbr --b:v 2500 --turbo
 ```
 
 Key options: `--turbo` (fast preset), `--q Q` (0-255 base_q_idx, CQP),
+`--bitdepth 8|10`, `--hdr [NITS]`, `--cll MAX_CLL,MAX_FALL`,
+`--cp N --tc N --mc N --range 0|1` (CICP color description),
+`--rc cqp|vbr|cbr`, `--b:v KBPS`, `--vbv KBITS`,
 `--keyint N`, `--tiles LOG2`, `--golden`, `--altref N`, `--no-lr`, `--no-cdef`,
 `--no-txsearch`, `--no-txdepth`, `--no-switchable`, `--cpu`/`--metal`.
 
@@ -45,18 +60,14 @@ cd ffmpeg && git apply /path/to/ffmpeg-n8.1.3-libmav1.patch
 ./configure --enable-libmav1 \
   --extra-cflags=-I/opt/mav1/include --extra-ldflags=-L/opt/mav1/lib
 make -j8
-./ffmpeg -thread_queue_size 512 -i in.y4m -c:v libmav1 -turbo 1 -qindex 125 out.ivf
+
+# 10-bit HDR10 encode
+./ffmpeg -thread_queue_size 512 -i in_10bit.y4m -c:v libmav1 -turbo 1 -hdr 1 -b:v 4M out.ivf
 ```
 
-> **Throughput note:** FFmpeg hands the encoder one input frame per
-> `receive_packet` call and, with the default shallow thread queues, delivers
-> input at consumption pace. That starves mav1's engine pipeline (~10 fps on
-> 1080p). Passing `-thread_queue_size 512` (or larger) on the input lets the
-> demuxer run ahead and restores near-CLI throughput (~55 fps on M1 Pro,
-> ~1.4x libsvtav1). Without it the output is still correct, just slower.
-
-Codec options: `-metal 0|1`, `-turbo 0|1`, `-qindex N`, `-lf`, `-cdef`,
+Codec options: `-metal 0|1`, `-turbo 0|1`, `-qindex N`, `-hdr 0|1`, `-lf`, `-cdef`,
 `-txsearch`, `-txdepth`, `-lr`, `-dualfilter`, `-me_range N`, `-g` (GOP).
+Pixel formats: `yuv420p`, `yuv420p10le`. Rate control via `-b:v` / `-maxrate` / `-bufsize`.
 
 ## API
 
@@ -64,6 +75,21 @@ Codec options: `-metal 0|1`, `-turbo 0|1`, `-qindex N`, `-lf`, `-cdef`,
 `mav1_receive_packet` / `mav1_receive_packet_wait`, `mav1_get_recon`,
 `mav1_destroy`. Altref mode reorders output (hidden ARF + show_existing_frame
 temporal units), so consumers should use the queued send/receive API.
+
+## HDR
+
+10-bit 4:2:0 encoding (profile 0) with CICP colour description and static
+HDR10 metadata (MDCV + CLL OBUs). See [docs/hdr.md](docs/hdr.md) for input
+formats, CLI/FFmpeg flags, the iOS capture path, and the roadmap of
+HDR-specific features compared to svt-av1-hdr.
+
+## iOS
+
+`ios/mav1cam` is a proof-of-concept camera app: `make ios` builds
+`build/ios/libmav1.a` for `arm64-iphoneos`, `xcodegen generate` inside
+`ios/mav1cam` regenerates the Xcode project. Captures 720p/1080p/4K
+(optional HDR 10-bit), encodes AV1 on Metal, writes `.ivf` into the app
+documents (visible in Files).
 
 ## Layout
 
