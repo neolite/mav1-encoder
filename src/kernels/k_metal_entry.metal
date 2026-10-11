@@ -254,8 +254,25 @@ kernel void mav1_recon(device const FrameParams *fp [[buffer(0)]],
 /* SATD of 4x4 unit u of a bw x bh block at (bx, by) of plane p against its
  * EIGHTTAP inter prediction (predict_inter_block( ) evaluated per sample). */
 /* EIGHTTAP prediction of 4x4 unit u (Clip1 of the single-reference output). */
-INLINE void coop_pred_unit(DEV const FrameParams *fp, DEV const uint8_t *ref, int p, int bx, int by, int bw, int bh,
-                           int mvr, int mvc, int u, THR int *out) {
+INLINE void coop_pred_unit(DEV const FrameParams *fp, DEV const uint8_t *ref, DEV const uint8_t *hp, int p, int bx,
+                           int by, int bw, int bh, int mvr, int mvc, int u, THR int *out) {
+  if (p == 0 && hp) {
+    /* luma away from the frame edges: the quarter-pel plane of the motion
+     * search holds this very prediction (same filter, rounding, no clamp) */
+    int nu = bw >> 2, W = fp->frame_w, H = fp->frame_h;
+    int iy = by + (u / nu) * 4 + (mvr >> 3), ix = bx + (u % nu) * 4 + (mvc >> 3);
+    if (iy >= 3 && iy + 7 <= H - 1 && ix >= 3 && ix + 7 <= W - 1) {
+      DEV const uint8_t *pl = hp + (size_t)(((mvr >> 1) & 3) * 4 + ((mvc >> 1) & 3)) * W * H + (size_t)iy * W + ix;
+      for (int r = 0; r < 4; r++) {
+        uchar4 v = uchar4(*(DEV const packed_uchar4 *)(pl + r * W));
+        out[r * 4 + 0] = v.x;
+        out[r * 4 + 1] = v.y;
+        out[r * 4 + 2] = v.z;
+        out[r * 4 + 3] = v.w;
+      }
+      return;
+    }
+  }
   int sub = p > 0;
   int stride = fp->stride[p];
   DEV const uint8_t *rp = ref + fp->offset[p];
@@ -290,10 +307,10 @@ INLINE void coop_pred_unit(DEV const FrameParams *fp, DEV const uint8_t *ref, in
  * EIGHTTAP inter prediction (predict_inter_block( ) evaluated per sample);
  * with ref2, against the rounded average of both references' predictions
  * (compound_cost( )). */
-INLINE int coop_inter_unit(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref, int p,
-                           int bx, int by, int bw, int bh, int mvr, int mvc, int u) {
+INLINE int coop_inter_unit(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
+                           DEV const uint8_t *hp, int p, int bx, int by, int bw, int bh, int mvr, int mvc, int u) {
   int pr[16];
-  coop_pred_unit(fp, ref, p, bx, by, bw, bh, mvr, mvc, u, pr);
+  coop_pred_unit(fp, ref, hp, p, bx, by, bw, bh, mvr, mvc, u, pr);
   int stride = fp->stride[p], nu = bw >> 2;
   DEV const uint8_t *sp = src + fp->offset[p] + (by + (u / nu) * 4) * stride + bx + (u % nu) * 4;
   int32_t d[16];
@@ -303,11 +320,11 @@ INLINE int coop_inter_unit(DEV const FrameParams *fp, DEV const uint8_t *src, DE
 }
 
 INLINE int coop_comp_unit(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
-                          DEV const uint8_t *ref2, int p, int bx, int by, int bw, int bh, int mvr, int mvc, int mvr2,
-                          int mvc2, int u) {
+                          DEV const uint8_t *ref2, DEV const uint8_t *hp, DEV const uint8_t *hp2, int p, int bx, int by,
+                          int bw, int bh, int mvr, int mvc, int mvr2, int mvc2, int u) {
   int pr[16], pr2[16];
-  coop_pred_unit(fp, ref, p, bx, by, bw, bh, mvr, mvc, u, pr);
-  coop_pred_unit(fp, ref2, p, bx, by, bw, bh, mvr2, mvc2, u, pr2);
+  coop_pred_unit(fp, ref, hp, p, bx, by, bw, bh, mvr, mvc, u, pr);
+  coop_pred_unit(fp, ref2, hp2, p, bx, by, bw, bh, mvr2, mvc2, u, pr2);
   int stride = fp->stride[p], nu = bw >> 2;
   DEV const uint8_t *sp = src + fp->offset[p] + (by + (u / nu) * 4) * stride + bx + (u % nu) * 4;
   int32_t d[16];
@@ -317,14 +334,14 @@ INLINE int coop_comp_unit(DEV const FrameParams *fp, DEV const uint8_t *src, DEV
 }
 
 INLINE long coop_compound_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
-                               DEV const uint8_t *ref2, int x, int y, int w, int h, int mvr, int mvc, int mvr2,
+                               DEV const uint8_t *ref2, DEV const uint8_t *hp, DEV const uint8_t *hp2, int x, int y, int w, int h, int mvr, int mvc, int mvr2,
                                int mvc2, uint lane) {
   int lam = fp->ac_q[0] / 16;
   long c = 0;
   for (int p = 0; p < 3; p++) {
     int sub = p > 0, bw = w >> sub, bh = h >> sub, n = (bw >> 2) * (bh >> 2), s = 0;
     for (int u = (int)lane; u < n; u += 32)
-      s += coop_comp_unit(fp, src, ref, ref2, p, x >> sub, y >> sub, bw, bh, mvr, mvc, mvr2, mvc2, u);
+      s += coop_comp_unit(fp, src, ref, ref2, hp, hp2, p, x >> sub, y >> sub, bw, bh, mvr, mvc, mvr2, mvc2, u);
     c += simd_sum(s);
   }
   return c + (long)lam * (8 + mv_bits8(mvr, mvc) + mv_bits8(mvr2, mvc2) + COMPOUND_BITS8) / 8;
@@ -333,7 +350,7 @@ INLINE long coop_compound_cost(DEV const FrameParams *fp, DEV const uint8_t *src
 /* LAST, second reference and compound SATDs of the whole block (all planes)
  * from one evaluation of both predictions per 4x4 unit: s[0..2]. */
 INLINE void coop_inter3(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
-                        DEV const uint8_t *ref2, int x, int y, int w, int h, int mvr, int mvc, int mvr2, int mvc2,
+                        DEV const uint8_t *ref2, DEV const uint8_t *hp, DEV const uint8_t *hp2, int x, int y, int w, int h, int mvr, int mvc, int mvr2, int mvc2,
                         uint lane, THR long *s) {
   int a0 = 0, a1 = 0, a2 = 0;
   /* (plane, unit) items of all planes in one sweep */
@@ -344,8 +361,8 @@ INLINE void coop_inter3(DEV const FrameParams *fp, DEV const uint8_t *src, DEV c
     int stride = fp->stride[p];
     {
       int pr[16], pr2[16];
-      coop_pred_unit(fp, ref, p, bx, by, bw, bh, mvr, mvc, u, pr);
-      coop_pred_unit(fp, ref2, p, bx, by, bw, bh, mvr2, mvc2, u, pr2);
+      coop_pred_unit(fp, ref, hp, p, bx, by, bw, bh, mvr, mvc, u, pr);
+      coop_pred_unit(fp, ref2, hp2, p, bx, by, bw, bh, mvr2, mvc2, u, pr2);
       DEV const uint8_t *sp = src + fp->offset[p] + (by + (u / nu) * 4) * stride + bx + (u % nu) * 4;
       int32_t d0[16], d1[16], d2[16];
       for (int rr = 0; rr < 4; rr++)
@@ -368,7 +385,7 @@ INLINE void coop_inter3(DEV const FrameParams *fp, DEV const uint8_t *src, DEV c
 INLINE int coop_inter_satd(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref, int p,
                            int bx, int by, int bw, int bh, int mvr, int mvc, uint lane) {
   int n = (bw >> 2) * (bh >> 2), s = 0;
-  for (int u = (int)lane; u < n; u += 32) s += coop_inter_unit(fp, src, ref, p, bx, by, bw, bh, mvr, mvc, u);
+  for (int u = (int)lane; u < n; u += 32) s += coop_inter_unit(fp, src, ref, 0, p, bx, by, bw, bh, mvr, mvc, u);
   return simd_sum(s);
 }
 
@@ -644,7 +661,7 @@ INLINE int coop_cfl_satd(DEV const FrameParams *fp, DEV const uint8_t *src, int 
 }
 
 /* eval_block( ) for one SIMD group. */
-INLINE long coop_inter_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
+INLINE long coop_inter_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref, DEV const uint8_t *hp,
                             DEV const int32_t *mvField, int mvNode, int x, int y, int w, int h, THR int *mvr,
                             THR int *mvc, uint lane) {
   int lam = fp->ac_q[0] / 16;
@@ -657,15 +674,15 @@ INLINE long coop_inter_cost(DEV const FrameParams *fp, DEV const uint8_t *src, D
   int n0 = (w >> 2) * (h >> 2), nc = n0 >> 2, s = 0;
   for (int wi = (int)lane; wi < n0 + 2 * nc; wi += 32) {
     int p = wi < n0 ? 0 : (wi < n0 + nc ? 1 : 2), u = p == 0 ? wi : wi - n0 - (p - 1) * nc;
-    s += p ? coop_inter_unit(fp, src, ref, p, cx, cy, w >> 1, h >> 1, *mvr, *mvc, u)
-           : coop_inter_unit(fp, src, ref, 0, x, y, w, h, *mvr, *mvc, u);
+    s += p ? coop_inter_unit(fp, src, ref, hp, p, cx, cy, w >> 1, h >> 1, *mvr, *mvc, u)
+           : coop_inter_unit(fp, src, ref, hp, 0, x, y, w, h, *mvr, *mvc, u);
   }
   long c = simd_sum(s);
   return c + (long)lam * (4 + mv_bits8(*mvr, *mvc)) / 8;
 }
 
 INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
-                            DEV const uint8_t *gold, DEV const int32_t *mvField, DEV const int32_t *mvFieldGold,
+                            DEV const uint8_t *gold, DEV const uint8_t *hp, DEV const uint8_t *hp2, DEV const int32_t *mvField, DEV const int32_t *mvFieldGold,
                             int mvNode, int miRow, int miCol, int bsize,
                             DEV int32_t *scratch, int ps, THR BlockInfo *out, threadgroup uint8_t *A,
                             threadgroup uint8_t *L, threadgroup uint8_t *A2, threadgroup uint8_t *L2, uint lane) {
@@ -685,7 +702,7 @@ INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, D
     DEV const int32_t *m1 = mvFieldGold + (sbIdx * NUM_NODES + mvNode) * 2;
     int lr = m0[0], lc = m0[1], gr = m1[0], gc = m1[1];
     long s[3];
-    coop_inter3(fp, src, ref, gold, x, y, w, h, lr, lc, gr, gc, lane, s);
+    coop_inter3(fp, src, ref, gold, hp, hp2, x, y, w, h, lr, lc, gr, gc, lane, s);
     interCost = s[0] + (long)lam * (4 + mv_bits8(lr, lc)) / 8;
     mvr = lr;
     mvc = lc;
@@ -707,10 +724,10 @@ INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, D
       refFrame1 = fp->ref2_frame;
     }
   } else if (!fp->frame_is_intra) {
-    interCost = coop_inter_cost(fp, src, ref, mvField, mvNode, x, y, w, h, &mvr, &mvc, lane);
+    interCost = coop_inter_cost(fp, src, ref, hp, mvField, mvNode, x, y, w, h, &mvr, &mvc, lane);
     if (fp->golden) {
       int lr = mvr, lc = mvc, gr, gc;
-      long g = coop_inter_cost(fp, src, gold, mvFieldGold, mvNode, x, y, w, h, &gr, &gc, lane) +
+      long g = coop_inter_cost(fp, src, gold, hp2, mvFieldGold, mvNode, x, y, w, h, &gr, &gc, lane) +
                (long)lam * GOLDEN_REF_BITS8 / 8;
       if (g < interCost) { /* tie: LAST */
         interCost = g;
@@ -719,7 +736,7 @@ INLINE long coop_eval_block(DEV const FrameParams *fp, DEV const uint8_t *src, D
         refFrame = fp->ref2_frame;
       }
       if (fp->compound) {
-        long cc = coop_compound_cost(fp, src, ref, gold, x, y, w, h, lr, lc, gr, gc, lane);
+        long cc = coop_compound_cost(fp, src, ref, gold, hp, hp2, x, y, w, h, lr, lc, gr, gc, lane);
         if (cc < interCost) {
           interCost = cc;
           mvr = lr;
@@ -849,6 +866,9 @@ kernel void mav1_analyze_coop(device const FrameParams *fp [[buffer(0)]],
                               device const uint8_t *gold [[buffer(8)]],
                               device const int32_t *mvFieldGold [[buffer(9)]],
                               constant int2 &band [[buffer(10)]],
+                              device const uint8_t *hpl [[buffer(11)]],
+                              device const uint8_t *hpg [[buffer(12)]],
+                              constant int &useHp [[buffer(13)]],
                               uint gid [[threadgroup_position_in_grid]],
                               uint lane [[thread_index_in_simdgroup]]) {
   threadgroup uint8_t eA[EDGE_OFF + 160], eL[EDGE_OFF + 160], eA2[EDGE_OFF + 160], eL2[EDGE_OFF + 160];
@@ -872,7 +892,7 @@ kernel void mav1_analyze_coop(device const FrameParams *fp [[buffer(0)]],
   int dr, dc;
   int bs = part_block(p, level_bsize(level), k, halfSz, &dr, &dc);
   BlockInfo b;
-  long cost = coop_eval_block(fp, src, ref, gold, mvField, mvFieldGold, node, r + dr, c + dc, bs,
+  long cost = coop_eval_block(fp, src, ref, gold, useHp ? hpl : nullptr, useHp ? hpg : nullptr, mvField, mvFieldGold, node, r + dr, c + dc, bs,
                               scratch + (long)gid * analysis_slot_ints(level), 64 >> level, &b, eA + EDGE_OFF,
                               eL + EDGE_OFF, eA2 + EDGE_OFF, eL2 + EDGE_OFF, lane);
   if (lane == 0) {
@@ -929,6 +949,9 @@ kernel void mav1_analyze_l3o(device const FrameParams *fp [[buffer(0)]],
                              device const uint8_t *gold [[buffer(8)]],
                              device const int32_t *mvFieldGold [[buffer(9)]],
                              constant int2 &band [[buffer(10)]],
+                             device const uint8_t *hpl [[buffer(11)]],
+                             device const uint8_t *hpg [[buffer(12)]],
+                             constant int &useHp [[buffer(13)]],
                              uint gid [[threadgroup_position_in_grid]],
                              uint lane [[thread_index_in_simdgroup]]) {
   if ((int)gid >= band.y * 16) return;
@@ -974,8 +997,8 @@ kernel void mav1_analyze_l3o(device const FrameParams *fp [[buffer(0)]],
     int a0 = 0, a1 = 0, a2 = 0;
     if (t < 6) {
       int pr[16], pr2[16];
-      coop_pred_unit(fp, ref, ip, ibx, iby, ibw, ibh, lr, lc, iu, pr);
-      if (fp->golden) coop_pred_unit(fp, gold, ip, ibx, iby, ibw, ibh, gr, gc, iu, pr2);
+      coop_pred_unit(fp, ref, useHp ? hpl : nullptr, ip, ibx, iby, ibw, ibh, lr, lc, iu, pr);
+      if (fp->golden) coop_pred_unit(fp, gold, useHp ? hpg : nullptr, ip, ibx, iby, ibw, ibh, gr, gc, iu, pr2);
       int stride = fp->stride[ip], nu = ibw >> 2;
       DEV const uint8_t *sp = src + fp->offset[ip] + (iby + (iu / nu) * 4) * stride + ibx + (iu % nu) * 4;
       int4 d0[4], d1[4], d2[4];

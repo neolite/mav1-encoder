@@ -613,18 +613,25 @@ static void run_frame_core(Mav1Encoder *e, int isKey) {
     e->be->recon(e->be, e);
     t2 = now();
   }
-  build_filter_info(e);
+  double tf0 = now();
   int cdefOff = (e->leafopt & 4) != 0, nPresets = e->num_cdef_presets;
+  int lfOn = e->hdr.lf_level[0] || e->hdr.lf_level[1] || e->hdr.lf_level[2] || e->hdr.lf_level[3];
+  int filt = lfOn || (nPresets && !cdefOff) || !e->cfg.turbo; /* leaf frames: nothing to filter */
+  if (filt) build_filter_info(e);
+  double tf1 = now();
   if (nPresets) e->num_cdef_presets = 1 << e->hdr.cdef_bits;
   if (cdefOff) { /* the filter stage skips CDEF; every superblock codes index 0 */
     e->num_cdef_presets = 0;
     memset(e->cdef_choice, 0, (size_t)e->num_sbs);
   }
-  e->be->filter(e->be, e);
+  /* nothing to filter (leaf frames: no deblocking, no CDEF) */
+  if (filt) e->be->filter(e->be, e);
+  double tf2 = now();
   e->num_cdef_presets = nPresets;
   int useLr = e->cfg.restoration && e->cfg.qindex > 0 && !(e->leafopt & 8); /* AllLossless disables it */
   if (useLr) memcpy(e->dbk.base, e->rec.base, e->frame_bytes); /* UpscaledCurrFrame */
   if (e->cfg.cdef && e->cfg.qindex > 0 && !cdefOff) cdef_select(e);
+  double tf3 = now();
   if (useLr) {
     lr_select(e);
     memcpy(e->lrout.base, e->rec.base, e->frame_bytes);
@@ -643,8 +650,9 @@ static void run_frame_core(Mav1Encoder *e, int isKey) {
   e->last.t_filter = t3 - t2;
   e->last.t_entropy = 0;
   if (getenv("MAV1_TIMING"))
-    fprintf(stderr, "kind %d nonref %d: me %.1f ana %.1f edge %.1f rec %.1f flt %.1f ms\n", e->frame_kind, e->nonref,
-            (tme - t0) * 1e3, (tan - tme) * 1e3, (t1 - tan) * 1e3, (t2 - t1) * 1e3, (t3 - t2) * 1e3);
+    fprintf(stderr, "kind %d nonref %d: me %.1f ana %.1f edge %.1f rec %.1f flt %.1f ms (info %.1f gpu %.1f sel %.1f)\n", e->frame_kind, e->nonref,
+            (tme - t0) * 1e3, (tan - tme) * 1e3, (t1 - tan) * 1e3, (t2 - t1) * 1e3, (t3 - t2) * 1e3, (tf1 - tf0) * 1e3,
+            (tf2 - tf1) * 1e3, (tf3 - tf2) * 1e3);
 }
 
 /* Entropy codes the frame described by s (the encoder or a writer

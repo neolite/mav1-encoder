@@ -203,7 +203,7 @@ static void enc_me(Backend *b, id<MTLComputeCommandEncoder> enc, struct Mav1Enco
   [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
-static void enc_ana(Mav1MetalState *s, id<MTLComputeCommandEncoder> enc, struct Mav1Encoder *e, int level, int sb0,
+static void enc_ana(Backend *b, Mav1MetalState *s, id<MTLComputeCommandEncoder> enc, struct Mav1Encoder *e, int level, int sb0,
                     int nsb) {
   [enc setBuffer:wrap(s, &e->params) offset:0 atIndex:0];
   [enc setBuffer:wrap(s, &e->src) offset:0 atIndex:1];
@@ -218,6 +218,16 @@ static void enc_ana(Mav1MetalState *s, id<MTLComputeCommandEncoder> enc, struct 
   [enc setBytes:band length:sizeof band atIndex:10];
   [enc setBytes:&level length:sizeof level atIndex:7];
   const FrameParams *fp = ENC_PARAMS(e);
+  /* inter luma predictions from the motion search's quarter-pel planes */
+  {
+    MetalBackend *mb = (MetalBackend *)b;
+    int useHp = !fp->frame_is_intra && (fp->turbo & T_ME_HPEL) && !getenv("MAV1_NOAHP");
+    long eb = qp_entry_bytes(fp);
+    const Buf *qb = e->qpc ? &e->qpc->buf : &e->hpel;
+    [enc setBuffer:wrap(s, qb) offset:(NSUInteger)(useHp ? mb->qpLast * eb : 0) atIndex:11];
+    [enc setBuffer:wrap(s, qb) offset:(NSUInteger)(useHp ? mb->qpGold * eb : 0) atIndex:12];
+    [enc setBytes:&useHp length:sizeof useHp atIndex:13];
+  }
   NSUInteger n = (NSUInteger)nsb * (1u << (2 * level)) * level_slots(fp, level);
   if (level == 3 && (fp->turbo & T_INTRA) && fp->fast && !fp->frame_is_intra && !getenv("MAV1_NOL3O")) {
     /* 8x8: one SIMD group per 16x16 node, 8 lanes per block */
@@ -245,7 +255,6 @@ static void mtl_motion_search(Backend *b, struct Mav1Encoder *e) {
     /* levels depend on their parents: one dispatch each */
     for (int level = one ? L : 0; level < (one ? L + 1 : 4); level++) enc_me(b, enc, e, level, 0, e->num_sbs, 0);
   });
-  if (e->qpc) qpc_drop((MetalBackend *)b, e);
 }
 
 static void mtl_analyze(Backend *b, struct Mav1Encoder *e) {
@@ -255,9 +264,10 @@ static void mtl_analyze(Backend *b, struct Mav1Encoder *e) {
   run(s, ^(id<MTLComputeCommandEncoder> enc) {
     /* levels are independent; they share the scratch buffer, so they run as
      * consecutive (serial) dispatches */
-    for (int level = one ? L : 0; level <= (one ? L : 3); level++) enc_ana(s, enc, e, level, 0, e->num_sbs);
+    for (int level = one ? L : 0; level <= (one ? L : 3); level++) enc_ana(b, s, enc, e, level, 0, e->num_sbs);
   });
   }
+  if (e->qpc) qpc_drop((MetalBackend *)b, e); /* the planes are read by the analysis too */
   /* pass 2 (partition decision on the table) on the CPU cores */
   const FrameParams *fp = ENC_PARAMS(e);
   if (getenv("MAV1_DBG")) {
@@ -321,7 +331,7 @@ static void mtl_frame_core(Backend *b, struct Mav1Encoder *e) {
       if (fp->turbo & T_ME_HPEL) { double t = prof_run(s, ^(id<MTLComputeCommandEncoder> enc) { enc_qpel(b, enc, e); }); kprof[r][0] += t; }
       for (int l = 0; l < 4; l++) {
         kprof[r][1 + 2 * l] += prof_run(s, ^(id<MTLComputeCommandEncoder> enc) { enc_me(b, enc, e, l, 0, e->num_sbs, pr0); });
-        kprof[r][2 + 2 * l] += prof_run(s, ^(id<MTLComputeCommandEncoder> enc) { enc_ana(s, enc, e, l, 0, e->num_sbs); });
+        kprof[r][2 + 2 * l] += prof_run(s, ^(id<MTLComputeCommandEncoder> enc) { enc_ana(b, s, enc, e, l, 0, e->num_sbs); });
       }
     }
     kprof_n[r]++;
@@ -356,13 +366,13 @@ static void mtl_frame_core(Backend *b, struct Mav1Encoder *e) {
         /* each level's analysis before the next level's search (depth pruning) */
         for (int l = 0; l < lw; l++) {
           if (inter) enc_me(b, enc, e, l, 0, e->num_sbs, pr);
-          enc_ana(s, enc, e, l, 0, e->num_sbs);
+          enc_ana(b, s, enc, e, l, 0, e->num_sbs);
         }
       } else {
         int sb0 = k * rowsPer * e->sb_cols, nsb = k_min(e->num_sbs - sb0, rowsPer * e->sb_cols);
         for (int l = lw; l < 4; l++) {
           if (inter) enc_me(b, enc, e, l, sb0, nsb, pr);
-          enc_ana(s, enc, e, l, sb0, nsb);
+          enc_ana(b, s, enc, e, l, sb0, nsb);
         }
       }
       [enc endEncoding];
