@@ -51,6 +51,21 @@ typedef struct {
   size_t size;
 } Buf;
 
+/* turbo engines: quarter-pel planes of the reference pictures shared by
+ * the engines (built once per picture by its first reader). Entry k holds
+ * generation gen[k]; state 0 free, 1 being built, 2 ready; readers: frames
+ * using it. Guarded by mu / cv (pthread). */
+#define QPC_N 8
+typedef struct {
+  void *mu, *cv;
+  Buf buf;
+  unsigned gen[QPC_N], use[QPC_N], clock;
+  int state[QPC_N], readers[QPC_N];
+} QpCache;
+int qpc_acquire(QpCache *c, unsigned gen, int avoid, int *build);
+void qpc_ready(QpCache *c, int k);
+void qpc_release(QpCache *c, int k);
+
 /* Writer context (turbo): the per-frame buffers the tile writer reads,
  * handed over from the frame core so that the entropy coding of a frame runs
  * on the writer queue while the next frame's core runs. */
@@ -126,6 +141,7 @@ struct Mav1Encoder {
    * once the next reference frame's GPU stages are done (gate_pending: the
    * gate of the last such frame, handed to the next reference frame) */
   void *gate_pending;
+  QpCache *qpc;                 /* turbo engines: shared plane cache (driver-owned) */
   void *gate_out;               /* engine: semaphore to signal when the GPU core is done */
 
   /* statistics of the last frame */

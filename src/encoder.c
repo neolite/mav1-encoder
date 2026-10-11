@@ -200,6 +200,20 @@ static Mav1Encoder *create_enc(const Mav1Config *cfg, int isEngine, char *err, s
       e->eng_busy[i] = (void *)dispatch_group_create();
     }
     e->inflight = (void *)dispatch_semaphore_create(6);
+    if (cfg->use_metal && !getenv("MAV1_NOQPC")) {
+      QpCache *c = calloc(1, sizeof *c);
+      c->mu = malloc(sizeof(pthread_mutex_t));
+      c->cv = malloc(sizeof(pthread_cond_t));
+      pthread_mutex_init((pthread_mutex_t *)c->mu, NULL);
+      pthread_cond_init((pthread_cond_t *)c->cv, NULL);
+      if (buf_alloc(&c->buf, (size_t)QPC_N * (16L * e->w * e->h + (long)((e->w + 3) >> 2) * ((e->h + 3) >> 2)) + 4096)) {
+        snprintf(err, errlen, "out of memory");
+        mav1_destroy(e);
+        return NULL;
+      }
+      e->qpc = c;
+      for (int i = 0; i < NUM_ENG; i++) e->eng[i]->qpc = c;
+    }
   }
   return e;
 }
@@ -212,6 +226,7 @@ void mav1_destroy(Mav1Encoder *e) {
   for (int i = 0; i < NUM_ENG; i++)
     if (e->eng[i]) {
       dispatch_group_wait((dispatch_group_t)e->eng_busy[i], DISPATCH_TIME_FOREVER);
+      e->eng[i]->qpc = NULL;
       mav1_destroy(e->eng[i]);
       dispatch_release((dispatch_queue_t)e->eng_q[i]);
       dispatch_release((dispatch_group_t)e->eng_busy[i]);
@@ -254,6 +269,14 @@ void mav1_destroy(Mav1Encoder *e) {
   buf_free(&e->dbk);
   buf_free(&e->lrout);
   buf_free(&e->lrunits);
+  if (e->qpc) {
+    buf_free(&e->qpc->buf);
+    pthread_mutex_destroy((pthread_mutex_t *)e->qpc->mu);
+    pthread_cond_destroy((pthread_cond_t *)e->qpc->cv);
+    free(e->qpc->mu);
+    free(e->qpc->cv);
+    free(e->qpc);
+  }
   free(e);
 }
 
@@ -313,6 +336,57 @@ void edge_types_rows(Mav1Encoder *e, uint8_t *ys, uint8_t *uvs, int row0, int ro
                 (availL && uvs[k_min(r + 1, rows - 1) * cols + c - 1]);
       b->interp_filter = (b->interp_filter & 15) | fy << 4 | fuv << 5;
     }
+}
+
+/* shared plane cache: the entry of generation gen (never `avoid`), claimed
+ * for building (*build) when no entry holds it; waits while it is being
+ * built or every entry is in use */
+int qpc_acquire(QpCache *c, unsigned gen, int avoid, int *build) {
+  pthread_mutex_t *mu = (pthread_mutex_t *)c->mu;
+  pthread_mutex_lock(mu);
+  for (;;) {
+    int k, best = -1;
+    for (k = 0; k < QPC_N; k++)
+      if (c->state[k] && c->gen[k] == gen && k != avoid) break;
+    if (k < QPC_N) {
+      if (c->state[k] == 1) {
+        pthread_cond_wait((pthread_cond_t *)c->cv, mu);
+        continue;
+      }
+      c->readers[k]++;
+      c->use[k] = ++c->clock;
+      *build = 0;
+      pthread_mutex_unlock(mu);
+      return k;
+    }
+    for (k = 0; k < QPC_N; k++)
+      if (k != avoid && c->readers[k] == 0 && c->state[k] != 1 && (best < 0 || c->use[k] < c->use[best])) best = k;
+    if (best < 0) {
+      pthread_cond_wait((pthread_cond_t *)c->cv, mu);
+      continue;
+    }
+    c->gen[best] = gen;
+    c->state[best] = 1;
+    c->readers[best] = 1;
+    c->use[best] = ++c->clock;
+    *build = 1;
+    pthread_mutex_unlock(mu);
+    return best;
+  }
+}
+
+void qpc_ready(QpCache *c, int k) {
+  pthread_mutex_lock((pthread_mutex_t *)c->mu);
+  c->state[k] = 2;
+  pthread_cond_broadcast((pthread_cond_t *)c->cv);
+  pthread_mutex_unlock((pthread_mutex_t *)c->mu);
+}
+
+void qpc_release(QpCache *c, int k) {
+  pthread_mutex_lock((pthread_mutex_t *)c->mu);
+  c->readers[k]--;
+  pthread_cond_broadcast((pthread_cond_t *)c->cv);
+  pthread_mutex_unlock((pthread_mutex_t *)c->mu);
 }
 
 static void edge_filter_types(Mav1Encoder *e) {
@@ -884,9 +958,10 @@ static uint8_t *alt_code(Mav1Encoder *e, uint8_t **framep, int disp, int isKey, 
   if (tl) fprintf(stderr, "%7.1f drv  d%d k%d\n", (now() - tl0) * 1e3, disp, kind);
   /* reference frames on engine 0 (they form a chain), the others
    * alternately on engines 1 and 2 */
-  int ei = h->refresh_frame_flags ? 0 : e->eng_next;
+  int chain = h->refresh_frame_flags && !(kind == 3 && !getenv("MAV1_MIDCHAIN")); /* the ARF chain (pyramid middle frames off it) */
+  int ei = chain ? 0 : e->eng_next;
   Mav1Encoder *E = e->eng[0] ? e->eng[ei] : e;
-  if (e->eng[0] && ei) e->eng_next = 3 - ei;
+  if (e->eng[0] && ei) e->eng_next = ei % (NUM_ENG - 1) + 1;
   int rf = h->refresh_frame_flags;
   FrameHdr hdr = *h;
   struct { int v[8]; } sb;
@@ -904,7 +979,7 @@ static uint8_t *alt_code(Mav1Encoder *e, uint8_t **framep, int disp, int isKey, 
   *framep = NULL;
   int cw = (e->w + 1) >> 1, ch = (e->h + 1) >> 1;
   uint8_t *recon = malloc(packed_size(e));
-  typedef struct { Mav1Encoder *s; WCtx *c; Mav1FrameStats st; } Job;
+  typedef struct { Mav1Encoder *s; WCtx *c; Mav1FrameStats st; uint8_t *tile; size_t tileSize; } Job;
   Job *job = calloc(1, sizeof *job);
   /* slot dependencies (engines): the versions read and their reader
    * groups; for each refreshed slot the previous version, its readers and
@@ -1022,15 +1097,34 @@ static uint8_t *alt_code(Mav1Encoder *e, uint8_t **framep, int disp, int isKey, 
     setup();
     core();
   }
-  q_run(e, ^{
-    if (coreDone) {
+  /* the entropy coding of frames is independent (default CDFs, no
+   * temporal MVs): it runs concurrently once the core is done; the
+   * writer queue appends the OBUs in coding order */
+  dispatch_semaphore_t tailDone = NULL;
+  if (coreDone && e->wq && !getenv("MAV1_SERIALENT")) {
+    tailDone = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
       dispatch_semaphore_wait(coreDone, DISPATCH_TIME_FOREVER);
       dispatch_release(coreDone);
+      job->tileSize = frame_tail(job->s, &job->tile, &job->st);
+      dispatch_semaphore_signal(tailDone);
+    });
+  }
+  q_run(e, ^{
+    if (tailDone) {
+      dispatch_semaphore_wait(tailDone, DISPATCH_TIME_FOREVER);
+      dispatch_release(tailDone);
+    } else {
+      if (coreDone) {
+        dispatch_semaphore_wait(coreDone, DISPATCH_TIME_FOREVER);
+        dispatch_release(coreDone);
+      }
+      job->tileSize = frame_tail(job->s, &job->tile, &job->st);
     }
     Mav1Encoder *s = job->s;
     Mav1FrameStats st2 = job->st;
-    uint8_t *tile = NULL;
-    size_t tileSize = frame_tail(s, &tile, &st2);
+    uint8_t *tile = job->tile;
+    size_t tileSize = job->tileSize;
     double t3 = now();
     tu_reserve(t, tileSize + 1024);
     if (isKey) {

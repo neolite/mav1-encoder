@@ -29,7 +29,19 @@ typedef struct {
   /* plane buffer entries: reference generation held (0: none), last use */
   unsigned qpGen[ME_QP_ENTRIES], qpUse[ME_QP_ENTRIES], qpClock;
   int qpLast, qpGold; /* entries of the current frame's references */
+  int qpcHeld[2];     /* shared cache entries held by the frame (-1: none) */
 } MetalBackend;
+
+/* the plane buffer holding the current references' entries */
+static const Buf *qp_buf(struct Mav1Encoder *e) { return e->qpc ? &e->qpc->buf : &e->hpel; }
+
+static void qpc_drop(MetalBackend *m, struct Mav1Encoder *e) {
+  for (int i = 0; i < 2; i++)
+    if (m->qpcHeld[i] >= 0) {
+      qpc_release(e->qpc, m->qpcHeld[i]);
+      m->qpcHeld[i] = -1;
+    }
+}
 
 static Mav1MetalState *ST(Backend *b) { return (__bridge Mav1MetalState *)((MetalBackend *)b)->state; }
 
@@ -91,9 +103,50 @@ static void enc_qpel(Backend *b, id<MTLComputeCommandEncoder> enc, struct Mav1En
   const FrameParams *fp = ENC_PARAMS(e);
   long eb = qp_entry_bytes(fp);
   int buildLast, buildGold = 0;
+  NSUInteger n = (NSUInteger)fp->frame_w * fp->frame_h;
+  if (e->qpc) {
+    /* shared entries: missing ones built by this frame (its own command
+     * buffer, done before any other reader proceeds); then the decimated
+     * source of this frame */
+    m->qpcHeld[0] = m->qpLast = qpc_acquire(e->qpc, e->ref_gen, -1, &buildLast);
+    m->qpcHeld[1] = -1;
+    if (fp->golden) m->qpcHeld[1] = m->qpGold = qpc_acquire(e->qpc, e->gold_gen, m->qpLast, &buildGold);
+    else m->qpGold = m->qpLast;
+    if (buildLast || buildGold) {
+      id<MTLCommandBuffer> cb = [s.queue commandBuffer];
+      id<MTLComputeCommandEncoder> be = [cb computeCommandEncoder];
+      [be setComputePipelineState:s.hpel];
+      [be setBuffer:wrap(s, &e->params) offset:0 atIndex:0];
+      [be setBuffer:wrap(s, &e->src) offset:0 atIndex:4];
+      [be setBuffer:wrap(s, &e->hpel) offset:(NSUInteger)(ME_QP_ENTRIES * eb) atIndex:5];
+      for (int r = 0; r < 2; r++) {
+        if (!(r ? buildGold : buildLast)) continue;
+        int mode[2] = {1, 0};
+        [be setBuffer:wrap(s, r ? gold_buf(e) : &e->ref) offset:0 atIndex:1];
+        [be setBuffer:wrap(s, &e->qpc->buf) offset:(NSUInteger)((r ? m->qpGold : m->qpLast) * eb) atIndex:3];
+        [be setBytes:mode length:sizeof mode atIndex:6];
+        [be dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+      }
+      [be endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (buildLast) qpc_ready(e->qpc, m->qpLast);
+      if (buildGold) qpc_ready(e->qpc, m->qpGold);
+    }
+    int mode[2] = {0, 1};
+    [enc setComputePipelineState:s.hpel];
+    [enc setBuffer:wrap(s, &e->params) offset:0 atIndex:0];
+    [enc setBuffer:wrap(s, &e->src) offset:0 atIndex:4];
+    [enc setBuffer:wrap(s, &e->hpel) offset:(NSUInteger)(ME_QP_ENTRIES * eb) atIndex:5];
+    [enc setBuffer:wrap(s, &e->ref) offset:0 atIndex:1];
+    [enc setBuffer:wrap(s, &e->hpel) offset:0 atIndex:3];
+    [enc setBytes:mode length:sizeof mode atIndex:6];
+    [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    return;
+  }
   m->qpLast = qp_pick(m, e->ref_gen, -1, &buildLast);
   m->qpGold = fp->golden ? qp_pick(m, e->gold_gen, m->qpLast, &buildGold) : m->qpLast;
-  NSUInteger n = (NSUInteger)fp->frame_w * fp->frame_h;
   [enc setComputePipelineState:s.hpel];
   [enc setBuffer:wrap(s, &e->params) offset:0 atIndex:0];
   [enc setBuffer:wrap(s, &e->src) offset:0 atIndex:4];
@@ -125,8 +178,8 @@ static void enc_me(Backend *b, id<MTLComputeCommandEncoder> enc, struct Mav1Enco
   [enc setBuffer:wrap(s, &e->mescratch) offset:0 atIndex:4];
   [enc setBuffer:wrap(s, gold_buf(e)) offset:0 atIndex:6];
   [enc setBuffer:wrap(s, &e->mvgold) offset:0 atIndex:7];
-  [enc setBuffer:wrap(s, &e->hpel) offset:(NSUInteger)(mb->qpLast * eb) atIndex:8];
-  [enc setBuffer:wrap(s, &e->hpel) offset:(NSUInteger)(mb->qpGold * eb) atIndex:10];
+  [enc setBuffer:wrap(s, qp_buf(e)) offset:(NSUInteger)(mb->qpLast * eb) atIndex:8];
+  [enc setBuffer:wrap(s, qp_buf(e)) offset:(NSUInteger)(mb->qpGold * eb) atIndex:10];
   [enc setBuffer:wrap(s, &e->hpel) offset:(NSUInteger)(ME_QP_ENTRIES * eb) atIndex:11];
   int band[2] = {sb0, nsb};
   [enc setBytes:band length:sizeof band atIndex:9];
@@ -192,6 +245,7 @@ static void mtl_motion_search(Backend *b, struct Mav1Encoder *e) {
     /* levels depend on their parents: one dispatch each */
     for (int level = one ? L : 0; level < (one ? L + 1 : 4); level++) enc_me(b, enc, e, level, 0, e->num_sbs, 0);
   });
+  if (e->qpc) qpc_drop((MetalBackend *)b, e);
 }
 
 static void mtl_analyze(Backend *b, struct Mav1Encoder *e) {
@@ -228,10 +282,63 @@ static void mtl_analyze(Backend *b, struct Mav1Encoder *e) {
  * makes its partition decisions and edge types and releases its
  * superblocks to the dependency-driven reconstruction, while the GPU works
  * on the next band. The results are those of the sequential stages. */
+/* profiling (MAV1_KPROF): GPU ms per stage, reference / leaf frames */
+static double kprof[2][12];
+static int kprof_n[2];
+static void kprof_dump(void) {
+  static const char *nm[12] = {"qpel", "me0", "ana0", "me1", "ana1", "me2", "ana2", "me3", "ana3", "filter", "", ""};
+  for (int r = 0; r < 2; r++) {
+    fprintf(stderr, "%s frames %d:", r ? "leaf" : "ref", kprof_n[r]);
+    for (int i = 0; i < 10; i++) fprintf(stderr, " %s %.2f", nm[i], kprof[r][i] / (kprof_n[r] ? kprof_n[r] : 1));
+    fprintf(stderr, "\n");
+  }
+}
+static double prof_run(Mav1MetalState *s, void (^encode)(id<MTLComputeCommandEncoder>)) {
+  id<MTLCommandBuffer> cb = [s.queue commandBuffer];
+  id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+  encode(enc);
+  [enc endEncoding];
+  [cb commit];
+  [cb waitUntilCompleted];
+  return (cb.GPUEndTime - cb.GPUStartTime) * 1e3;
+}
+static int kprof_on(void) {
+  static int on = -1;
+  if (on < 0) {
+    on = getenv("MAV1_KPROF") != NULL;
+    if (on) atexit(kprof_dump);
+  }
+  return on;
+}
+
 static void mtl_frame_core(Backend *b, struct Mav1Encoder *e) {
   Mav1MetalState *s = ST(b);
   const FrameParams *fp = ENC_PARAMS(e);
   int inter = !fp->frame_is_intra;
+  if (kprof_on() && inter) {
+    int pr0 = fp->fast && fp->depth_thr > 0, r = e->nonref != 0;
+    @autoreleasepool {
+      if (fp->turbo & T_ME_HPEL) { double t = prof_run(s, ^(id<MTLComputeCommandEncoder> enc) { enc_qpel(b, enc, e); }); kprof[r][0] += t; }
+      for (int l = 0; l < 4; l++) {
+        kprof[r][1 + 2 * l] += prof_run(s, ^(id<MTLComputeCommandEncoder> enc) { enc_me(b, enc, e, l, 0, e->num_sbs, pr0); });
+        kprof[r][2 + 2 * l] += prof_run(s, ^(id<MTLComputeCommandEncoder> enc) { enc_ana(s, enc, e, l, 0, e->num_sbs); });
+      }
+    }
+    kprof_n[r]++;
+    if (e->qpc) qpc_drop((MetalBackend *)b, e);
+    dispatch_apply((size_t)e->num_sbs, DISPATCH_APPLY_AUTO, ^(size_t i) {
+      analyze_sb_table(fp, (int)i, (const long *)e->acosts.base, (const BlockInfo *)e->ainfos.base, ENC_BLOCKS(e), ENC_SBS(e));
+    });
+    if (e->cfg.intra_edge_filter) {
+      uint8_t *ys = calloc((size_t)e->mi_rows * e->mi_cols, 1), *uvs = calloc((size_t)e->mi_rows * e->mi_cols, 1);
+      edge_types_rows(e, ys, uvs, 0, e->sb_rows);
+      free(ys);
+      free(uvs);
+    }
+    e->be->recon(e->be, e);
+    if (e->gate_out) { dispatch_semaphore_signal((__bridge dispatch_semaphore_t)e->gate_out); e->gate_out = NULL; }
+    return;
+  }
   int rowsPer = getenv("MAV1_BAND") ? atoi(getenv("MAV1_BAND")) : e->sb_rows >= 16 ? 4 : 2; /* bigger bands from 1080p on */
   if (rowsPer < 1) rowsPer = 1;
   int nb = (e->sb_rows + rowsPer - 1) / rowsPer;
@@ -289,6 +396,7 @@ static void mtl_frame_core(Backend *b, struct Mav1Encoder *e) {
     if (ys) edge_types_rows(e, ys, uvs, k * rowsPer, k_min(e->sb_rows, (k + 1) * rowsPer));
     recon_sched_release(rs, sb0, nsb);
   }
+  if (e->qpc) qpc_drop((MetalBackend *)b, e); /* the motion search is done */
   if (e->gate_out) { /* GPU stages done: a waiting non-reference frame may start */
     dispatch_semaphore_signal((__bridge dispatch_semaphore_t)e->gate_out);
     e->gate_out = NULL;
@@ -452,6 +560,7 @@ Backend *backend_metal_create(struct Mav1Encoder *e, char *err, size_t errlen) {
     s.buffers = [NSMutableDictionary new];
     MetalBackend *m = calloc(1, sizeof(*m));
     m->base.name = "metal";
+    m->qpcHeld[0] = m->qpcHeld[1] = -1;
     m->base.motion_search = mtl_motion_search;
     m->base.analyze = getenv("MAV1_CPU_ANALYZE") ? cpu_backend_analyze : mtl_analyze;
     /* Hybrid: GPU for the massively parallel stages (motion search,
