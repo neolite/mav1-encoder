@@ -112,6 +112,7 @@ struct Mav1Encoder {
   int frame_kind;       /* 0 regular, 1 hidden ALTREF, 2 frame inside the mini-GOP */
   Buf slot[8];          /* reference slots (0, 2 and 3 are used) */
   int slot_hint[8];     /* OrderHint of each slot */
+  int dump_last_hint, dump_arf_hint; /* MAV1_DUMP_DEC: OrderHint of LAST / ALTREF, -1 if none */
   int anchor_slot;      /* slot of the last shown reference frame */
   uint8_t **inq;        /* queued input frames (packed I420), display order */
   int inq_n, in_disp, key_disp;

@@ -655,11 +655,59 @@ static void run_frame_core(Mav1Encoder *e, int isKey) {
             (tf2 - tf1) * 1e3, (tf3 - tf2) * 1e3);
 }
 
+/* MAV1_DUMP_DEC=path: appends one record per coded frame with the final
+ * per-8x8 decisions (debug/analysis aid; no decision is changed and the
+ * IVF output is byte-identical with or without it). Record: 11 x int32
+ * header (magic 'MDEC', order_hint, last_hint, arf_hint, frame_type,
+ * frame_kind, nonref, base_q_idx, rows8, cols8, tile_bytes), then
+ * rows8*cols8 cells of 8 bytes: bsize, mode (0 intra, 1 single ref,
+ * 2 compound), ref_frame, pad, int16 mv_row, int16 mv_col (Mv[0], 1/8 pel). */
+static void dump_decisions(Mav1Encoder *s, size_t tileSize) {
+  static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+  static FILE *f;
+  const char *path = getenv("MAV1_DUMP_DEC");
+  if (!path) return;
+  int rows8 = (s->mi_rows + 1) >> 1, cols8 = (s->mi_cols + 1) >> 1;
+  size_t cells = (size_t)rows8 * cols8;
+  uint8_t *grid = calloc(cells, 8);
+  const SbInfo *sbs = ENC_SBS(s);
+  const BlockInfo *blocks = ENC_BLOCKS(s);
+  for (int i = 0; i < s->num_sbs; i++)
+    for (int k = 0; k < sbs[i].num_blocks; k++) {
+      const BlockInfo *b = &blocks[sbs[i].first_block + k];
+      int w8 = (Num_4x4_Blocks_Wide[b->bsize] + 1) >> 1, h8 = (Num_4x4_Blocks_High[b->bsize] + 1) >> 1;
+      int r0 = b->mi_row >> 1, c0 = b->mi_col >> 1;
+      for (int r = r0; r < r0 + h8 && r < rows8; r++)
+        for (int c = c0; c < c0 + w8 && c < cols8; c++) {
+          uint8_t *cell = grid + ((size_t)r * cols8 + c) * 8;
+          cell[0] = (uint8_t)b->bsize;
+          cell[1] = !b->is_inter ? 0 : b->ref_frame1 ? 2 : 1;
+          cell[2] = (uint8_t)b->ref_frame;
+          cell[3] = 0;
+          int16_t mr = (int16_t)b->mv_row, mc = (int16_t)b->mv_col;
+          memcpy(cell + 4, &mr, 2);
+          memcpy(cell + 6, &mc, 2);
+        }
+    }
+  int32_t hdr[11] = {0x4345444D, s->order_hint, s->dump_last_hint, s->dump_arf_hint, s->hdr.frame_type == KEY_FRAME ? 0 : 1,
+                     s->frame_kind, s->nonref, s->hdr.base_q_idx, rows8, cols8, (int32_t)tileSize};
+  pthread_mutex_lock(&mu);
+  if (!f) f = fopen(path, "wb");
+  if (f) {
+    fwrite(hdr, sizeof hdr, 1, f);
+    fwrite(grid, 8, cells, f);
+    fflush(f);
+  }
+  pthread_mutex_unlock(&mu);
+  free(grid);
+}
+
 /* Entropy codes the frame described by s (the encoder or a writer
  * snapshot) and adds its block statistics to *st. */
 static size_t frame_tail(Mav1Encoder *s, uint8_t **tile, Mav1FrameStats *st) {
   double t3 = now();
   size_t tileSize = write_tile(s, tile);
+  dump_decisions(s, tileSize);
   const SbInfo *sbs = ENC_SBS(s);
   const BlockInfo *blocks = ENC_BLOCKS(s);
   for (int i = 0; i < s->num_sbs; i++) {
@@ -780,6 +828,9 @@ int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int stride
   if (isKey) e->order_hint = 0;
   h->order_hint = e->order_hint;
   h->show_frame = 1;
+  /* MAV1_DUMP_DEC: on this path LAST is the previous frame (nonref_odd off) */
+  e->dump_last_hint = isKey ? -1 : e->order_hint - 1 - (e->cfg.nonref_odd && (e->order_hint & 1) == 0 ? 1 : 0);
+  e->dump_arf_hint = -1;
   /* ref_frame_idx: LAST -> slot 0, GOLDEN -> slot 1 (multi_ref), others slot 0 */
   if (e->cfg.multi_ref) h->ref_idx[GOLDEN_FRAME - LAST_FRAME] = 1;
   /* GOLDEN (slot 1): key frames and every 4th frame (the finer-q ones) */
@@ -987,6 +1038,7 @@ static uint8_t *alt_code(Mav1Encoder *e, uint8_t **framep, int disp, int isKey, 
   memcpy(sb.v, e->sign_bias, sizeof sb.v);
   int keyDisp = e->key_disp, nonref = e->nonref, leafopt = e->leafopt, frameKind = e->frame_kind,
       orderHint = e->order_hint;
+  int lastHint = isKey ? -1 : e->slot_hint[lastSlot], arfHint = !isKey && arfSlot >= 0 ? e->slot_hint[arfSlot] : -1;
   unsigned refGen = isKey ? 0 : e->slot_gen[lastSlot], goldGen = !isKey && arfSlot >= 0 ? e->slot_gen[arfSlot] : 0;
   if (rf) e->gen++;
   for (int k = 0; k < 8; k++)
@@ -1039,6 +1091,8 @@ static uint8_t *alt_code(Mav1Encoder *e, uint8_t **framep, int disp, int isKey, 
     E->leafopt = leafopt;
     E->frame_kind = frameKind;
     E->order_hint = orderHint;
+    E->dump_last_hint = lastHint;
+    E->dump_arf_hint = arfHint;
     const uint8_t *pl[3] = {frame, frame + (size_t)e->w * e->h, frame + (size_t)e->w * e->h + (size_t)cw * ch};
     int st[3] = {e->w, cw, cw};
     load_source(E, pl, st);
