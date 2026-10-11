@@ -10,6 +10,9 @@
 
 
 #ifndef __METAL_VERSION__
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 /* CPU fast path of both predictors (unscaled references: the filter phases
  * are constant over the block). Same arithmetic as the spec loops: rows
  * that only meet zero vertical taps are skipped, interior rows read
@@ -31,10 +34,35 @@ static inline void inter_fast(const uint8_t *ref, int refStride, int lastX, int 
     const uint8_t *row = ref + Clip3(0, lastY, y0 + r) * refStride;
     int32_t *t = tmp + r * w;
     if (!px) {
-      for (int c = 0; c < w; c++) t[c] = (int32_t)(interior ? row[x0 + 3 + c] : row[clipX[c + 3]]) << 4;
+      int c = 0;
+#if defined(__aarch64__)
+      if (interior)
+        for (; c + 8 <= w; c += 8) {
+          uint16x8_t u = vshll_n_u8(vld1_u8(row + x0 + 3 + c), 4);
+          vst1q_s32(t + c, vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(u))));
+          vst1q_s32(t + c + 4, vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(u))));
+        }
+#endif
+      for (; c < w; c++) t[c] = (int32_t)(interior ? row[x0 + 3 + c] : row[clipX[c + 3]]) << 4;
     } else if (interior) {
       const uint8_t *q = row + x0;
-      for (int c = 0; c < w; c++) {
+      int c = 0;
+#if defined(__aarch64__)
+      /* eight taps of eight outputs; each tap's window is one u8x8 load */
+      for (; c + 8 <= w; c += 8) {
+        int32x4_t alo = vdupq_n_s32(0), ahi = alo;
+        for (int k = 0; k < 8; k++) {
+          int16x8_t win = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(q + c + k)));
+          int16x4_t fk = vdup_n_s16(fH[k]);
+          alo = vmlal_s16(alo, vget_low_s16(win), fk);
+          ahi = vmlal_s16(ahi, vget_high_s16(win), fk);
+        }
+        int32x4_t four = vdupq_n_s32(4);
+        vst1q_s32(t + c, vshrq_n_s32(vaddq_s32(alo, four), 3));
+        vst1q_s32(t + c + 4, vshrq_n_s32(vaddq_s32(ahi, four), 3));
+      }
+#endif
+      for (; c < w; c++) {
         int a = 0;
         for (int k = 0; k < 8; k++) a += fH[k] * q[c + k];
         t[c] = (a + 4) >> 3;
@@ -50,14 +78,44 @@ static inline void inter_fast(const uint8_t *ref, int refStride, int lastX, int 
   int rr = 1 << (round1 - 1);
   for (int r = 0; r < h; r++) {
     const int32_t *t = tmp + r * w;
+    int c = 0;
+#if defined(__aarch64__)
+    for (; c + 4 <= w; c += 4) {
+      int64x2_t lo, hi;
+      if (!py) {
+        int32x4_t tv = vld1q_s32(t + 3 * w + c);
+        lo = vmull_s32(vget_low_s32(tv), vdup_n_s32(128));
+        hi = vmull_s32(vget_high_s32(tv), vdup_n_s32(128));
+      } else {
+        lo = hi = vdupq_n_s64(0);
+        for (int k = 0; k < 8; k++) {
+          int32x4_t tv = vld1q_s32(t + k * w + c);
+          int32x2_t fk = vdup_n_s32(fV[k]);
+          lo = vmlal_s32(lo, vget_low_s32(tv), fk);
+          hi = vmlal_s32(hi, vget_high_s32(tv), fk);
+        }
+      }
+      int64x2_t rrv = vdupq_n_s64(rr), sh = vdupq_n_s64(-round1);
+      lo = vshlq_s64(vaddq_s64(lo, rrv), sh);
+      hi = vshlq_s64(vaddq_s64(hi, rrv), sh);
+      int32x4_t v = vuzp1q_s32(vreinterpretq_s32_s64(lo), vreinterpretq_s32_s64(hi));
+      if (dst8) {
+        /* Clip1: saturate s32 -> s16 -> u8 */
+        uint8x8_t b = vqmovun_s16(vcombine_s16(vqmovn_s32(v), vdup_n_s16(0)));
+        vst1_lane_u32((uint32_t *)(dst8 + r * dstStride + c), vreinterpret_u32_u8(b), 0);
+      } else {
+        vst1q_s32(dst32 + r * dstStride + c, v);
+      }
+    }
+#endif
     if (!py) {
-      for (int c = 0; c < w; c++) {
+      for (; c < w; c++) {
         int v = (t[3 * w + c] * 128 + rr) >> round1;
         if (dst8) dst8[r * dstStride + c] = (uint8_t)Clip1(v);
         else dst32[r * dstStride + c] = v;
       }
     } else {
-      for (int c = 0; c < w; c++) {
+      for (; c < w; c++) {
         int a = 0;
         for (int k = 0; k < 8; k++) a += fV[k] * t[k * w + c];
         int v = (a + rr) >> round1;

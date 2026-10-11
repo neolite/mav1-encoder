@@ -13,7 +13,7 @@ HDRS := $(wildcard src/*.h) $(KERNELS)
 CORE_OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(CORE))
 METAL_OBJ := $(BUILD)/backend_metal.o
 
-all: $(BUILD)/libmav1.a $(BUILD)/mav1enc $(BUILD)/test_entropy $(BUILD)/test_txfm
+all: $(BUILD)/libmav1.a $(BUILD)/mav1enc $(BUILD)/test_entropy $(BUILD)/test_txfm $(BUILD)/test_neon
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -41,6 +41,10 @@ $(BUILD)/test_entropy: tests/test_entropy.c src/entenc.c
 
 $(BUILD)/test_txfm: tests/test_txfm.c src/fwd_matrices.c $(HDRS)
 	$(CC) $(CFLAGS) tests/test_txfm.c src/fwd_matrices.c -o $@
+
+# NEON kernels vs the scalar reference implementations (aarch64 only).
+$(BUILD)/test_neon: tests/test_neon.c src/fwd_matrices.c $(HDRS)
+	$(CC) $(CFLAGS) tests/test_neon.c src/fwd_matrices.c -o $@
 
 asan: $(BUILD)/mav1enc_asan
 $(BUILD)/mav1enc_asan: tools/mav1enc.c $(CORE) src/backend_metal_stub.c $(HDRS) | $(BUILD)

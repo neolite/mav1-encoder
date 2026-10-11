@@ -108,20 +108,22 @@ INLINE int code_tx_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV 
         resid[i * 64 + j] = (int)src[o] - (int)rec[o];
       }
     fwd_2d(resid, coef, txSz, t, mats, tmp);
-    quantize_block(coef, qtry, txSz, dcQ, acQ, 26, 22);
+    /* a single candidate quantises straight into the coefficient buffer */
+    DEV int32_t *qout = (numCands == 1 && !fp->tx_mode_select) ? coefOut : qtry;
+    quantize_block(coef, qout, txSz, dcQ, acQ, 26, 22);
     KCONST int32_t *scan = get_scan(txSz, t);
-    int eob = find_eob(qtry, scan, seg_eob(txSz));
+    int eob = find_eob(qout, scan, seg_eob(txSz));
     long sse = 0;
     if (numCands == 1 && !fp->tx_mode_select) {
       /* nothing to compare: no cost (the residual for the reconstruction) */
       if (eob > 0) {
-        dequant_block(qtry, dq, txSz, dcQ, acQ);
+        dequant_block(qout, dq, txSz, dcQ, acQ);
         itx_2d(dq, res, txSz, t, 0);
       }
       bestCost = 0;
       bestType = eob > 0 ? t : DCT_DCT;
       bestEob = eob;
-      for (int k = 0; k < tw * th; k++) qbest[k] = qtry[k];
+      qbest = qout;
       continue;
     }
     if (eob > 0) {
@@ -150,7 +152,8 @@ INLINE int code_tx_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV 
     }
   }
 
-  for (int k = 0; k < tw * th; k++) coefOut[k] = qbest[k];
+  if (qbest != coefOut)
+    for (int k = 0; k < tw * th; k++) coefOut[k] = qbest[k];
   if (bestEob > 0) {
     int fud = itx_flip_ud(bestType), flr = itx_flip_lr(bestType);
     if (numCands > 1) { /* a single candidate's residual is still in res */
