@@ -153,11 +153,19 @@ static void write_coeffs(Tile *t, int plane, int startX, int startY, int txSz, i
     /* Levels, from the last coefficient backwards. `lv` mirrors the
      * decoder's Quant[] (levels of already decoded positions) inside the
      * (at most 32 x 32) adjusted transform, with 4 zero columns and rows of
-     * padding so that the context neighbours need no bounds checks. */
+     * padding so that the context neighbours need no bounds checks. coded
+     * levels never exceed 3 + COEFF_BASE_RANGE = 15, so a byte suffices.
+     * Only rows a context can touch are cleared: sig/mag offsets look at
+     * most 4 rows past the last nonzero position's row. */
     int adj = Adjusted_Tx_Size[txSz];
     int bwl = Tx_Width_Log2[adj], aw = 1 << bwl, ah = Tx_Height[adj], S = aw + 4;
-    int32_t lv[36 * 36];
-    memset(lv, 0, sizeof(int32_t) * (size_t)S * (ah + 4));
+    uint8_t lv[36 * 36];
+    int maxRow = 0;
+    for (int c = 0; c < eob; c++) {
+      int r = scan[c] >> bwl;
+      if (r > maxRow) maxRow = r;
+    }
+    memset(lv, 0, (size_t)S * (size_t)k_min(ah + 4, maxRow + 5));
     int sig[SIG_REF_DIFF_OFFSET_NUM], mag3[3];
     for (int i = 0; i < SIG_REF_DIFF_OFFSET_NUM; i++)
       sig[i] = Sig_Ref_Diff_Offset[txClass][i][0] * S + Sig_Ref_Diff_Offset[txClass][i][1];
@@ -170,7 +178,7 @@ static void write_coeffs(Tile *t, int plane, int startX, int startY, int txSz, i
       int pos = scan[c];
       int level = abs(q[pos]);
       int row = pos >> bwl, col = pos & (aw - 1);
-      int32_t *l = lv + row * S + col;
+      uint8_t *l = lv + row * S + col;
       int coded = level < 3 ? level : 3;
       if (c == eob - 1) {
         ec_symbol(&t->ec, coded - 1, t->cdf.coeff_base_eob[txSzCtx][ptype][coeff_base_eob_ctx(txSz, c)], 3);
@@ -391,25 +399,32 @@ static void write_block(Tile *t, const BlockInfo *b) {
     }
   }
 
-  /* Update the mode-info grid (used by later context derivations). */
-  for (int y = 0; y < bh4 && r + y < e->mi_rows; y++)
-    for (int x = 0; x < bw4 && c + x < e->mi_cols; x++) {
-      MiInfo *m = mi_at(e, r + y, c + x);
-      m->bsize = (int8_t)bs;
-      m->is_inter = (int8_t)b->is_inter;
-      m->skip = (int8_t)skip;
-      m->y_mode = (int8_t)(b->is_inter ? interMode : b->y_mode);
-      m->written = 1;
-      m->interp[0] = (int8_t)(b->interp_filter & 3);
-      m->interp[1] = (int8_t)((b->interp_filter >> 2) & 3);
-      m->ref0 = (int8_t)(b->is_inter ? b->ref_frame : INTRA_FRAME);
-      m->tx_size = (int8_t)txSize; /* InterTxSizes */
-      m->mv_row = (int16_t)(b->is_inter ? b->mv_row : 0);
-      m->mv_col = (int16_t)(b->is_inter ? b->mv_col : 0);
-      m->ref1 = (int8_t)(b->is_inter ? b->ref_frame1 : 0);
-      m->mv1_row = (int16_t)(b->is_inter ? b->mv1_row : 0);
-      m->mv1_col = (int16_t)(b->is_inter ? b->mv1_col : 0);
+  /* Update the mode-info grid (used by later context derivations). Every
+   * mi of the block gets the same values: fill the first row and copy it. */
+  {
+    int wClip = e->mi_cols - c > bw4 ? bw4 : e->mi_cols - c;
+    int hClip = e->mi_rows - r > bh4 ? bh4 : e->mi_rows - r;
+    MiInfo v;
+    v.bsize = (int8_t)bs;
+    v.is_inter = (int8_t)b->is_inter;
+    v.skip = (int8_t)skip;
+    v.y_mode = (int8_t)(b->is_inter ? interMode : b->y_mode);
+    v.written = 1;
+    v.interp[0] = (int8_t)(b->interp_filter & 3);
+    v.interp[1] = (int8_t)((b->interp_filter >> 2) & 3);
+    v.ref0 = (int8_t)(b->is_inter ? b->ref_frame : INTRA_FRAME);
+    v.tx_size = (int8_t)txSize; /* InterTxSizes */
+    v.mv_row = (int16_t)(b->is_inter ? b->mv_row : 0);
+    v.mv_col = (int16_t)(b->is_inter ? b->mv_col : 0);
+    v.ref1 = (int8_t)(b->is_inter ? b->ref_frame1 : 0);
+    v.mv1_row = (int16_t)(b->is_inter ? b->mv1_row : 0);
+    v.mv1_col = (int16_t)(b->is_inter ? b->mv1_col : 0);
+    if (wClip > 0 && hClip > 0) {
+      MiInfo *row0 = mi_at(e, r, c);
+      for (int x = 0; x < wClip; x++) row0[x] = v;
+      for (int y = 1; y < hClip; y++) memcpy(mi_at(e, r + y, c), row0, (size_t)wClip * sizeof(MiInfo));
     }
+  }
 
   if (skip) {
     for (int plane = 0; plane < 3; plane++) {
