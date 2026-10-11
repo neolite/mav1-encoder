@@ -8,3 +8,6 @@ Hisense_WF5I8043BWF.usdz
 build.py
 compare.html
 .claude/
+ios/mav1cam/.DS_Store
+ios/mav1cam/mav1cam.xcodeproj/xcuserdata/
+ios/mav1cam/mav1cam.xcodeproj/project.xcworkspace/xcuserdata/
