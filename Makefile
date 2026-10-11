@@ -65,24 +65,23 @@ clean:
 
 .PHONY: all asan install clean
 
-# iOS static library (ios/mav1cam links build/ios/libmav1.a).
-IOSSDK  := $(shell xcrun -sdk iphoneos --show-sdk-path 2>/dev/null)
-IOSCC   := xcrun -sdk iphoneos clang
-IOSFLAGS := -O3 -target arm64-apple-ios17.0 -isysroot $(IOSSDK) -Isrc -std=gnu11 -w
-IOSB    := $(BUILD)/ios
-IOS_OBJS := $(patsubst src/%.c,$(IOSB)/%.o,$(CORE)) $(IOSB)/backend_metal.o
+# iOS static libraries: device (build/ios-iphoneos) + simulator
+# (build/ios-iphonesimulator); ios/mav1cam links via $(PLATFORM_NAME).
+define IOS_RULES
+IOSB_$1 := $(BUILD)/ios-$1
+IOS_OBJS_$1 := $$(patsubst src/%.c,$$(IOSB_$1)/%.o,$$(CORE)) $$(IOSB_$1)/backend_metal.o
+$$(IOSB_$1):
+	mkdir -p $$@
+$$(IOSB_$1)/%.o: src/%.c $$(HDRS) | $$(IOSB_$1)
+	xcrun -sdk $1 clang -O3 -target arm64-apple-ios17.0$2 -isysroot $$(shell xcrun -sdk $1 --show-sdk-path) -Isrc -std=gnu11 -w -c $$< -o $$@
+$$(IOSB_$1)/backend_metal.o: src/backend_metal.m $$(HDRS) $$(BUILD)/kernels_src.h | $$(IOSB_$1)
+	xcrun -sdk $1 clang -O3 -target arm64-apple-ios17.0$2 -isysroot $$(shell xcrun -sdk $1 --show-sdk-path) -Isrc -std=gnu11 -w -fobjc-arc -I$$(BUILD) -c $$< -o $$@
+$$(IOSB_$1)/libmav1.a: $$(IOS_OBJS_$1)
+	rm -f $$@ && xcrun -sdk $1 ar rcs $$@ $$^
+endef
+$(eval $(call IOS_RULES,iphoneos,))
+$(eval $(call IOS_RULES,iphonesimulator,-simulator))
 
-$(IOSB):
-	mkdir -p $(IOSB)
-
-$(IOSB)/%.o: src/%.c $(HDRS) | $(IOSB)
-	$(IOSCC) $(IOSFLAGS) -c $< -o $@
-
-$(IOSB)/backend_metal.o: src/backend_metal.m $(HDRS) $(BUILD)/kernels_src.h | $(IOSB)
-	$(IOSCC) $(IOSFLAGS) -fobjc-arc -I$(BUILD) -c $< -o $@
-
-ios: $(IOSB)/libmav1.a
-$(IOSB)/libmav1.a: $(IOS_OBJS)
-	rm -f $@ && xcrun -sdk iphoneos ar rcs $@ $^
+ios: $(BUILD)/ios-iphoneos/libmav1.a $(BUILD)/ios-iphonesimulator/libmav1.a
 
 .PHONY: ios

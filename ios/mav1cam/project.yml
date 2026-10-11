@@ -18,7 +18,7 @@ targets:
       INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace: YES
       SWIFT_OBJC_BRIDGING_HEADER: mav1cam/Bridging.h
       HEADER_SEARCH_PATHS: $(SRCROOT)/../../src
-      LIBRARY_SEARCH_PATHS: $(SRCROOT)/../../build/ios
+      LIBRARY_SEARCH_PATHS: $(SRCROOT)/../../build/ios-$(PLATFORM_NAME)
       OTHER_LDFLAGS: -lmav1
       TARGETED_DEVICE_FAMILY: 1
       IPHONEOS_DEPLOYMENT_TARGET: 17.0
