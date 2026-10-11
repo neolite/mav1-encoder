@@ -89,6 +89,15 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
     /// possibly low-res entry from dev.formats.
     private func tuneDevice(_ dev: AVCaptureDevice) {
         try? dev.lockForConfiguration()
+        // HDR: pick a 10-bit-capable HDR format so the output can deliver
+        // P010; SDR keeps whatever the session preset chose (don't pick the
+        // first format blindly — it may be a low-res entry)
+        if hdrRequested, let f = dev.formats.first(where: {
+            $0.isVideoHDRSupported
+                && $0.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 })
+        }) {
+            dev.activeFormat = f
+        }
         let t = CMTime(value: 1, timescale: 30)
         if dev.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 }) {
             dev.activeVideoMinFrameDuration = t
@@ -144,6 +153,7 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         let want10 = hdrRequested && videoOutput.availableVideoPixelFormatTypes.contains(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
         session.beginConfiguration()
         session.sessionPreset = preset
+        if let dev = camInput?.device { tuneDevice(dev) }
         // P010 keeps 10-bit pixels through the capture chain on devices that
         // support HDR capture; anything else falls back to 8-bit NV12.
         videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String:
@@ -152,12 +162,25 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
                      ? kCVPixelFormatType_420YpCbCr8Planar
                      : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange]
         session.commitConfiguration()
-        hdrActive = want10
 
-        let dim = preset == .hd4K3840x2160 ? (3840, 2160) : preset == .hd1920x1080 ? (1920, 1080) : (1280, 720)
+        sampleIdx = 0
+        framesSent = 0; packets = 0; bytesWritten = 0
+        startTime = CACurrentMediaTime()
+        DispatchQueue.main.async {
+            self.recording = true
+            self.status = "starting…"
+        }
+        startSession()
+    }
+
+    /// The encoder + output files are created on the FIRST captured frame so
+    /// the geometry always matches what the session actually delivers (HDR
+    /// formats / presets can produce different dimensions than asked).
+    private func lazyCreate(w: Int, h: Int, is10bit: Bool) -> Bool {
+        hdrActive = is10bit
 
         var cfg = Mav1Config()
-        mav1_default_config(&cfg, Int32(dim.0), Int32(dim.1))
+        mav1_default_config(&cfg, Int32(w), Int32(h))
         cfg.use_metal = 1
         cfg.turbo = 1
         cfg.qindex = 100
@@ -167,7 +190,7 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         cfg.rc = MAV1_RC_CQP
         // phone memory: 4 full engines ~1.4GB at 1080p; 2 fit comfortably
         cfg.threads = 2
-        if hdrActive {
+        if is10bit {
             cfg.bitdepth = 10
             // iPhone captures HDR in HLG (Dolby Vision is a mux-level side
             // channel; the raw frames are HLG-tagged BT.2020 10-bit)
@@ -185,8 +208,8 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         var errbuf = [CChar](repeating: 0, count: 256)
         enc = errbuf.withUnsafeMutableBufferPointer { mav1_create(&cfg, $0.baseAddress, $0.count) }
         guard enc != nil else {
-            DispatchQueue.main.async { self.status = "mav1_create failed: \(String(cString: errbuf))" }
-            return
+            DispatchQueue.main.async { self.recording = false; self.status = "mav1_create failed: \(String(cString: errbuf))" }
+            return false
         }
 
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -196,8 +219,8 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         FileManager.default.createFile(atPath: url.path, contents: nil)
         guard let fh = try? FileHandle(forWritingTo: url) else {
             mav1_destroy(enc); enc = nil
-            DispatchQueue.main.async { self.status = "file open failed" }
-            return
+            DispatchQueue.main.async { self.recording = false; self.status = "file open failed" }
+            return false
         }
         file = fh
         outURL = url
@@ -207,7 +230,7 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         hdr.append(contentsOf: [0x44, 0x4B, 0x49, 0x46]) // DKIF
         appendLE(&hdr, UInt16(0)); appendLE(&hdr, UInt16(32))
         hdr.append(contentsOf: [0x41, 0x56, 0x30, 0x31]) // AV01
-        appendLE(&hdr, UInt16(dim.0)); appendLE(&hdr, UInt16(dim.1))
+        appendLE(&hdr, UInt16(w)); appendLE(&hdr, UInt16(h))
         appendLE(&hdr, UInt32(30)); appendLE(&hdr, UInt32(1))
         appendLE(&hdr, UInt32(0)); appendLE(&hdr, UInt32(0))
         fh.write(hdr)
@@ -216,16 +239,12 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         // (the A17+ decoder plays them back in the gallery)
         movURL = url.deletingPathExtension().appendingPathExtension("mov")
         try? FileManager.default.removeItem(at: movURL!)
-        setupMovWriter(width: dim.0, height: dim.1, bitdepth: cfg.bitdepth, enc: enc!)
+        setupMovWriter(width: w, height: h, bitdepth: cfg.bitdepth, enc: enc!)
 
-        sampleIdx = 0
-        framesSent = 0; packets = 0; bytesWritten = 0
-        startTime = CACurrentMediaTime()
         DispatchQueue.main.async {
-            self.recording = true
-            self.status = "recording \(dim.0)x\(dim.1)\(self.hdrActive ? " HDR10" : "") turbo"
+            self.status = "recording \(w)x\(h)\(is10bit ? " HDR10" : "") turbo"
         }
-        startSession()
+        return true
     }
 
     func stop() {
@@ -276,13 +295,18 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
     // MARK: capture
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard recording, let enc, let file else { return }
+        guard recording else { return }
         guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         CVPixelBufferLockBaseAddress(pb, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
 
         let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
         let fmt = CVPixelBufferGetPixelFormatType(pb)
+
+        if enc == nil {
+            guard lazyCreate(w: w, h: h, is10bit: fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) else { return }
+        }
+        guard let enc, let file else { return }
 
         var pl: [UnsafePointer<UInt8>?]
         var st: [Int32]
@@ -478,7 +502,13 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         movInput = nil
         av1Desc = nil
         w?.finishWriting { [weak self] in
-            guard let self, let url, w?.status == .completed else { return }
+            guard let self, let url else { return }
+            guard w?.status == .completed else {
+                DispatchQueue.main.async {
+                    self.status = "mov failed: \(w?.error?.localizedDescription ?? "\(String(describing: w?.status))")"
+                }
+                return
+            }
             PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
                 guard status == .authorized || status == .limited else { return }
                 PHPhotoLibrary.shared().performChanges {

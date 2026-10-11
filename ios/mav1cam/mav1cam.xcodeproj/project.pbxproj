@@ -14,6 +14,7 @@
 
 /* Begin PBXFileReference section */
 		1B0E2C45A157D490C75CEC31 /* mav1cam.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = mav1cam.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		800F93750255B571854829C8 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		8B26EC5823D2915418DA434B /* Bridging.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = Bridging.h; sourceTree = "<group>"; };
 		B30C726E0DE1D1AF3C42D92D /* mav1camApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = mav1camApp.swift; sourceTree = "<group>"; };
 		BE7657F10BF8DEF0DB1BBEE1 /* CameraRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraRecorder.swift; sourceTree = "<group>"; };
@@ -35,6 +36,7 @@
 				8B26EC5823D2915418DA434B /* Bridging.h */,
 				BE7657F10BF8DEF0DB1BBEE1 /* CameraRecorder.swift */,
 				BF12959708FD3C7937D7DCD2 /* ContentView.swift */,
+				800F93750255B571854829C8 /* Info.plist */,
 				B30C726E0DE1D1AF3C42D92D /* mav1camApp.swift */,
 			);
 			path = mav1cam;
@@ -123,13 +125,7 @@
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = "$(SRCROOT)/../../src";
-				INFOPLIST_KEY_CFBundleDisplayName = mav1cam;
-				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
-				INFOPLIST_KEY_NSCameraUsageDescription = "Records video to encode it as AV1";
-				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Saves encoded AV1 videos to your library";
-				INFOPLIST_KEY_UIFileSharingEnabled = YES;
-				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
-				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_FILE = mav1cam/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -269,13 +265,7 @@
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = "$(SRCROOT)/../../src";
-				INFOPLIST_KEY_CFBundleDisplayName = mav1cam;
-				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
-				INFOPLIST_KEY_NSCameraUsageDescription = "Records video to encode it as AV1";
-				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Saves encoded AV1 videos to your library";
-				INFOPLIST_KEY_UIFileSharingEnabled = YES;
-				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
-				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_FILE = mav1cam/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
