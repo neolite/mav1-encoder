@@ -43,6 +43,7 @@ static void buf_free(Buf *b) {
 }
 
 static int wctx_init(Mav1Encoder *e);
+static int env_or(const char *n, int d);
 static Mav1Encoder *create_enc(const Mav1Config *cfg, int isEngine, char *err, size_t errlen);
 static void wctx_free(Mav1Encoder *e);
 
@@ -63,6 +64,7 @@ void mav1_default_config(Mav1Config *cfg, int width, int height) {
   cfg->me_range = 32;
 }
 
+static int env_or(const char *n, int d);
 static Mav1Encoder *create_enc(const Mav1Config *cfg, int isEngine, char *err, size_t errlen) {
   if (cfg->width < 16 || cfg->height < 16 || cfg->width > 65536 || cfg->height > 65536) {
     snprintf(err, errlen, "unsupported frame size %dx%d", cfg->width, cfg->height);
@@ -196,7 +198,11 @@ static Mav1Encoder *create_enc(const Mav1Config *cfg, int isEngine, char *err, s
         mav1_destroy(e);
         return NULL;
       }
-      e->eng_q[i] = (void *)dispatch_queue_create("mav1.engine", DISPATCH_QUEUE_SERIAL);
+      /* QoS: the reference-frame chain above the other engines (MAV1_QOS0 / MAV1_QOS1) */
+      static const dispatch_qos_class_t qos[5] = {QOS_CLASS_UNSPECIFIED, QOS_CLASS_UTILITY, QOS_CLASS_DEFAULT, QOS_CLASS_USER_INITIATED, QOS_CLASS_USER_INTERACTIVE};
+      int qi = i == 0 ? env_or("MAV1_QOS0", 4) : env_or("MAV1_QOS1", 0);
+      dispatch_queue_attr_t at = qi ? dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, qos[qi], 0) : DISPATCH_QUEUE_SERIAL;
+      e->eng_q[i] = (void *)dispatch_queue_create("mav1.engine", at);
       e->eng_busy[i] = (void *)dispatch_group_create();
     }
     e->inflight = (void *)dispatch_semaphore_create(6);
@@ -737,6 +743,11 @@ static void wctx_free(Mav1Encoder *e) {
   free(e->outmu);
 }
 
+static dispatch_qos_class_t qos_ent(void) {
+  static const dispatch_qos_class_t q[5] = {QOS_CLASS_USER_INITIATED, QOS_CLASS_UTILITY, QOS_CLASS_DEFAULT, QOS_CLASS_USER_INITIATED, QOS_CLASS_USER_INTERACTIVE};
+  return q[env_or("MAV1_QOSE", 1)];
+}
+
 /* Runs op on the writer queue (in order with the frames' entropy coding),
  * or inline. */
 static void q_run(Mav1Encoder *e, void (^op)(void)) {
@@ -1103,7 +1114,7 @@ static uint8_t *alt_code(Mav1Encoder *e, uint8_t **framep, int disp, int isKey, 
   dispatch_semaphore_t tailDone = NULL;
   if (coreDone && e->wq && !getenv("MAV1_SERIALENT")) {
     tailDone = dispatch_semaphore_create(0);
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    dispatch_async(dispatch_get_global_queue(qos_ent(), 0), ^{
       dispatch_semaphore_wait(coreDone, DISPATCH_TIME_FOREVER);
       dispatch_release(coreDone);
       job->tileSize = frame_tail(job->s, &job->tile, &job->st);

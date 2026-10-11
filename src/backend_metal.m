@@ -343,6 +343,8 @@ static void mtl_frame_core(Backend *b, struct Mav1Encoder *e) {
   if (rowsPer < 1) rowsPer = 1;
   int nb = (e->sb_rows + rowsPer - 1) / rowsPer;
   int pr = fp->fast && fp->depth_thr > 0;
+  /* levels below lw run on the whole frame before the bands */
+  int lw = getenv("MAV1_LW") ? atoi(getenv("MAV1_LW")) : 2;
   NSMutableArray<dispatch_semaphore_t> *done = [NSMutableArray arrayWithCapacity:(NSUInteger)nb + 1];
   for (int k = 0; k <= nb; k++) [done addObject:dispatch_semaphore_create(0)];
   @autoreleasepool {
@@ -352,13 +354,13 @@ static void mtl_frame_core(Backend *b, struct Mav1Encoder *e) {
       if (k < 0) {
         if (inter && (fp->turbo & T_ME_HPEL)) enc_qpel(b, enc, e);
         /* each level's analysis before the next level's search (depth pruning) */
-        for (int l = 0; l < 2; l++) {
+        for (int l = 0; l < lw; l++) {
           if (inter) enc_me(b, enc, e, l, 0, e->num_sbs, pr);
           enc_ana(s, enc, e, l, 0, e->num_sbs);
         }
       } else {
         int sb0 = k * rowsPer * e->sb_cols, nsb = k_min(e->num_sbs - sb0, rowsPer * e->sb_cols);
-        for (int l = 2; l < 4; l++) {
+        for (int l = lw; l < 4; l++) {
           if (inter) enc_me(b, enc, e, l, sb0, nsb, pr);
           enc_ana(s, enc, e, l, sb0, nsb);
         }
