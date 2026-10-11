@@ -223,7 +223,9 @@ static Mav1Encoder *create_enc(const Mav1Config *cfg, int isEngine, char *err, s
       }
       /* QoS: the reference-frame chain above the other engines (MAV1_QOS0 / MAV1_QOS1) */
       static const dispatch_qos_class_t qos[5] = {QOS_CLASS_UNSPECIFIED, QOS_CLASS_UTILITY, QOS_CLASS_DEFAULT, QOS_CLASS_USER_INITIATED, QOS_CLASS_USER_INTERACTIVE};
-      int qi = i == 0 ? env_or("MAV1_QOS0", 4) : env_or("MAV1_QOS1", 0);
+      /* worker engines default to USER_INITIATED: on iOS, UNSPECIFIED queues
+       * get scheduled onto efficiency cores which starves the pipeline */
+      int qi = i == 0 ? env_or("MAV1_QOS0", 4) : env_or("MAV1_QOS1", 3);
       dispatch_queue_attr_t at = qi ? dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, qos[qi], 0) : DISPATCH_QUEUE_SERIAL;
       e->eng_q[i] = (void *)dispatch_queue_create("mav1.engine", at);
       e->eng_busy[i] = (void *)dispatch_group_create();

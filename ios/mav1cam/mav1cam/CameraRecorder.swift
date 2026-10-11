@@ -194,6 +194,11 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         mav1_default_config(&cfg, Int32(w), Int32(h))
         cfg.use_metal = 1
         cfg.turbo = 1
+        // mirror mav1enc's fast path (restoration alone is ~2.8s/frame on-device)
+        cfg.restoration = 0
+        cfg.tx_search = 0
+        cfg.tx_depth = 0
+        cfg.switchable_interp = 0
         cfg.qindex = 100
         cfg.fps_num = 30
         cfg.fps_den = 1
@@ -427,7 +432,7 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         while mav1_receive_packet(enc, &out, &size) == 0 {
             writePacket(out, size: size)
         }
-        if framesSent % 15 == 0 {
+        if true {
             let el = CACurrentMediaTime() - startTime
             let inFps = Double(framesSent) / el
             let outFps = Double(packets) / el
