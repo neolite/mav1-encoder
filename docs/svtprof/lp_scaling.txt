@@ -1,0 +1,6 @@
+ 5.46 real 5.44 user 0.21 sys  [--lp 1]
+ 1.98 real 5.81 user 0.20 sys  [--lp 2]
+ 1.27 real 6.54 user 0.29 sys  [--lp 4]
+ 1.40 real 6.55 user 0.39 sys  [--lp 8]
+ 1.30 real 6.53 user 0.33 sys  [--lp 8 --pin 1]
+ 1.23 real 6.52 user 0.25 sys  []

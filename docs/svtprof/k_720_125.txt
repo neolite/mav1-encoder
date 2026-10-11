@@ -1,0 +1,124 @@
+kind 0 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 35.0 flt 4.5 ms (info 0.1 gpu 3.4 sel 1.0)
+  ent 8.6 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 14.6 flt 3.9 ms (info 0.1 gpu 3.3 sel 0.6)
+  ent 5.9 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 12.7 flt 3.9 ms (info 0.1 gpu 3.1 sel 0.7)
+  ent 6.0 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 24.7 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 3.3 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 20.6 flt 4.0 ms (info 0.1 gpu 3.3 sel 0.7)
+  ent 5.9 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 25.3 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 18.0 flt 4.5 ms (info 0.1 gpu 3.8 sel 0.7)
+  ent 4.1 ms
+  ent 6.2 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 17.6 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 5.4 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 17.8 flt 3.5 ms (info 0.1 gpu 2.8 sel 0.6)
+  ent 5.9 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 18.7 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 5.0 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 18.7 flt 5.3 ms (info 0.1 gpu 4.7 sel 0.6)
+  ent 6.1 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 15.6 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 6.2 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 16.3 flt 4.0 ms (info 0.1 gpu 3.3 sel 0.6)
+  ent 5.6 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 21.0 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 4.6 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 19.4 flt 5.3 ms (info 0.1 gpu 4.6 sel 0.6)
+  ent 6.6 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 15.4 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 6.1 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 16.5 flt 3.9 ms (info 0.1 gpu 3.2 sel 0.6)
+  ent 5.8 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 18.8 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 5.4 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 18.6 flt 5.7 ms (info 0.1 gpu 5.0 sel 0.6)
+  ent 7.9 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 15.6 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 5.9 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 17.1 flt 3.9 ms (info 0.1 gpu 3.2 sel 0.6)
+  ent 5.8 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 19.5 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 4.1 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 18.5 flt 5.7 ms (info 0.1 gpu 5.0 sel 0.6)
+  ent 7.9 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 15.5 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 5.5 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 15.2 flt 3.8 ms (info 0.1 gpu 3.1 sel 0.6)
+  ent 5.8 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 19.1 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 6.8 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 20.4 flt 5.7 ms (info 0.1 gpu 5.0 sel 0.6)
+  ent 6.1 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 17.6 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 5.9 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 19.3 flt 4.4 ms (info 0.1 gpu 3.7 sel 0.6)
+  ent 5.8 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 21.5 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 4.2 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 18.8 flt 5.6 ms (info 0.1 gpu 5.0 sel 0.6)
+  ent 5.9 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 18.3 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 4.6 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 15.1 flt 4.0 ms (info 0.1 gpu 3.3 sel 0.7)
+  ent 5.6 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 19.0 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 4.9 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 18.5 flt 5.6 ms (info 0.1 gpu 4.9 sel 0.6)
+  ent 6.0 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 15.8 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 3.3 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 18.3 flt 4.0 ms (info 0.1 gpu 3.3 sel 0.6)
+  ent 5.9 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 18.1 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 5.8 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 20.6 flt 5.5 ms (info 0.1 gpu 4.9 sel 0.6)
+  ent 5.7 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 16.3 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 6.4 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 16.8 flt 3.8 ms (info 0.1 gpu 3.1 sel 0.6)
+  ent 5.6 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 18.6 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 5.6 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 18.1 flt 5.7 ms (info 0.1 gpu 5.0 sel 0.6)
+  ent 6.0 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 17.0 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 6.0 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 16.2 flt 3.9 ms (info 0.1 gpu 3.1 sel 0.7)
+  ent 5.8 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 18.4 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 5.5 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 18.0 flt 5.6 ms (info 0.1 gpu 4.9 sel 0.6)
+  ent 8.4 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 14.7 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 4.7 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 15.8 flt 3.9 ms (info 0.1 gpu 3.3 sel 0.6)
+  ent 5.7 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 17.8 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 5.7 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 18.4 flt 5.9 ms (info 0.1 gpu 5.3 sel 0.6)
+  ent 6.0 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 15.8 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 8.0 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 17.6 flt 4.1 ms (info 0.1 gpu 3.4 sel 0.6)
+  ent 5.9 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 18.1 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 6.0 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 20.2 flt 5.6 ms (info 0.1 gpu 4.9 sel 0.6)
+  ent 6.9 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 15.3 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 5.4 ms
+kind 1 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 16.0 flt 3.5 ms (info 0.1 gpu 2.8 sel 0.6)
+  ent 5.9 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 18.7 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 4.6 ms
+kind 0 nonref 0: me 0.0 ana 0.0 edge 0.0 rec 17.9 flt 4.9 ms (info 0.1 gpu 4.2 sel 0.6)
+  ent 3.8 ms
+kind 2 nonref 1: me 0.0 ana 0.0 edge 0.0 rec 14.6 flt 0.0 ms (info 0.0 gpu 0.0 sel 0.0)
+  ent 3.1 ms
+metal: 60 frames, 3251072 bytes (21673.8 kbit/s @50/1 fps), PSNR Y 34.412 U 38.468 V 38.926, time/frame: analysis 0.00ms recon 18.12ms filter 2.40ms entropy 5.73ms
+tool usage (blocks): intra=48280 inter=296459 cfl=3530 angle_delta=0 tx_non_dct=0 skip=29378 rect_part=0 compound=68583 obmc=0 lr_wiener_units=0 lr_sgr_units=0 golden=0 altref=26041
+ref frames 30: qpel 0.27 me0 1.26 ana0 0.60 me1 0.47 ana1 0.43 me2 0.49 ana2 0.94 me3 0.78 ana3 0.56 filter 0.00
+leaf frames 29: qpel 0.09 me0 1.55 ana0 0.92 me1 0.68 ana1 0.37 me2 0.77 ana2 0.83 me3 1.35 ana3 0.64 filter 0.00

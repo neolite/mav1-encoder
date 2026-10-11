@@ -1,0 +1,9 @@
+stage	SVT720_cpu1	SVT1080_cpu1	mav1_720	mav1_1080
+ME/HME(+TF)	2.3	8.0(TF1.1)	GPU ~4 est	GPU ~8 (ref5.9/leaf10.5 KPROF)
+MD PD0+PD1 search	24.8	54.1	GPU ~3 est	GPU ~6 (ana0-3)
+final tx/quant/recon	~1(encdec_update)	1.5	CPU ~20 est	CPU 48
+entropy	4.0	7.7(q46 3.0)	CPU ~15 est	CPU 40
+deblock/CDEF/LR	2.3	6.2	GPU 1.6 + CPU cdef_sel	GPU 2.9 + CPU 2.2
+TPL	1.2	2.4	-	-
+PA/RC/other	1.1	0.5	CPU ~1	CPU ~1.5
+TOTAL	37 cpu-ms	80 cpu-ms	GPU 7.75 + CPU 37	GPU 15.0 + CPU 83
