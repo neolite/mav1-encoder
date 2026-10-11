@@ -502,31 +502,44 @@ static void mtl_destroy(Backend *b) {
   free(m);
 }
 
-Backend *backend_metal_create(struct Mav1Encoder *e, char *err, size_t errlen) {
-  (void)e;
-  @autoreleasepool {
-    /* the library and pipelines are built once per process; every backend
-     * (frame engine) has its own command queue and buffer wrappers */
-    static Mav1MetalState *proto;
-    static dispatch_once_t once;
-    static char perr[256];
-    dispatch_once(&once, ^{
-      Mav1MetalState *s = [Mav1MetalState new];
-      perr[0] = 0;
-      id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-      if (!dev) {
-        snprintf(perr, sizeof perr, "no Metal device");
-        return;
-      }
-      double t0i = CFAbsoluteTimeGetCurrent();
-      MTLCompileOptions *opt = [MTLCompileOptions new];
-      opt.mathMode = MTLMathModeSafe;
-      NSError *nerr = nil;
-      id<MTLLibrary> lib = [dev newLibraryWithSource:@(kMav1KernelSource) options:opt error:&nerr];
-      if (!lib) {
-        snprintf(perr, sizeof perr, "Metal kernel compilation failed: %s", nerr.localizedDescription.UTF8String);
-        return;
-      }
+/* FrameParams.turbo baked into the Metal source (MAV1_TURBO_MASK): the
+ * kernels see it as a compile-time constant, so flag-gated paths fold
+ * away. Must equal the fp->turbo assignment in encoder.c. */
+static int turbo_mask(const Mav1Encoder *e) {
+  return e->cfg.turbo ? (getenv("MAV1_TURBO") ? (int)strtol(getenv("MAV1_TURBO"), NULL, 0) : 0x47CBF1) : 0;
+}
+
+static Mav1MetalState *proto_for_mask(int mask, char *err, size_t errlen) {
+  /* the library and pipelines are built once per process per turbo mask;
+   * every backend (frame engine) has its own command queue and buffers */
+  static NSMutableDictionary *protos;
+  static dispatch_queue_t pq;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    protos = [NSMutableDictionary new];
+    pq = dispatch_queue_create("mav1.metalproto", NULL);
+  });
+  __block Mav1MetalState *proto;
+  __block NSString *perr;
+  dispatch_sync(pq, ^{
+    proto = protos[@(mask)];
+    if (proto) return;
+    Mav1MetalState *s = [Mav1MetalState new];
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    if (!dev) {
+      perr = @"no Metal device";
+      return;
+    }
+    double t0i = CFAbsoluteTimeGetCurrent();
+    MTLCompileOptions *opt = [MTLCompileOptions new];
+    opt.mathMode = MTLMathModeSafe;
+    NSError *nerr = nil;
+    NSString *src = [NSString stringWithFormat:@"#define MAV1_TURBO_MASK 0x%X\n%s", mask, kMav1KernelSource];
+    id<MTLLibrary> lib = [dev newLibraryWithSource:src options:opt error:&nerr];
+    if (!lib) {
+      perr = [@"Metal kernel compilation failed: " stringByAppendingString:nerr.localizedDescription];
+      return;
+    }
       if (getenv("MAV1_TL")) fprintf(stderr, "init: device+compile %.1f ms\n", (CFAbsoluteTimeGetCurrent() - t0i) * 1e3);
       s.device = dev;
       s.analyze = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_analyze"] error:&nerr];
@@ -540,9 +553,10 @@ Backend *backend_metal_create(struct Mav1Encoder *e, char *err, size_t errlen) {
       s.cdef = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_cdef"] error:&nerr];
       s.lr = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mav1_lr"] error:&nerr];
       if (!s.analyze || !s.analyzeCoop || !s.analyzeL3 || !s.meTg || !s.recon || !s.me || !s.hpel || !s.lf || !s.cdef || !s.lr) {
-        snprintf(perr, sizeof perr, "pipeline creation failed: %s", nerr.localizedDescription.UTF8String);
+        perr = [@"pipeline creation failed: " stringByAppendingString:nerr.localizedDescription];
         return;
       }
+      protos[@(mask)] = s;
       proto = s;
       if (getenv("MAV1_TL")) fprintf(stderr, "init: pipelines %.1f ms\n", (CFAbsoluteTimeGetCurrent() - t0i) * 1e3);
       if (getenv("MAV1_PSO"))
@@ -551,11 +565,18 @@ Backend *backend_metal_create(struct Mav1Encoder *e, char *err, size_t errlen) {
                 (unsigned long)s.recon.maxTotalThreadsPerThreadgroup, (unsigned long)s.me.maxTotalThreadsPerThreadgroup,
                 (unsigned long)s.hpel.maxTotalThreadsPerThreadgroup, (unsigned long)s.lf.maxTotalThreadsPerThreadgroup,
                 (unsigned long)s.cdef.maxTotalThreadsPerThreadgroup);
-    });
-    if (!proto) {
-      snprintf(err, errlen, "%s", perr);
-      return NULL;
-    }
+  });
+  if (!proto) {
+    snprintf(err, errlen, "%s", perr.UTF8String);
+    return NULL;
+  }
+  return proto;
+}
+
+Backend *backend_metal_create(struct Mav1Encoder *e, char *err, size_t errlen) {
+  @autoreleasepool {
+    Mav1MetalState *proto = proto_for_mask(turbo_mask(e), err, errlen);
+    if (!proto) return NULL;
     Mav1MetalState *s = [Mav1MetalState new];
     s.device = proto.device;
     s.analyze = proto.analyze;

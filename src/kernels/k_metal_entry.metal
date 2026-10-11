@@ -96,7 +96,7 @@ kernel void mav1_hpel(device const FrameParams *fp [[buffer(0)]],
   int n = fp->frame_w * fp->frame_h;
   if ((int)gid >= n) return;
   int y = (int)gid / fp->frame_w, x = (int)gid % fp->frame_w;
-  int dec = (fp->turbo & T_ME_DEC) && y < dec_h(fp) && x < dec_w(fp);
+  int dec = (FPT(fp) & T_ME_DEC) && y < dec_h(fp) && x < dec_w(fp);
   if (mode.x) {
     qpel_build(fp, ref, entry, y, x);
     if (dec) dec_build(fp, ref, entry + 16L * n, y, x);
@@ -174,7 +174,7 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
    * spread over the lanes; per-candidate sums by simd_sum. The (cost, index)
    * minimum equals the serial first minimum of me_finish. */
   int mvr = m.stages ? dy * 8 : m.pr, mvc = m.stages ? dx * 8 : m.pc, bestS = 0;
-  int ustride = (fp->turbo & T_ME_USUB) && m.w >= 32 ? 2 : 1;
+  int ustride = (FPT(fp) & T_ME_USUB) && m.w >= 32 ? 2 : 1;
   int nUnits = ((m.w >> 2) * (m.w >> 2)) / ustride;
   for (int step = 4; step >= me_min_step(fp, m.w); step >>= 1) {
     int sums[ME_LANES];
@@ -184,7 +184,7 @@ kernel void mav1_me(device const FrameParams *fp [[buffer(0)]],
       int k = first + w / nUnits, u = (w % nUnits) * ustride;
       int dr = 0, dc = 0;
       if (k > 0) me_nb(fp, k - 1, step, &dr, &dc);
-      sums[k] += (fp->turbo & T_ME_HPEL) ? me_unit_satd_hp(fp, src, ref, hp, &m, mvr + dr, mvc + dc, u)
+      sums[k] += (FPT(fp) & T_ME_HPEL) ? me_unit_satd_hp(fp, src, ref, hp, &m, mvr + dr, mvc + dc, u)
                                          : me_unit_satd(fp, src, ref, &m, mvr + dr, mvc + dc, u);
     }
     int bc = INT_MAX, bk = 0;
@@ -1256,8 +1256,8 @@ kernel void mav1_me_tg(device const FrameParams *fp [[buffer(0)]],
   for (int stage = 0; stage < m.stages; stage++) {
     if (stage > 0) me_refine_stage(fp, &m, dy, dx, stage);
     /* each candidate's rows split over R adjacent threads */
-    int dec = (fp->turbo & T_ME_DEC) && m.step >= ME_COARSE_STEP;
-    int rs = (fp->turbo & T_ME_RSUB) && m.step == 1 ? 2 : 1;
+    int dec = (FPT(fp) & T_ME_DEC) && m.step >= ME_COARSE_STEP;
+    int rs = (FPT(fp) & T_ME_RSUB) && m.step == 1 ? 2 : 1;
     int rows = dec ? m.w >> 2 : m.w / rs, R = dec ? 2 : 8;
     int best = INT_MAX, bestK = INT_MAX;
     for (int it0 = 0; it0 < m.count * R; it0 += (int)tpg) {
@@ -1313,7 +1313,7 @@ kernel void mav1_me_tg(device const FrameParams *fp [[buffer(0)]],
     return;
   }
   int mvr = m.stages ? dy * 8 : m.pr, mvc = m.stages ? dx * 8 : m.pc, bestS = 0;
-  int ustride = (fp->turbo & T_ME_USUB) && m.w >= 32 ? 2 : 1;
+  int ustride = (FPT(fp) & T_ME_USUB) && m.w >= 32 ? 2 : 1;
   int nUnits = (m.w >> 2) * (m.w >> 2);
   for (int step = 4; step >= me_min_step(fp, m.w); step >>= 1) {
     int bc = INT_MAX, bk = 0;
@@ -1326,7 +1326,7 @@ kernel void mav1_me_tg(device const FrameParams *fp [[buffer(0)]],
         if (k > 0) me_nb(fp, k - 1, step, &r0, &c0);
         int s = 0;
         for (int u = (int)tid * ustride; u < nUnits; u += (int)tpg * ustride)
-          s += (fp->turbo & T_ME_HPEL) ? me_unit_satd_hp(fp, src, ref, hp, &m, mvr + r0, mvc + c0, u)
+          s += (FPT(fp) & T_ME_HPEL) ? me_unit_satd_hp(fp, src, ref, hp, &m, mvr + r0, mvc + c0, u)
                                        : me_unit_satd(fp, src, ref, &m, mvr + r0, mvc + c0, u);
         c = tg_sum(s, tid, tpg, red) * ustride;
       }

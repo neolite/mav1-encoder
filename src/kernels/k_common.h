@@ -13,6 +13,12 @@
 
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
+/* turbo mask: compile-time constant inside Metal kernels (the library is
+ * built with -DMAV1_TURBO_MASK=...), fp->turbo on the CPU side. */
+#ifndef MAV1_TURBO_MASK
+#define MAV1_TURBO_MASK 0
+#endif
+#define FPT(fp) (MAV1_TURBO_MASK)
 using namespace metal;
 #define DEV device            /* read/write buffer memory */
 #define KCONST constant       /* constant tables */
@@ -25,6 +31,7 @@ using namespace metal;
 #define KCONST const
 #define THR
 #define INLINE static inline
+#define FPT(fp) ((fp)->turbo)
 #endif
 
 #include "../spec_tables.h"

@@ -42,10 +42,10 @@ INLINE int level_bsize(int l) {
  * (checkerboard, cost x2) — the same subset on CPU and GPU. */
 #define T_ANA_USUB 4194304
 INLINE int turbo_mode_off(DEV const FrameParams *fp, int mode) {
-  return (fp->turbo & T_INTRA) && !fp->frame_is_intra && mode != DC_PRED && mode != V_PRED && mode != H_PRED &&
+  return (FPT(fp) & T_INTRA) && !fp->frame_is_intra && mode != DC_PRED && mode != V_PRED && mode != H_PRED &&
          mode != SMOOTH_PRED;
 }
-INLINE int turbo_no_cfl(DEV const FrameParams *fp) { return (fp->turbo & T_INTRA) && !fp->frame_is_intra; }
+INLINE int turbo_no_cfl(DEV const FrameParams *fp) { return (FPT(fp) & T_INTRA) && !fp->frame_is_intra; }
 
 /* Approximate cost (1/8 bit) of each luma intra mode. */
 INLINE int mode_bits8(int mode) {
@@ -72,7 +72,7 @@ INLINE int satd4x4(THR const int32_t *d) {
   return s;
 }
 
-INLINE int eval_sub(DEV const FrameParams *fp) { return (fp->turbo & T_ANA_USUB) != 0; }
+INLINE int eval_sub(DEV const FrameParams *fp) { return (FPT(fp) & T_ANA_USUB) != 0; }
 /* unit index of checkerboard item k of a nu-unit-wide grid (nu even),
  * matching block_satd_sub's row+col-even set. */
 INLINE int satd_sub_unit(int k, int nu) {
@@ -601,14 +601,14 @@ INLINE void slot_part(int slot, THR int *p, THR int *k) {
 /* Turbo bit 1024: leaf frames code no 8x8 blocks except where the 16x16
  * node crosses the frame edge (8x8 motion vectors are the parent's). */
 #define T_LEAF_NO8 1024
-INLINE int leaf_no8(DEV const FrameParams *fp) { return (fp->turbo & T_LEAF_NO8) && fp->leaf && !fp->frame_is_intra; }
+INLINE int leaf_no8(DEV const FrameParams *fp) { return (FPT(fp) & T_LEAF_NO8) && fp->leaf && !fp->frame_is_intra; }
 /* The 8x8 node i of superblock sbIdx lies in a 16x16 node crossing the frame edge. */
 INLINE int node8_at_edge(DEV const FrameParams *fp, int sbIdx, int i) {
   int r = (sbIdx / fp->sb_cols) * 16 + ((i >> 3) & ~1) * 2, c = (sbIdx % fp->sb_cols) * 16 + ((i & 7) & ~1) * 2;
   return r + 4 > fp->mi_rows || c + 4 > fp->mi_cols;
 }
 INLINE int turbo_square(DEV const FrameParams *fp) {
-  return (fp->turbo & 1) && (!fp->frame_is_intra || (fp->turbo & T_KEY_SQUARE));
+  return (FPT(fp) & 1) && (!fp->frame_is_intra || (FPT(fp) & T_KEY_SQUARE));
 }
 
 /* Partition p is searched at this node (the conditions of analyze_sb). */

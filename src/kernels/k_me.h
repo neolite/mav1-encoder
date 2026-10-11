@@ -90,9 +90,9 @@ typedef struct {
 #define T_ME_USUB 262144 /* sub-pel SATD on every other 4x4 unit for blocks >= 32 */
 #define T_ME_G3COPY 16384 /* leaf frames: 8x8 nodes of the second reference take the 16x16 parent's vector */
 #define T_ME_HALF01 32768 /* 64x64 and 32x32 nodes: half-pel refinement only */
-INLINE int me_min_step(DEV const FrameParams *fp, int w) { return w >= 32 && (fp->turbo & T_ME_HALF01) ? 4 : 2; }
+INLINE int me_min_step(DEV const FrameParams *fp, int w) { return w >= 32 && (FPT(fp) & T_ME_HALF01) ? 4 : 2; }
 INLINE int me_gold_copy(DEV const FrameParams *fp, int level) {
-  return level == 3 && (fp->turbo & T_ME_G3COPY) && fp->leaf && !fp->frame_is_intra;
+  return level == 3 && (FPT(fp) & T_ME_G3COPY) && fp->leaf && !fp->frame_is_intra;
 }
 
 /* Plane buffer of the turbo motion search: ME_QP_ENTRIES entries, each the
@@ -132,7 +132,7 @@ INLINE int dec_sad(DEV const FrameParams *fp, DEV const uint8_t *ds, DEV const u
 /* Turbo: the node's search ends with the parent's vector (copy node, or the
  * full-pel winner is the parent's own position). */
 INLINE int me_take_parent(DEV const FrameParams *fp, int level, THR const MeNode *m, int by, int bx) {
-  return level > 0 && (m->copy || ((fp->turbo & T_ME_KEEP) && by == m->cy && bx == m->cx));
+  return level > 0 && (m->copy || ((FPT(fp) & T_ME_KEEP) && by == m->cy && bx == m->cx));
 }
 
 #define ME_COARSE_STEP 4
@@ -158,20 +158,20 @@ INLINE MeNode me_node(DEV const FrameParams *fp, int sbIdx, int level, int i, DE
     m.pc = par[1];
     m.cy = par[0] >> 3;
     m.cx = par[1] >> 3;
-    m.range = k_min(m.range, (fp->turbo & T_ME_CR1) ? 1 : (fp->turbo & T_ME_CR2) ? 2 : 4);
-    m.copy = ((fp->turbo & T_ME_L3COPY) || leaf_no8(fp)) && level == 3;
+    m.range = k_min(m.range, (FPT(fp) & T_ME_CR1) ? 1 : (FPT(fp) & T_ME_CR2) ? 2 : 4);
+    m.copy = ((FPT(fp) & T_ME_L3COPY) || leaf_no8(fp)) && level == 3;
   }
   m.step = 1;
   m.stages = 1;
   if (level == 0) {
     /* stage 0: grid of spacing 4 over +-range around (0, 0); T_ME_HME3
      * widens it to spacing 8 and adds a +-4 step-4 middle stage */
-    m.step = (fp->turbo & T_ME_HME3) ? 2 * ME_COARSE_STEP : ME_COARSE_STEP;
+    m.step = (FPT(fp) & T_ME_HME3) ? 2 * ME_COARSE_STEP : ME_COARSE_STEP;
     m.range = (m.range / m.step) * m.step;
-    m.stages = (fp->turbo & T_ME_HME3) ? 3 : 2;
+    m.stages = (FPT(fp) & T_ME_HME3) ? 3 : 2;
   }
   /* turbo T_ME_L3SUB: 8x8 nodes refine the parent's vector at sub-pel only */
-  if (level == 3 && (fp->turbo & T_ME_L3SUB)) m.stages = 0;
+  if (level == 3 && (FPT(fp) & T_ME_L3SUB)) m.stages = 0;
   int side = 2 * (m.range / m.step) + 1;
   m.count = 1 + side * side;
   return m;
@@ -182,11 +182,11 @@ INLINE MeNode me_node(DEV const FrameParams *fp, int sbIdx, int level, int i, DE
 INLINE void me_refine_stage(DEV const FrameParams *fp, THR MeNode *m, int wy, int wx, int stage) {
   m->cy = wy;
   m->cx = wx;
-  if (stage == 1 && (fp->turbo & T_ME_HME3)) {
+  if (stage == 1 && (FPT(fp) & T_ME_HME3)) {
     m->range = ME_COARSE_STEP;
     m->step = ME_COARSE_STEP;
   } else {
-    m->range = (fp->turbo & T_ME_REF2) ? 2 : ME_REFINE;
+    m->range = (FPT(fp) & T_ME_REF2) ? 2 : ME_REFINE;
     m->step = 1;
   }
   int side = 2 * (m->range / m->step) + 1;
@@ -211,9 +211,9 @@ INLINE void me_candidate(THR const MeNode *m, int k, THR int *dy, THR int *dx) {
 INLINE int me_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref, DEV const uint8_t *ds,
                    DEV const uint8_t *dr, THR const MeNode *m, int dy, int dx) {
   int bits = 2 + 2 * FloorLog2(k_abs(dy) * 8 + 1) + 2 * FloorLog2(k_abs(dx) * 8 + 1);
-  if ((fp->turbo & T_ME_DEC) && m->step >= ME_COARSE_STEP)
+  if ((FPT(fp) & T_ME_DEC) && m->step >= ME_COARSE_STEP)
     return dec_sad(fp, ds, dr, m->x, m->y, m->w, dy, dx) + fp->ac_q[0] * bits / 64;
-  int rs = (fp->turbo & T_ME_RSUB) && m->step == 1 ? 2 : 1;
+  int rs = (FPT(fp) & T_ME_RSUB) && m->step == 1 ? 2 : 1;
   return me_sad(src + fp->offset[0], ref + fp->offset[0], fp->stride[0], fp->frame_w, fp->frame_h, m->x, m->y, m->w,
                 dy, dx, rs) +
          fp->ac_q[0] * bits / 64;
@@ -237,17 +237,17 @@ INLINE void me_neighbour(int k, int step, THR int *dr, THR int *dc) {
 }
 
 /* Sub-pel neighbour j (0 .. me_nb_count - 1) of the turbo set. */
-INLINE int me_nb_count(DEV const FrameParams *fp) { return (fp->turbo & T_ME_CROSS) ? 4 : 8; }
+INLINE int me_nb_count(DEV const FrameParams *fp) { return (FPT(fp) & T_ME_CROSS) ? 4 : 8; }
 INLINE void me_nb(DEV const FrameParams *fp, int j, int step, THR int *dr, THR int *dc) {
-  me_neighbour((fp->turbo & T_ME_CROSS) ? (j == 0 ? 1 : j == 1 ? 3 : j == 2 ? 4 : 6) : j, step, dr, dc);
+  me_neighbour((FPT(fp) & T_ME_CROSS) ? (j == 0 ? 1 : j == 1 ? 3 : j == 2 ? 4 : 6) : j, step, dr, dc);
 }
 
 INLINE int me_unit_satd_hp(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
                            DEV const uint8_t *hp, THR const MeNode *m, int mvr, int mvc, int u);
 INLINE int me_subpel_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
                           DEV const uint8_t *hp, THR const MeNode *m, int mvr, int mvc, DEV int32_t *scratch) {
-  if (fp->turbo & T_ME_HPEL) {
-    int s = 0, nu = (m->w >> 2) * (m->w >> 2), st = (fp->turbo & T_ME_USUB) && m->w >= 32 ? 2 : 1;
+  if (FPT(fp) & T_ME_HPEL) {
+    int s = 0, nu = (m->w >> 2) * (m->w >> 2), st = (FPT(fp) & T_ME_USUB) && m->w >= 32 ? 2 : 1;
     for (int u = 0; u < nu; u += st) s += me_unit_satd_hp(fp, src, ref, hp, m, mvr, mvc, u);
     return s * st;
   }
