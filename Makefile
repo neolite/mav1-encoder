@@ -50,7 +50,17 @@ asan: $(BUILD)/mav1enc_asan
 $(BUILD)/mav1enc_asan: tools/mav1enc.c $(CORE) src/backend_metal_stub.c $(HDRS) | $(BUILD)
 	$(CC) -O1 -g -fsanitize=address,undefined -Wall -Isrc -std=gnu11 tools/mav1enc.c $(CORE) src/backend_metal_stub.c -o $@
 
+# `make install PREFIX=/usr/local` stages mav1.h, libmav1.a and a pkg-config
+# file for consumers such as the FFmpeg wrapper (docs/ffmpeg-*-libmav1.patch).
+PREFIX  ?= /usr/local
+
+install: $(BUILD)/libmav1.a
+	mkdir -p $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib/pkgconfig
+	cp src/mav1.h $(DESTDIR)$(PREFIX)/include/mav1.h
+	cp $(BUILD)/libmav1.a $(DESTDIR)$(PREFIX)/lib/libmav1.a
+	printf 'libdir=%s\nincludedir=%s\n\nName: libmav1\nDescription: AV1 encoder (Metal GPU backend, Apple Silicon)\nVersion: 0.1\nLibs: -L$${libdir} -lmav1 -framework Metal -framework Foundation\nCflags: -I$${includedir}\n' "$(PREFIX)/lib" "$(PREFIX)/include" > $(DESTDIR)$(PREFIX)/lib/pkgconfig/libmav1.pc
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all asan clean
+.PHONY: all asan install clean

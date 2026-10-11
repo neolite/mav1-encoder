@@ -60,10 +60,10 @@ index 695214f..003819e 100644
  extern const FFCodec ff_libspeex_encoder;
 diff --git a/libavcodec/libmav1.c b/libavcodec/libmav1.c
 new file mode 100644
-index 0000000..853fe86
+index 0000000..56a9b34
 --- /dev/null
 +++ b/libavcodec/libmav1.c
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,214 @@
 +/*
 + * AV1 encoding through mav1 (Metal GPU / CPU kernels)
 + *
@@ -77,6 +77,7 @@ index 0000000..853fe86
 +
 +#include <mav1.h>
 +
++#include "libavutil/fifo.h"
 +#include "libavutil/mem.h"
 +#include "libavutil/opt.h"
 +#include "libavutil/pixdesc.h"
@@ -87,6 +88,9 @@ index 0000000..853fe86
 +typedef struct LibMav1Context {
 +    const AVClass *class;
 +    Mav1Encoder *enc;
++    AVFrame *frame;
++    AVFifo *pts_fifo;
++    int flushing;
 +    int metal;
 +    int qindex;
 +    int loop_filter;
@@ -96,6 +100,7 @@ index 0000000..853fe86
 +    int restoration;
 +    int switchable_interp;
 +    int me_range;
++    int turbo;
 +} LibMav1Context;
 +
 +static av_cold int libmav1_init(AVCodecContext *avctx)
@@ -114,6 +119,15 @@ index 0000000..853fe86
 +    cfg.restoration = ctx->restoration;
 +    cfg.switchable_interp = ctx->switchable_interp;
 +    cfg.me_range    = ctx->me_range;
++    cfg.turbo       = ctx->turbo;
++    /* match mav1enc --turbo: turbo implies fast mode, which disables the
++     * expensive search stages (restoration, tx search/depth, dual interp)
++     * and runs two tile columns */
++    if (ctx->turbo) {
++        cfg.fast = 1;
++        cfg.tx_search = cfg.tx_depth = cfg.restoration = cfg.switchable_interp = 0;
++        cfg.tile_cols_log2 = 2;
++    }
 +    cfg.keyint      = avctx->gop_size > 0 ? avctx->gop_size : 0;
 +
 +    ctx->enc = mav1_create(&cfg, err, sizeof(err));
@@ -135,18 +149,67 @@ index 0000000..853fe86
 +    return 0;
 +}
 +
-+static int libmav1_encode(AVCodecContext *avctx, AVPacket *pkt,
-+                          const AVFrame *frame, int *got_packet)
++/* The encoder reorders frames when altref is on (hidden frames +
++ * show_existing_frame), so it uses the queued send/receive API. PTS
++ * values travel through a FIFO: every sent input frame is emitted as
++ * exactly one output temporal unit, in display order. */
++static int libmav1_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
 +{
 +    LibMav1Context *ctx = avctx->priv_data;
-+    const uint8_t *planes[3] = { frame->data[0], frame->data[1], frame->data[2] };
-+    int strides[3] = { frame->linesize[0], frame->linesize[1], frame->linesize[2] };
 +    uint8_t *out;
 +    size_t size;
-+    int ret;
++    int ret, have = 0;
 +
-+    if (mav1_encode(ctx->enc, planes, strides, &out, &size))
-+        return AVERROR_EXTERNAL;
++    if (!ctx->flushing) {
++        const uint8_t *planes[3] = { NULL, NULL, NULL };
++        int strides[3] = { 0, 0, 0 };
++
++
++        if (!ctx->frame) {
++            ctx->frame = av_frame_alloc();
++            if (!ctx->frame)
++                return AVERROR(ENOMEM);
++        }
++        if (!ctx->pts_fifo)
++            ctx->pts_fifo = av_fifo_alloc2(64, sizeof(int64_t), 0);
++        if (!ctx->pts_fifo)
++            return AVERROR(ENOMEM);
++
++        ret = ff_encode_get_frame(avctx, ctx->frame);
++        if (ret == AVERROR_EOF) {
++            ctx->flushing = 1;
++        } else if (ret < 0 && ret != AVERROR(EAGAIN)) {
++            return ret;
++        } else if (ret >= 0) {
++            planes[0] = ctx->frame->data[0];
++            planes[1] = ctx->frame->data[1];
++            planes[2] = ctx->frame->data[2];
++            strides[0] = ctx->frame->linesize[0];
++            strides[1] = ctx->frame->linesize[1];
++            strides[2] = ctx->frame->linesize[2];
++            have = 1;
++        }
++
++        if (have || ctx->flushing) {
++            if (mav1_send_frame(ctx->enc, have ? planes : NULL, strides))
++                return AVERROR_EXTERNAL;
++        }
++        if (have) {
++            int64_t pts = ctx->frame->pts;
++            ret = av_fifo_write(ctx->pts_fifo, &pts, 1);
++            av_frame_unref(ctx->frame);
++            if (ret < 0)
++                return ret;
++        }
++    }
++
++    /* block briefly for in-flight engine output; the wait is bounded so
++     * new input frames can still be fed (they release gates the pending
++     * jobs may be waiting on) */
++    ret = mav1_receive_packet_wait(ctx->enc, &out, &size, 50);
++    if (ret)
++        return ctx->flushing ? AVERROR_EOF : AVERROR(EAGAIN);
++
 +    ret = ff_get_encode_buffer(avctx, pkt, size, 0);
 +    if (ret < 0) {
 +        free(out);
@@ -156,8 +219,8 @@ index 0000000..853fe86
 +    free(out);
 +    if (mav1_last_stats(ctx->enc)->frame_type == 0)
 +        pkt->flags |= AV_PKT_FLAG_KEY;
-+    pkt->pts = pkt->dts = frame->pts;
-+    *got_packet = 1;
++    if (av_fifo_read(ctx->pts_fifo, &pkt->pts, 1) >= 0)
++        pkt->dts = pkt->pts;
 +    return 0;
 +}
 +
@@ -165,6 +228,8 @@ index 0000000..853fe86
 +{
 +    LibMav1Context *ctx = avctx->priv_data;
 +    mav1_destroy(ctx->enc);
++    av_frame_free(&ctx->frame);
++    av_fifo_freep2(&ctx->pts_fifo);
 +    ctx->enc = NULL;
 +    return 0;
 +}
@@ -181,6 +246,7 @@ index 0000000..853fe86
 +    { "cdef",      "CDEF",                                        OFFSET(cdef),        AV_OPT_TYPE_BOOL, { .i64 = 1 },   0, 1,   VE },
 +    { "txsearch",  "Transform type search",                       OFFSET(tx_search),   AV_OPT_TYPE_BOOL, { .i64 = 1 },   0, 1,   VE },
 +    { "me_range",  "Full-pel motion search range",                OFFSET(me_range),    AV_OPT_TYPE_INT,  { .i64 = 32 },  0, 256, VE },
++    { "turbo",     "Speed mode (implies fast, altref 2, leaf)",   OFFSET(turbo),       AV_OPT_TYPE_BOOL, { .i64 = 0 },   0, 1,   VE },
 +    { NULL },
 +};
 +
@@ -202,7 +268,7 @@ index 0000000..853fe86
 +    .p.type         = AVMEDIA_TYPE_VIDEO,
 +    .p.id           = AV_CODEC_ID_AV1,
 +    .init           = libmav1_init,
-+    FF_CODEC_ENCODE_CB(libmav1_encode),
++    FF_CODEC_RECEIVE_PACKET_CB(libmav1_receive_packet),
 +    .close          = libmav1_close,
 +    .priv_data_size = sizeof(LibMav1Context),
 +    .p.priv_class   = &libmav1_class,
