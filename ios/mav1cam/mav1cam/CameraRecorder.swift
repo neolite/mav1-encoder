@@ -119,6 +119,8 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         cfg.fps_den = 1
         cfg.keyint = 0
         cfg.rc = MAV1_RC_CQP
+        // phone memory: 4 full engines ~1.4GB at 1080p; 2 fit comfortably
+        cfg.threads = 2
         if hdrActive {
             cfg.bitdepth = 10
             // iPhone captures HDR in HLG (Dolby Vision is a mux-level side

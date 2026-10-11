@@ -133,6 +133,7 @@ struct Mav1Encoder {
 #define NUM_ENG 4 /* engine 0 codes the reference frames, 1..3 the others */
   struct Mav1Encoder *eng[NUM_ENG];
   int eng_next, is_engine;
+  int num_eng; /* engines created (2..NUM_ENG; cfg.threads / MAV1_ENG) */
   _Atomic int jobs_live;      /* dispatched engine jobs not yet written */
   void *eng_q[NUM_ENG], *eng_busy[NUM_ENG]; /* serial dispatch queue, group of its jobs */
   /* slot versions: slot_ver[k] (dispatch group, NULL: written) completes

@@ -208,8 +208,14 @@ static Mav1Encoder *create_enc(const Mav1Config *cfg, int isEngine, char *err, s
     e->be = backend_cpu_create(e);
   }
   if (drv) {
+    /* engine count: cfg.threads (app) or MAV1_ENG, clamped to [2, NUM_ENG];
+     * engine 0 codes reference frames, 1..N-1 the rest */
+    int ne = NUM_ENG;
+    if (cfg->threads > 0) ne = k_min(NUM_ENG, k_max(2, cfg->threads));
+    else if (getenv("MAV1_ENG")) ne = k_min(NUM_ENG, k_max(2, atoi(getenv("MAV1_ENG"))));
+    e->num_eng = ne;
     e->eng_next = 1;
-    for (int i = 0; i < NUM_ENG; i++) {
+    for (int i = 0; i < ne; i++) {
       e->eng[i] = create_enc(cfg, 1, err, errlen);
       if (!e->eng[i]) {
         mav1_destroy(e);
@@ -236,7 +242,7 @@ static Mav1Encoder *create_enc(const Mav1Config *cfg, int isEngine, char *err, s
         return NULL;
       }
       e->qpc = c;
-      for (int i = 0; i < NUM_ENG; i++) e->eng[i]->qpc = c;
+      for (int i = 0; i < ne; i++) e->eng[i]->qpc = c;
     }
   }
   return e;
@@ -1154,7 +1160,7 @@ static uint8_t *alt_code(Mav1Encoder *e, uint8_t **framep, int disp, int isKey, 
   int chain = h->refresh_frame_flags && !(kind == 3 && !getenv("MAV1_MIDCHAIN")); /* the ARF chain (pyramid middle frames off it) */
   int ei = chain ? 0 : e->eng_next;
   Mav1Encoder *E = e->eng[0] ? e->eng[ei] : e;
-  if (e->eng[0] && ei) e->eng_next = ei % (NUM_ENG - 1) + 1;
+  if (e->eng[0] && ei && e->num_eng > 2) e->eng_next = ei % (e->num_eng - 1) + 1;
   int rf = h->refresh_frame_flags;
   FrameHdr hdr = *h;
   struct { int v[8]; } sb;
