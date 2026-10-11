@@ -112,6 +112,18 @@ INLINE int code_tx_block(DEV const FrameParams *fp, DEV const uint8_t *src, DEV 
     KCONST int32_t *scan = get_scan(txSz, t);
     int eob = find_eob(qtry, scan, seg_eob(txSz));
     long sse = 0;
+    if (numCands == 1 && !fp->tx_mode_select) {
+      /* nothing to compare: no cost (the residual for the reconstruction) */
+      if (eob > 0) {
+        dequant_block(qtry, dq, txSz, dcQ, acQ);
+        itx_2d(dq, res, txSz, t, 0);
+      }
+      bestCost = 0;
+      bestType = eob > 0 ? t : DCT_DCT;
+      bestEob = eob;
+      for (int k = 0; k < tw * th; k++) qbest[k] = qtry[k];
+      continue;
+    }
     if (eob > 0) {
       dequant_block(qtry, dq, txSz, dcQ, acQ);
       itx_2d(dq, res, txSz, t, 0);

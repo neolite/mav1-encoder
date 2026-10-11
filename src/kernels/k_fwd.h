@@ -84,12 +84,11 @@ INLINE int quantize_block(DEV const int32_t *coef, DEV int32_t *quant, int txSz,
 }
 
 /* Dequantisation, spec 7.12.3 step 1 (no quantizer matrices). Output row
- * stride 64, as consumed by itx_2d. */
+ * stride 64, as consumed by itx_2d (which reads only the Min(32, h) x
+ * Min(32, w) region written here). */
 INLINE void dequant_block(DEV const int32_t *quant, DEV int32_t *dq, int txSz, int dcQ, int acQ) {
   int tw = k_min(32, Tx_Width[txSz]), th = k_min(32, Tx_Height[txSz]);
   int denom = dq_denom(txSz);
-  for (int i = 0; i < 64; i++)
-    for (int j = 0; j < 64; j++) dq[i * 64 + j] = 0;
   for (int i = 0; i < th; i++)
     for (int j = 0; j < tw; j++) {
       int q = (i == 0 && j == 0) ? dcQ : acQ;
