@@ -1,5 +1,7 @@
 import AVFoundation
+import CoreMedia
 import Foundation
+import Photos
 import UIKit
 
 /// Camera -> mav1 -> .ivf in Documents. NV12/planar input; the UV planes of
@@ -12,6 +14,11 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
     private var enc: OpaquePointer?
     private var file: FileHandle?
     private var outURL: URL?
+    private var movWriter: AVAssetWriter?
+    private var movInput: AVAssetWriterInput?
+    private var movURL: URL?
+    private var av1Desc: CMFormatDescription?
+    private var sampleIdx: Int64 = 0
     private var uBuf: UnsafeMutableRawPointer?
     private var vBuf: UnsafeMutableRawPointer?
     private var uvBytes = 0
@@ -35,26 +42,28 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
 
     private let presets: [AVCaptureSession.Preset] = [.hd1280x720, .hd1920x1080, .hd4K3840x2160]
 
+    private var camInput: AVCaptureDeviceInput?
+    /// camera selector: [label, position, type]
+    let cameras: [(String, AVCaptureDevice.Position, AVCaptureDevice.DeviceType)] = [
+        ("0.5x", .back, .builtInUltraWideCamera),
+        ("1x", .back, .builtInWideAngleCamera),
+        ("5x", .back, .builtInTelephotoCamera),
+        ("front", .front, .builtInWideAngleCamera),
+    ]
+
     override init() {
         super.init()
         session.sessionPreset = .hd1920x1080
 
-        guard let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
-              let input = try? AVCaptureDeviceInput(device: dev),
-              session.canAddInput(input) else {
+        if let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+           let input = try? AVCaptureDeviceInput(device: dev),
+           session.canAddInput(input) {
+            session.addInput(input)
+            camInput = input
+            tuneDevice(dev)
+        } else {
             status = "camera init failed"
             return
-        }
-        session.addInput(input)
-
-        // request 30 fps
-        for f in dev.formats where f.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 }) && CMFormatDescriptionGetMediaSubType(f.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
-            try? dev.lockForConfiguration()
-            dev.activeFormat = f
-            dev.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
-            dev.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
-            dev.unlockForConfiguration()
-            break
         }
 
         let fmt = videoOutput.availableVideoPixelFormatTypes.contains(kCVPixelFormatType_420YpCbCr8Planar)
@@ -71,6 +80,43 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
 
         if let conn = videoOutput.connection(with: .video), conn.isVideoRotationAngleSupported(90) {
             conn.videoRotationAngle = 90
+        }
+    }
+
+    /// 30 fps capture + continuous autofocus/exposure (without these the
+    /// focus point sticks wherever the device happened to open).
+    private func tuneDevice(_ dev: AVCaptureDevice) {
+        try? dev.lockForConfiguration()
+        if let f = dev.formats.first(where: {
+            $0.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 })
+                && CMFormatDescriptionGetMediaSubType($0.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        }) {
+            dev.activeFormat = f
+            dev.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
+            dev.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+        }
+        if dev.isFocusModeSupported(.continuousAutoFocus) { dev.focusMode = .continuousAutoFocus }
+        if dev.isSmoothAutoFocusSupported { dev.isSmoothAutoFocusEnabled = true }
+        if dev.isExposureModeSupported(.continuousAutoExposure) { dev.exposureMode = .continuousAutoExposure }
+        dev.unlockForConfiguration()
+    }
+
+    /// Swap the session's camera input at index `i` of `cameras`.
+    func selectCamera(_ i: Int) {
+        let (_, pos, type) = cameras[i]
+        videoQueue.async {
+            guard let dev = AVCaptureDevice.default(type, for: .video, position: pos),
+                  let input = try? AVCaptureDeviceInput(device: dev) else { return }
+            self.session.beginConfiguration()
+            if let old = self.camInput { self.session.removeInput(old) }
+            if self.session.canAddInput(input) {
+                self.session.addInput(input)
+                self.camInput = input
+                self.tuneDevice(dev)
+            } else if let old = self.camInput {
+                self.session.addInput(old)
+            }
+            self.session.commitConfiguration()
         }
     }
 
@@ -167,6 +213,13 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         appendLE(&hdr, UInt32(0)); appendLE(&hdr, UInt32(0))
         fh.write(hdr)
 
+        // .mov mux for Photos: pass-through av01 samples in an MP4 container
+        // (the A17+ decoder plays them back in the gallery)
+        movURL = url.deletingPathExtension().appendingPathExtension("mov")
+        try? FileManager.default.removeItem(at: movURL!)
+        setupMovWriter(width: dim.0, height: dim.1, bitdepth: cfg.bitdepth, enc: enc!)
+
+        sampleIdx = 0
         framesSent = 0; packets = 0; bytesWritten = 0
         startTime = CACurrentMediaTime()
         DispatchQueue.main.async {
@@ -177,6 +230,12 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
     }
 
     func stop() {
+        // stop feeding frames immediately so the drain only flushes what's
+        // already in flight; the UI goes idle at once
+        DispatchQueue.main.async {
+            self.recording = false
+            self.status = "stopping…"
+        }
         videoQueue.async { self._stop() }
     }
 
@@ -192,12 +251,15 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         }
         var out: UnsafeMutablePointer<UInt8>?
         var size = 0
-        while mav1_receive_packet_wait(enc, &out, &size, 2000) == 0 {
+        let deadline = CACurrentMediaTime() + 20
+        while mav1_receive_packet_wait(enc, &out, &size, 500) == 0 {
             writePacket(out, size: size)
+            if CACurrentMediaTime() > deadline { break }
         }
         patchFrameCount()
         try? file?.close()
         file = nil
+        finishMov()
         mav1_destroy(enc)
         self.enc = nil
         uBuf.map { free($0) }; uBuf = nil
@@ -352,6 +414,85 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         }
     }
 
+    // MARK: mov mux (av01 passthrough for Photos)
+
+    private func setupMovWriter(width: Int, height: Int, bitdepth: Int32, enc: OpaquePointer) {
+        guard let movURL else { return }
+        // AV1 Codec Configuration Record: marker|version, seq_profile|level,
+        // tier|bitdepth|subsampling flags, initial delay, then the sequence
+        // header OBU as the config payload.
+        var av1c = Data([0x81, UInt8(0 << 5 | 40), UInt8(bitdepth > 8 ? 0x4C : 0x0C), 0x00])
+        var sh = [UInt8](repeating: 0, count: 256)
+        let shLen = mav1_sequence_header(enc, &sh)
+        av1c.append(contentsOf: sh[0..<Int(shLen)])
+        let atoms: [String: Data] = ["av1C": av1c]
+        let ext: [String: Any] = [
+            kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String: atoms,
+        ]
+        var fd: CMFormatDescription?
+        let rc = CMVideoFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault, codecType: kCMVideoCodecType_AV1,
+            width: Int32(width), height: Int32(height),
+            extensions: ext as CFDictionary, formatDescriptionOut: &fd)
+        guard rc == noErr, let fd else { return }
+        av1Desc = fd
+
+        guard let w = try? AVAssetWriter(outputURL: movURL, fileType: .mov) else { return }
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: fd)
+        input.expectsMediaDataInRealTime = true
+        guard w.canAdd(input) else { return }
+        w.add(input)
+        guard w.startWriting() else { return }
+        w.startSession(atSourceTime: .zero)
+        movWriter = w
+        movInput = input
+    }
+
+    private func appendMovSample(_ data: UnsafeMutablePointer<UInt8>, size: Int) {
+        guard let inp = movInput, let fd = av1Desc, movWriter?.status == .writing else { return }
+        var bb: CMBlockBuffer?
+        guard CMBlockBufferCreateEmpty(allocator: kCFAllocatorDefault, capacity: 0, flags: 0, blockBufferOut: &bb) == noErr,
+              let bb else { return }
+        guard CMBlockBufferAppendMemoryBlock(bb, memoryBlock: nil, length: size, blockAllocator: nil,
+                                             customBlockSource: nil, offsetToData: 0, dataLength: size, flags: 0) == noErr,
+              CMBlockBufferReplaceDataBytes(with: data, blockBuffer: bb, offsetIntoDestination: 0, dataLength: size) == noErr else { return }
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: 30),
+            presentationTimeStamp: CMTime(value: sampleIdx, timescale: 30),
+            decodeTimeStamp: .invalid)
+        var sz = size
+        var sb: CMSampleBuffer?
+        guard CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: bb, formatDescription: fd,
+                                        sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+                                        sampleSizeEntryCount: 1, sampleSizeArray: &sz, sampleBufferOut: &sb) == noErr,
+              let sb else { return }
+        sampleIdx += 1
+        inp.append(sb)
+    }
+
+    private func finishMov() {
+        guard movWriter != nil else { return }
+        let url = movURL
+        movInput?.markAsFinished()
+        let w = movWriter
+        movWriter = nil
+        movInput = nil
+        av1Desc = nil
+        w?.finishWriting { [weak self] in
+            guard let self, let url, w?.status == .completed else { return }
+            PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+                guard status == .authorized || status == .limited else { return }
+                PHPhotoLibrary.shared().performChanges {
+                    PHAssetCreationRequest.forAsset().addResource(with: .video, fileURL: url, options: nil)
+                } completionHandler: { ok, err in
+                    DispatchQueue.main.async {
+                        self.status = ok ? "saved to Photos ✓" : "Photos save failed: \(err?.localizedDescription ?? "?")"
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: IVF
 
     private func writePacket(_ data: UnsafeMutablePointer<UInt8>?, size: Int) {
@@ -361,6 +502,7 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         appendLE(&hdr, UInt64(packets))
         file.write(hdr)
         file.write(Data(bytes: data, count: size))
+        appendMovSample(data, size: size)
         free(data)
         packets += 1
         bytesWritten += size + 12

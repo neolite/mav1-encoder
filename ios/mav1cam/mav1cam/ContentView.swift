@@ -23,6 +23,7 @@ struct PreviewView: UIViewRepresentable {
 struct ContentView: View {
     @StateObject private var rec = CameraRecorder()
     @State private var preset = 1 // 0: 720p, 1: 1080p, 2: 4K
+    @State private var cam = 1 // index into rec.cameras
 
     var body: some View {
         ZStack {
@@ -56,6 +57,25 @@ struct ContentView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                     .padding(.bottom, 4)
 
+                // camera / zoom selector just above the record button
+                HStack(spacing: 18) {
+                    ForEach(Array(rec.cameras.enumerated()), id: \.offset) { i, c in
+                        Button(action: {
+                            cam = i
+                            rec.selectCamera(i)
+                        }) {
+                            Text(c.0)
+                                .font(.caption.bold())
+                                .frame(minWidth: 34, minHeight: 34)
+                                .background(cam == i ? .white.opacity(0.85) : .black.opacity(0.45))
+                                .foregroundStyle(cam == i ? .black : .white)
+                                .clipShape(Circle())
+                        }
+                    }
+                }
+                .padding(.bottom, 4)
+                .disabled(rec.recording)
+
                 Button(action: {
                     if rec.recording {
                         rec.stop()
@@ -63,11 +83,22 @@ struct ContentView: View {
                         rec.start(presetIndex: preset)
                     }
                 }) {
-                    Circle()
-                        .strokeBorder(.white, lineWidth: 4)
-                        .fill(rec.recording ? .red : .clear)
-                        .frame(width: 72, height: 72)
-                        .padding(.bottom, 24)
+                    ZStack {
+                        Circle()
+                            .strokeBorder(.white, lineWidth: 4)
+                            .frame(width: 72, height: 72)
+                        if rec.recording {
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(.red)
+                                .frame(width: 30, height: 30)
+                        } else {
+                            Circle()
+                                .fill(.red)
+                                .frame(width: 56, height: 56)
+                        }
+                    }
+                    .frame(width: 72, height: 72)
+                    .padding(.bottom, 24)
                 }
             }
         }
