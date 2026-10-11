@@ -2,10 +2,15 @@
  * mav1 - an AV1 encoder whose pixel processing runs on Metal (or on the CPU
  * through the very same kernel sources).
  *
- * Output: 8-bit 4:2:0, profile 0, low-delay (key frame followed by inter
- * frames predicting from the previous frame). Every temporal unit returned
- * by mav1_encode() starts with a temporal delimiter; key frames also carry
- * a sequence header.
+ * Output: 4:2:0, profile 0 (8 or 10 bit, Mav1Config.bitdepth), low-delay (key
+ * frame followed by inter frames predicting from the previous frame). Every
+ * temporal unit returned by mav1_encode() starts with a temporal delimiter;
+ * key frames also carry a sequence header (and, with cfg.hdr, the HDR10
+ * metadata OBUs).
+ *
+ * Planes are described as byte pointers at both depths: at 10 bits each
+ * sample is a native-endian uint16_t (strides in bytes), the I420/P010-style
+ * layout FFmpeg hands to an encoder.
  */
 #ifndef MAV1_H
 #define MAV1_H
@@ -17,8 +22,14 @@
 extern "C" {
 #endif
 
+/* rate control modes */
+#define MAV1_RC_CQP 0 /* constant qindex (cfg.qindex) */
+#define MAV1_RC_VBR 1 /* single-pass average bitrate target */
+#define MAV1_RC_CBR 2 /* VBR plus a buffer constraint (capped peak) */
+
 typedef struct {
   int width, height;
+  int bitdepth;          /* 8 (default) or 10 */
   int qindex;          /* base_q_idx, 1..255 */
   int use_metal;       /* 1: Metal backend, 0: CPU backend */
   int keyint;          /* key frame interval (0: only the first frame) */
@@ -39,6 +50,22 @@ typedef struct {
   int me_range;        /* full-pel motion search range */
   int threads;         /* CPU backend worker threads (0: auto) */
   int turbo;           /* speed mode: implies fast, altref 2, leaf; reduced ME and analysis */
+  /* color description (CICP; written to the sequence header when != -1) */
+  int color_primaries, transfer_characteristics, matrix_coefficients; /* -1: unspecified */
+  int color_range;     /* 0 limited, 1 full */
+  /* HDR10 metadata (cfg.hdr): mastering display + content light level OBUs
+   * after every sequence header. Chromaticities in 1/65536 units (0.16
+   * fixed); luminances in the signal's fixed point (max 1/256 cd/m^2,
+   * min 1/16384 cd/m^2). */
+  int hdr;                 /* emit HDR10 metadata OBUs (implies a color description) */
+  int mastering_display[8]; /* r, g, b, white: x, y in 1/65536 units (0: none) */
+  int max_luma, min_luma;  /* mastering luminance, 0: defaults 1000 nits / 1 centinit */
+  int max_cll, max_fall;   /* content light level in cd/m^2 (-1: none) */
+  /* rate control */
+  int rc;              /* MAV1_RC_CQP (default), MAV1_RC_VBR, MAV1_RC_CBR */
+  int bitrate;         /* target bitrate in kbit/s (rc != CQP) */
+  int vbv_size;        /* rate buffer in kbits (0: 1000 ms worth) */
+  int fps_num, fps_den; /* frame rate for the rate model (0: 30/1) */
 } Mav1Config;
 
 typedef struct {

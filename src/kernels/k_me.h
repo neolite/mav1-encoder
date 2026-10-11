@@ -10,17 +10,14 @@
  * and reduces (cost, k) lexicographically, which yields the same candidate.
  * The levels (64, 32, 16, 8) depend on each other (children search around
  * the parent's vector) and run as separate dispatches. */
-#ifndef K_ME_H
-#define K_ME_H
 
-#include "k_analysis.h"
 
 /* SAD of a w x w block against the reference at full-pel offset (dy, dx),
  * with reference coordinates clamped to the frame like the predictor. */
 #ifdef __METAL_VERSION__
 /* 4x4 SATD of the rows of differences r0..r3 (vertical butterflies on the
  * row vectors, then horizontal ones): equals satd4x4. */
-INLINE int satd4x4_v(int4 r0, int4 r1, int4 r2, int4 r3) {
+INLINE int KNAME(satd4x4_v)(int4 r0, int4 r1, int4 r2, int4 r3) {
   int4 a0 = r0 + r1, a1 = r0 - r1, a2 = r2 + r3, a3 = r2 - r3;
   int4 t[4] = {a0 + a2, a1 + a3, a0 - a2, a1 - a3};
   int s = 0;
@@ -36,16 +33,26 @@ INLINE int satd4x4_v(int4 r0, int4 r1, int4 r2, int4 r3) {
 
 /* rs > 1 (turbo T_ME_RSUB): rows are strided and the sum scaled back, a
  * subsampled SAD for the small refinement windows. */
-INLINE int me_sad(DEV const uint8_t *src, DEV const uint8_t *ref, int stride, int frameW, int frameH, int x, int y,
-                  int w, int dy, int dx, int rs) {
+#ifdef __METAL_VERSION__
+#if MAV1_BD == 10
+#define KP4 packed_ushort4
+#define KV4 ushort4
+#else
+#define KP4 packed_uchar4
+#define KV4 uchar4
+#endif
+#endif
+
+INLINE int KNAME(me_sad)(DEV const KPIX *src, DEV const KPIX *ref, int stride, int frameW, int frameH, int x, int y,
+                         int w, int dy, int dx, int rs) {
 #ifdef __METAL_VERSION__
   if (x + dx >= 0 && x + dx + w <= frameW && y + dy >= 0 && y + dy + w <= frameH) {
     /* no clamping: 4 samples per load */
     uint4 acc = 0;
     for (int i = 0; i < w; i += rs) {
-      DEV const packed_uchar4 *s = (DEV const packed_uchar4 *)(src + (y + i) * stride + x);
-      DEV const packed_uchar4 *r = (DEV const packed_uchar4 *)(ref + (y + i + dy) * stride + x + dx);
-      for (int j = 0; j < (w >> 2); j++) acc += uint4(absdiff(uchar4(s[j]), uchar4(r[j])));
+      DEV const KP4 *s = (DEV const KP4 *)(src + (y + i) * stride + x);
+      DEV const KP4 *r = (DEV const KP4 *)(ref + (y + i + dy) * stride + x + dx);
+      for (int j = 0; j < (w >> 2); j++) acc += uint4(absdiff(KV4(s[j]), KV4(r[j])));
     }
     return (int)(acc.x + acc.y + acc.z + acc.w) * rs;
   }
@@ -53,8 +60,8 @@ INLINE int me_sad(DEV const uint8_t *src, DEV const uint8_t *ref, int stride, in
   int sad = 0;
   for (int i = 0; i < w; i += rs) {
     int ry = Clip3(0, frameH - 1, y + i + dy);
-    DEV const uint8_t *s = src + (y + i) * stride + x;
-    DEV const uint8_t *r = ref + ry * stride;
+    DEV const KPIX *s = src + (y + i) * stride + x;
+    DEV const KPIX *r = ref + ry * stride;
     for (int j = 0; j < w; j++) {
       int rx = Clip3(0, frameW - 1, x + j + dx);
       sad += k_abs((int)s[j] - (int)r[rx]);
@@ -73,7 +80,7 @@ typedef struct {
   int count;         /* candidates of the current stage */
   int pr, pc;        /* parent's vector (1/8 pel; levels > 0) */
   int copy;          /* turbo: take the parent's vector without searching */
-} MeNode;
+} KNAME(MeNode);
 
 /* turbo bits (FrameParams.turbo) of the motion search */
 #define T_ME_CR1 2     /* children search +-1 full-pel around the parent */
@@ -90,8 +97,8 @@ typedef struct {
 #define T_ME_USUB 262144 /* sub-pel SATD on every other 4x4 unit for blocks >= 32 */
 #define T_ME_G3COPY 16384 /* leaf frames: 8x8 nodes of the second reference take the 16x16 parent's vector */
 #define T_ME_HALF01 32768 /* 64x64 and 32x32 nodes: half-pel refinement only */
-INLINE int me_min_step(DEV const FrameParams *fp, int w) { return w >= 32 && (FPT(fp) & T_ME_HALF01) ? 4 : 2; }
-INLINE int me_gold_copy(DEV const FrameParams *fp, int level) {
+INLINE int KNAME(me_min_step)(DEV const FrameParams *fp, int w) { return w >= 32 && (FPT(fp) & T_ME_HALF01) ? 4 : 2; }
+INLINE int KNAME(me_gold_copy)(DEV const FrameParams *fp, int level) {
   return level == 3 && (FPT(fp) & T_ME_G3COPY) && fp->leaf && !fp->frame_is_intra;
 }
 
@@ -100,27 +107,34 @@ INLINE int me_gold_copy(DEV const FrameParams *fp, int level) {
  * plane (T_ME_DEC), then the decimated source. Entries are reused across
  * frames for the same reference picture. */
 #define ME_QP_ENTRIES 3
-INLINE int dec_w(DEV const FrameParams *fp) { return (fp->frame_w + 3) >> 2; }
-INLINE int dec_h(DEV const FrameParams *fp) { return (fp->frame_h + 3) >> 2; }
-INLINE long qp_entry_bytes(DEV const FrameParams *fp) {
-  return 16L * fp->frame_w * fp->frame_h + (long)dec_w(fp) * dec_h(fp);
+INLINE int KNAME(dec_w)(DEV const FrameParams *fp) { return (fp->frame_w + 3) >> 2; }
+INLINE int KNAME(dec_h)(DEV const FrameParams *fp) { return (fp->frame_h + 3) >> 2; }
+/* samples (of the bitdepth's element size) of one plane-buffer entry; the
+ * byte size for host-side offsets is qp_entry_bytes below */
+INLINE long KNAME(qp_plane_samples)(DEV const FrameParams *fp) {
+  return 16L * fp->frame_w * fp->frame_h + (long)KNAME(dec_w)(fp) * KNAME(dec_h)(fp);
 }
-/* decimated plane of an entry */
-INLINE DEV const uint8_t *qp_dec(DEV const FrameParams *fp, DEV const uint8_t *entry) {
+/* byte size of one plane-buffer entry (host side: buffer offsets, Metal
+ * bindings; bitdepth dependent through fp->bitdepth) */
+INLINE long KNAME(qp_entry_bytes)(DEV const FrameParams *fp) {
+  return KNAME(qp_plane_samples)(fp) * (fp->bitdepth > 8 ? 2 : 1);
+}
+/* decimated plane of an entry (KPIX elements) */
+INLINE DEV const KPIX *KNAME(qp_dec)(DEV const FrameParams *fp, DEV const KPIX *entry) {
   return entry + 16L * fp->frame_w * fp->frame_h;
 }
-INLINE void dec_build(DEV const FrameParams *fp, DEV const uint8_t *pl, DEV uint8_t *out, int y, int x) {
+INLINE void KNAME(dec_build)(DEV const FrameParams *fp, DEV const KPIX *pl, DEV KPIX *out, int y, int x) {
   int s = 0;
   for (int i = 0; i < 4; i++)
     for (int j = 0; j < 4; j++)
       s += pl[fp->offset[0] + Clip3(0, fp->frame_h - 1, 4 * y + i) * fp->stride[0] + Clip3(0, fp->frame_w - 1, 4 * x + j)];
-  out[(size_t)y * dec_w(fp) + x] = (uint8_t)((s + 8) >> 4);
+  out[(size_t)y * KNAME(dec_w)(fp) + x] = (KPIX)((s + 8) >> 4);
 }
 /* SAD x16 of the w x w block at (x, y) on the decimated planes, offset
  * (dy, dx) (multiples of 4). */
-INLINE int dec_sad(DEV const FrameParams *fp, DEV const uint8_t *ds, DEV const uint8_t *dr, int x, int y, int w, int dy,
+INLINE int KNAME(dec_sad)(DEV const FrameParams *fp, DEV const KPIX *ds, DEV const KPIX *dr, int x, int y, int w, int dy,
                    int dx) {
-  int W = dec_w(fp), H = dec_h(fp), n = w >> 2, x0 = x >> 2, y0 = y >> 2, oy = dy >> 2, ox = dx >> 2, sad = 0;
+  int W = KNAME(dec_w)(fp), H = KNAME(dec_h)(fp), n = w >> 2, x0 = x >> 2, y0 = y >> 2, oy = dy >> 2, ox = dx >> 2, sad = 0;
   for (int i = 0; i < n; i++) {
     int sy = k_min(y0 + i, H - 1), ry = Clip3(0, H - 1, y0 + i + oy);
     for (int j = 0; j < n; j++)
@@ -131,15 +145,15 @@ INLINE int dec_sad(DEV const FrameParams *fp, DEV const uint8_t *ds, DEV const u
 
 /* Turbo: the node's search ends with the parent's vector (copy node, or the
  * full-pel winner is the parent's own position). */
-INLINE int me_take_parent(DEV const FrameParams *fp, int level, THR const MeNode *m, int by, int bx) {
+INLINE int KNAME(me_take_parent)(DEV const FrameParams *fp, int level, THR const KNAME(MeNode) *m, int by, int bx) {
   return level > 0 && (m->copy || ((FPT(fp) & T_ME_KEEP) && by == m->cy && bx == m->cx));
 }
 
 #define ME_COARSE_STEP 4
 #define ME_REFINE 3
 
-INLINE MeNode me_node(DEV const FrameParams *fp, int sbIdx, int level, int i, DEV const int32_t *mvField) {
-  MeNode m;
+INLINE KNAME(MeNode) KNAME(me_node)(DEV const FrameParams *fp, int sbIdx, int level, int i, DEV const int32_t *mvField) {
+  KNAME(MeNode) m;
   int sbRow = sbIdx / fp->sb_cols, sbCol = sbIdx % fp->sb_cols;
   int n = 1 << level;
   m.w = 64 >> level;
@@ -159,7 +173,7 @@ INLINE MeNode me_node(DEV const FrameParams *fp, int sbIdx, int level, int i, DE
     m.cy = par[0] >> 3;
     m.cx = par[1] >> 3;
     m.range = k_min(m.range, (FPT(fp) & T_ME_CR1) ? 1 : (FPT(fp) & T_ME_CR2) ? 2 : 4);
-    m.copy = ((FPT(fp) & T_ME_L3COPY) || leaf_no8(fp)) && level == 3;
+    m.copy = ((FPT(fp) & T_ME_L3COPY) || KNAME(leaf_no8)(fp)) && level == 3;
   }
   m.step = 1;
   m.stages = 1;
@@ -179,7 +193,7 @@ INLINE MeNode me_node(DEV const FrameParams *fp, int sbIdx, int level, int i, DE
 
 /* Later stages of level 0: +-4 step-4 on the decimated planes (middle stage
  * of T_ME_HME3), then +-3 (+-2 with T_ME_REF2) full-pel around the winner. */
-INLINE void me_refine_stage(DEV const FrameParams *fp, THR MeNode *m, int wy, int wx, int stage) {
+INLINE void KNAME(me_refine_stage)(DEV const FrameParams *fp, THR KNAME(MeNode) *m, int wy, int wx, int stage) {
   m->cy = wy;
   m->cx = wx;
   if (stage == 1 && (FPT(fp) & T_ME_HME3)) {
@@ -196,7 +210,7 @@ INLINE void me_refine_stage(DEV const FrameParams *fp, THR MeNode *m, int wy, in
 /* Candidate k of the current stage: 0 is the grid centre ((0, 0) at level 0,
  * the parent's vector below, the coarse winner when refining), then the grid
  * around the centre in raster order. */
-INLINE void me_candidate(THR const MeNode *m, int k, THR int *dy, THR int *dx) {
+INLINE void KNAME(me_candidate)(THR const KNAME(MeNode) *m, int k, THR int *dy, THR int *dx) {
   if (k == 0) {
     *dy = m->cy;
     *dx = m->cx;
@@ -208,67 +222,70 @@ INLINE void me_candidate(THR const MeNode *m, int k, THR int *dy, THR int *dx) {
   *dx = m->cx - m->range + (k % side) * m->step;
 }
 
-INLINE int me_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref, DEV const uint8_t *ds,
-                   DEV const uint8_t *dr, THR const MeNode *m, int dy, int dx) {
+INLINE int KNAME(me_cost)(DEV const FrameParams *fp, DEV const KPIX *src, DEV const KPIX *ref, DEV const KPIX *ds,
+                          DEV const KPIX *dr, THR const KNAME(MeNode) *m, int dy, int dx) {
   int bits = 2 + 2 * FloorLog2(k_abs(dy) * 8 + 1) + 2 * FloorLog2(k_abs(dx) * 8 + 1);
   if ((FPT(fp) & T_ME_DEC) && m->step >= ME_COARSE_STEP)
-    return dec_sad(fp, ds, dr, m->x, m->y, m->w, dy, dx) + fp->ac_q[0] * bits / 64;
+    return KNAME(dec_sad)(fp, ds, dr, m->x, m->y, m->w, dy, dx) + fp->ac_q[0] * bits / (64 >> (2 * fp->coeff_shift));
   int rs = (FPT(fp) & T_ME_RSUB) && m->step == 1 ? 2 : 1;
-  return me_sad(src + fp->offset[0], ref + fp->offset[0], fp->stride[0], fp->frame_w, fp->frame_h, m->x, m->y, m->w,
-                dy, dx, rs) +
-         fp->ac_q[0] * bits / 64;
+  return KNAME(me_sad)(src + fp->offset[0], ref + fp->offset[0], fp->stride[0], fp->frame_w, fp->frame_h, m->x, m->y,
+                       m->w, dy, dx, rs) +
+         fp->ac_q[0] * bits / (64 >> (2 * fp->coeff_shift));
 }
 
 /* Scratch of one sub-pel evaluation: a w x w byte prediction and the
  * (w + 7) x w filter intermediate. Nodes of a level run concurrently, and on
  * the GPU 9 lanes per node evaluate sub-pel candidates concurrently. */
-INLINE int me_slot(int level) {
+INLINE int KNAME(me_slot)(int level) {
+  /* KPIX prediction (2 int32 units per 4 samples at 10 bit) + int32 filter
+   * intermediate; ME_SB_INTS below is the bd-independent upper bound */
   int w = 64 >> level;
-  return (w * w + 3) / 4 + (w + 7) * w;
+  return (w * w + 3) / 4 * (MAV1_BD == 10 ? 2 : 1) + (w + 7) * w;
 }
-INLINE int me_node_scratch(int level, int i) { return i * me_slot(level); }
+INLINE int KNAME(me_node_scratch)(int level, int i) { return i * KNAME(me_slot)(level); }
 #define ME_LANES 9
-#define ME_SB_INTS (64 * ME_LANES * (16 + 15 * 8)) /* level 3 is the largest */
+#define ME_SB_INTS (64 * ME_LANES * (16 + 19 * 8)) /* level 3 is the largest (10 bit) */
 
 /* Sub-pel neighbour k (0..7) at distance step, in 1/8 units. */
-INLINE void me_neighbour(int k, int step, THR int *dr, THR int *dc) {
+INLINE void KNAME(me_neighbour)(int k, int step, THR int *dr, THR int *dc) {
   *dr = (k < 3) ? -step : (k < 5 ? 0 : step);
   *dc = (k == 0 || k == 3 || k == 5) ? -step : ((k == 1 || k == 6) ? 0 : step);
 }
 
 /* Sub-pel neighbour j (0 .. me_nb_count - 1) of the turbo set. */
-INLINE int me_nb_count(DEV const FrameParams *fp) { return (FPT(fp) & T_ME_CROSS) ? 4 : 8; }
-INLINE void me_nb(DEV const FrameParams *fp, int j, int step, THR int *dr, THR int *dc) {
-  me_neighbour((FPT(fp) & T_ME_CROSS) ? (j == 0 ? 1 : j == 1 ? 3 : j == 2 ? 4 : 6) : j, step, dr, dc);
+INLINE int KNAME(me_nb_count)(DEV const FrameParams *fp) { return (FPT(fp) & T_ME_CROSS) ? 4 : 8; }
+INLINE void KNAME(me_nb)(DEV const FrameParams *fp, int j, int step, THR int *dr, THR int *dc) {
+  KNAME(me_neighbour)((FPT(fp) & T_ME_CROSS) ? (j == 0 ? 1 : j == 1 ? 3 : j == 2 ? 4 : 6) : j, step, dr, dc);
 }
 
-INLINE int me_unit_satd_hp(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
-                           DEV const uint8_t *hp, THR const MeNode *m, int mvr, int mvc, int u);
-INLINE int me_subpel_cost(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
-                          DEV const uint8_t *hp, THR const MeNode *m, int mvr, int mvc, DEV int32_t *scratch) {
+INLINE int KNAME(me_unit_satd_hp)(DEV const FrameParams *fp, DEV const KPIX *src, DEV const KPIX *ref,
+                                  DEV const KPIX *hp, THR const KNAME(MeNode) *m, int mvr, int mvc, int u);
+INLINE int KNAME(me_subpel_cost)(DEV const FrameParams *fp, DEV const KPIX *src, DEV const KPIX *ref,
+                                 DEV const KPIX *hp, THR const KNAME(MeNode) *m, int mvr, int mvc, DEV int32_t *scratch) {
   if (FPT(fp) & T_ME_HPEL) {
     int s = 0, nu = (m->w >> 2) * (m->w >> 2), st = (FPT(fp) & T_ME_USUB) && m->w >= 32 ? 2 : 1;
-    for (int u = 0; u < nu; u += st) s += me_unit_satd_hp(fp, src, ref, hp, m, mvr, mvc, u);
+    for (int u = 0; u < nu; u += st) s += KNAME(me_unit_satd_hp)(fp, src, ref, hp, m, mvr, mvc, u);
     return s * st;
   }
-  DEV uint8_t *pred = (DEV uint8_t *)scratch;
-  predict_inter_block(ref + fp->offset[0], fp->stride[0], fp->frame_w, fp->frame_h, pred, m->w, m->x, m->y, m->w,
-                      m->w, mvr, mvc, 0, 0, EIGHTTAP, scratch + (m->w * m->w + 3) / 4);
-  return block_satd_s(src + fp->offset[0] + m->y * fp->stride[0] + m->x, fp->stride[0], pred, m->w, m->w, m->w);
+  DEV KPIX *pred = (DEV KPIX *)scratch;
+  KNAME(predict_inter_block)(ref + fp->offset[0], fp->stride[0], fp->frame_w, fp->frame_h, pred, m->w, m->x, m->y, m->w,
+                             m->w, mvr, mvc, 0, 0, EIGHTTAP, scratch + (m->w * m->w + 3) / 4 * (MAV1_BD == 10 ? 2 : 1),
+                             fp->px_max);
+  return KNAME(block_satd_s)(src + fp->offset[0] + m->y * fp->stride[0] + m->x, fp->stride[0], pred, m->w, m->w, m->w);
 }
 
 /* Sub-pel refinement around the full-pel winner: steps of 4 (half) then 2
  * (quarter) in 1/8 units, first minimum of the 8 neighbours per step. */
-INLINE void me_finish(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref, DEV const uint8_t *hp,
-                      THR const MeNode *m, int by, int bx, DEV int32_t *out, DEV int32_t *scratch) {
+INLINE void KNAME(me_finish)(DEV const FrameParams *fp, DEV const KPIX *src, DEV const KPIX *ref, DEV const KPIX *hp,
+                             THR const KNAME(MeNode) *m, int by, int bx, DEV int32_t *out, DEV int32_t *scratch) {
   int mvr = m->stages ? by * 8 : m->pr, mvc = m->stages ? bx * 8 : m->pc;
-  int bestS = me_subpel_cost(fp, src, ref, hp, m, mvr, mvc, scratch);
-  for (int step = 4; step >= me_min_step(fp, m->w); step >>= 1) {
+  int bestS = KNAME(me_subpel_cost)(fp, src, ref, hp, m, mvr, mvc, scratch);
+  for (int step = 4; step >= KNAME(me_min_step)(fp, m->w); step >>= 1) {
     int cr = mvr, cc = mvc;
-    for (int k = 0; k < me_nb_count(fp); k++) {
+    for (int k = 0; k < KNAME(me_nb_count)(fp); k++) {
       int dr, dc;
-      me_nb(fp, k, step, &dr, &dc);
-      int c = me_subpel_cost(fp, src, ref, hp, m, cr + dr, cc + dc, scratch);
+      KNAME(me_nb)(fp, k, step, &dr, &dc);
+      int c = KNAME(me_subpel_cost)(fp, src, ref, hp, m, cr + dr, cc + dc, scratch);
       if (c < bestS) {
         bestS = c;
         mvr = cr + dr;
@@ -286,12 +303,12 @@ INLINE void me_finish(DEV const FrameParams *fp, DEV const uint8_t *src, DEV con
  * (plane 0 is the reference itself). Layout: qp[((r * 16) + k) * W * H].
  * The motion search reads its sub-pel candidates from them; the coded
  * prediction stays normative. */
-INLINE void qpel_build(DEV const FrameParams *fp, DEV const uint8_t *ref, DEV uint8_t *qp, int y, int x) {
-  DEV const uint8_t *rp = ref + fp->offset[0];
+INLINE void KNAME(qpel_build)(DEV const FrameParams *fp, DEV const KPIX *ref, DEV KPIX *qp, int y, int x) {
+  DEV const KPIX *rp = ref + fp->offset[0];
   int stride = fp->stride[0], W = fp->frame_w, H = fp->frame_h;
   int hrow[4][8];
   for (int t = 0; t < 8; t++) {
-    DEV const uint8_t *row = rp + Clip3(0, H - 1, y + t - 3) * stride;
+    DEV const KPIX *row = rp + Clip3(0, H - 1, y + t - 3) * stride;
     int px[8];
     for (int u = 0; u < 8; u++) px[u] = row[Clip3(0, W - 1, x + u - 3)];
     for (int fx = 0; fx < 4; fx++) {
@@ -307,44 +324,45 @@ INLINE void qpel_build(DEV const FrameParams *fp, DEV const uint8_t *ref, DEV ui
     for (int fx = 0; fx < 4; fx++) {
       int s = 0;
       for (int t = 0; t < 8; t++) s += f[t] * hrow[fx][t];
-      qp[(size_t)(fy * 4 + fx) * n + o] = (uint8_t)Clip1(Round2(s, 11));
+      qp[(size_t)(fy * 4 + fx) * n + o] = (KPIX)Clip3(0, fp->px_max, Round2(s, 11));
     }
   }
 }
 
 /* SATD of 4x4 unit u of the node against the quarter-pel-plane prediction
  * at (mvr, mvc) (even, 1/8 units). */
-INLINE int me_unit_satd_hp(DEV const FrameParams *fp, DEV const uint8_t *src, DEV const uint8_t *ref,
-                           DEV const uint8_t *qp, THR const MeNode *m, int mvr, int mvc, int u) {
+INLINE int KNAME(me_unit_satd_hp)(DEV const FrameParams *fp, DEV const KPIX *src, DEV const KPIX *ref,
+                                  DEV const KPIX *qp, THR const KNAME(MeNode) *m, int mvr, int mvc, int u) {
+  (void)ref;
   int W = fp->frame_w, H = fp->frame_h;
   int nu = m->w >> 2;
   int ux = m->x + (u % nu) * 4, uy = m->y + (u / nu) * 4;
-  DEV const uint8_t *pl = qp + (size_t)(((mvr >> 1) & 3) * 4 + ((mvc >> 1) & 3)) * W * H;
+  DEV const KPIX *pl = qp + (size_t)(((mvr >> 1) & 3) * 4 + ((mvc >> 1) & 3)) * W * H;
   int iy = uy + (mvr >> 3), ix = ux + (mvc >> 3);
-  DEV const uint8_t *sp = src + fp->offset[0] + uy * fp->stride[0] + ux;
+  DEV const KPIX *sp = src + fp->offset[0] + uy * fp->stride[0] + ux;
 #ifdef __METAL_VERSION__
   if (iy >= 0 && iy + 4 <= H && ix >= 0 && ix + 4 <= W) {
     int4 r[4];
     for (int k = 0; k < 4; k++)
-      r[k] = int4(uchar4(*(DEV const packed_uchar4 *)(sp + k * fp->stride[0]))) -
-             int4(uchar4(*(DEV const packed_uchar4 *)(pl + (size_t)(iy + k) * W + ix)));
-    return satd4x4_v(r[0], r[1], r[2], r[3]);
+      r[k] = int4(KV4(*(DEV const KP4 *)(sp + k * fp->stride[0]))) -
+             int4(KV4(*(DEV const KP4 *)(pl + (size_t)(iy + k) * W + ix)));
+    return KNAME(satd4x4_v)(r[0], r[1], r[2], r[3]);
   }
 #endif
   int32_t d[16];
   for (int r = 0; r < 4; r++) {
-    DEV const uint8_t *row = pl + (size_t)Clip3(0, H - 1, iy + r) * W;
+    DEV const KPIX *row = pl + (size_t)Clip3(0, H - 1, iy + r) * W;
     for (int c = 0; c < 4; c++) d[r * 4 + c] = (int)sp[r * fp->stride[0] + c] - (int)row[Clip3(0, W - 1, ix + c)];
   }
-  return satd4x4(d);
+  return KNAME(satd4x4)(d);
 }
 
 /* Serial search of one node (CPU backend). */
-INLINE void me_node_serial(DEV const FrameParams *fp, int sbIdx, int level, int i, DEV const uint8_t *src,
-                           DEV const uint8_t *ref, DEV const uint8_t *hp, DEV const uint8_t *ds, DEV const uint8_t *dr,
-                           DEV int32_t *mvField, DEV int32_t *scratch, int isGold) {
-  MeNode m = me_node(fp, sbIdx, level, i, mvField);
-  if (isGold && me_gold_copy(fp, level)) m.copy = 1;
+INLINE void KNAME(me_node_serial)(DEV const FrameParams *fp, int sbIdx, int level, int i, DEV const KPIX *src,
+                                  DEV const KPIX *ref, DEV const KPIX *hp, DEV const KPIX *ds, DEV const KPIX *dr,
+                                  DEV int32_t *mvField, DEV int32_t *scratch, int isGold) {
+  KNAME(MeNode) m = KNAME(me_node)(fp, sbIdx, level, i, mvField);
+  if (isGold && KNAME(me_gold_copy)(fp, level)) m.copy = 1;
   DEV int32_t *out = mvField + (sbIdx * NUM_NODES + NODE_BASE(level) + i) * 2;
   if (!m.valid) {
     out[0] = out[1] = 0;
@@ -357,12 +375,12 @@ INLINE void me_node_serial(DEV const FrameParams *fp, int sbIdx, int level, int 
     return;
   }
   for (int stage = 0; stage < m.stages; stage++) {
-    if (stage > 0) me_refine_stage(fp, &m, by, bx, stage);
+    if (stage > 0) KNAME(me_refine_stage)(fp, &m, by, bx, stage);
     int best = -1;
     for (int k = 0; k < m.count; k++) {
       int dy, dx;
-      me_candidate(&m, k, &dy, &dx);
-      int c = me_cost(fp, src, ref, ds, dr, &m, dy, dx);
+      KNAME(me_candidate)(&m, k, &dy, &dx);
+      int c = KNAME(me_cost)(fp, src, ref, ds, dr, &m, dy, dx);
       if (best < 0 || c < best) {
         best = c;
         by = dy;
@@ -370,12 +388,10 @@ INLINE void me_node_serial(DEV const FrameParams *fp, int sbIdx, int level, int 
       }
     }
   }
-  if (me_take_parent(fp, level, &m, by, bx)) {
+  if (KNAME(me_take_parent)(fp, level, &m, by, bx)) {
     out[0] = m.pr;
     out[1] = m.pc;
     return;
   }
-  me_finish(fp, src, ref, hp, &m, by, bx, out, scratch + me_node_scratch(level, i));
+  KNAME(me_finish)(fp, src, ref, hp, &m, by, bx, out, scratch + KNAME(me_node_scratch)(level, i));
 }
-
-#endif

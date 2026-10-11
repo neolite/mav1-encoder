@@ -1,8 +1,7 @@
 /* Forward/inverse transform consistency over every tx size and type. */
 #include <stdio.h>
 #include <stdlib.h>
-#include "../src/kernels/k_fwd.h"
-#include "../src/kernels/k_scan.h"
+#include "../src/kernels/kernel_set.h"
 #include "../src/fwd_matrices.h"
 
 int main(void) {
@@ -30,7 +29,7 @@ int main(void) {
         static int32_t fl[4096];
         for (int i = 0; i < h; i++)
           for (int j = 0; j < w; j++) fl[i * 64 + j] = resid[(fud ? h - 1 - i : i) * 64 + (flr ? w - 1 - j : j)];
-        fwd_2d(fl, coef, txSz, t, mats, tmp);
+        KNAME(fwd_2d)(fl, coef, txSz, t, mats, tmp);
         for (int k = 0; k < 4096; k++) dq[k] = 0;
         for (int i = 0; i < 32 && i < h; i++)
           for (int j = 0; j < 32 && j < w; j++) {

@@ -8,12 +8,8 @@
 #include <dispatch/dispatch.h>
 
 #include "enc_internal.h"
-#include "kernels/k_intra.h"
-#include "kernels/k_scan.h"
+#include "kernels/kernel_set.h"
 #include "mvpred.h"
-#include "kernels/k_analysis.h"
-#include "kernels/k_recon.h"
-#include "kernels/k_lr.h"
 
 typedef struct {
   struct Mav1Encoder *e;
@@ -276,7 +272,7 @@ static void write_intra_modes(Tile *t, const BlockInfo *b, int availU, int avail
   } else {
     ec_symbol(&t->ec, b->y_mode, t->cdf.y_mode[Size_Group[bs]], INTRA_MODES);
   }
-  if (intra_is_directional(b->y_mode))
+  if (KNAME(intra_is_directional)(b->y_mode))
     ec_symbol(&t->ec, b->angle_y + MAX_ANGLE_DELTA, t->cdf.angle_delta[b->y_mode - V_PRED], 2 * MAX_ANGLE_DELTA + 1);
   /* HasChroma: always for blocks of at least 8x8. */
   int bw = Block_Width(bs), bh = Block_Height(bs);
@@ -293,7 +289,7 @@ static void write_intra_modes(Tile *t, const BlockInfo *b, int availU, int avail
     if (signU) ec_symbol(&t->ec, k_abs(au) - 1, t->cdf.cfl_alpha[(signU - 1) * 3 + signV], CFL_ALPHABET_SIZE);
     if (signV) ec_symbol(&t->ec, k_abs(av) - 1, t->cdf.cfl_alpha[(signV - 1) * 3 + signU], CFL_ALPHABET_SIZE);
   }
-  if (intra_is_directional(b->uv_mode))
+  if (KNAME(intra_is_directional)(b->uv_mode))
     ec_symbol(&t->ec, b->angle_uv + MAX_ANGLE_DELTA, t->cdf.angle_delta[b->uv_mode - V_PRED], 2 * MAX_ANGLE_DELTA + 1);
 }
 
@@ -448,10 +444,10 @@ static void write_block(Tile *t, const BlockInfo *b) {
     if (startX >= maxX || startY >= maxY) continue;
     const int32_t *q = coefs + b->coef_off[plane] + txIdx * tw * th;
     int planeTxType = lossless ? DCT_DCT
-                      : plane == 0 ? tx_type_get(b, txIdx)
+                      : plane == 0 ? KNAME(tx_type_get)(b, txIdx)
                                    : chroma_tx_type(txSz, b->is_inter, b->uv_mode, b->tx_type, 0);
     txIdx++;
-    int eob = find_eob(q, get_scan(txSz, planeTxType), seg_eob(txSz));
+    int eob = KNAME(find_eob)(q, get_scan(txSz, planeTxType), seg_eob(txSz));
     write_coeffs(t, plane, startX, startY, txSz, bs, q, eob, planeTxType,
                  b->is_inter, b->y_mode);
       }
@@ -540,10 +536,10 @@ static void write_partition(Tile *t, int r, int c, int bSize, const BlockInfo *b
     write_partition(t, r + half, c + half, sub, blocks, k, n);
     return;
   }
-  int nb = part_count(ENC_PARAMS(e), p, r, c, half);
+  int nb = KNAME(part_count)(ENC_PARAMS(e), p, r, c, half);
   for (int i = 0; i < nb; i++) {
     int dr, dc;
-    int bs = part_block(p, bSize, i, half, &dr, &dc);
+    int bs = KNAME(part_block)(p, bSize, i, half, &dr, &dc);
     if (*k >= n || blocks[*k].mi_row != r + dr || blocks[*k].mi_col != c + dc || blocks[*k].bsize != bs) abort();
     write_block(t, &blocks[*k]);
     (*k)++;

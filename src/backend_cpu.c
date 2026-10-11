@@ -1,7 +1,10 @@
 /* CPU backend: runs the kernels as plain C on Grand Central Dispatch
  * worker threads, following the same dispatch structure as the Metal
  * backend (one work item per superblock, wavefront order for the
- * reconstruction). */
+ * reconstruction).
+ *
+ * The kernels are instantiated per bitdepth (MAV1_BD 10 then 8) and the
+ * stages dispatch on fp->bitdepth at run time. */
 #include <dispatch/dispatch.h>
 #include <stdlib.h>
 #include <stdatomic.h>
@@ -9,69 +12,107 @@
 
 #include "backend.h"
 #include "enc_internal.h"
-#include "kernels/k_analysis.h"
-#include "kernels/k_recon.h"
-#include "kernels/k_me.h"
-#include "kernels/k_lf.h"
-#include "kernels/k_cdef.h"
-#include "kernels/k_lr.h"
 
-typedef struct {
-  Backend base;
-} CpuBackend;
-
-static void cpu_motion_search(Backend *b, struct Mav1Encoder *e) {
-  (void)b;
-  const FrameParams *fp = ENC_PARAMS(e);
-  int nref = fp->golden ? 2 : 1;
-  /* plane buffer entries 0 (LAST) and 1 (second reference), rebuilt every frame */
-  uint8_t *qp = e->hpel.base, *srcDec = qp + ME_QP_ENTRIES * qp_entry_bytes(fp);
-  if (fp->turbo & T_ME_HPEL) {
-    int W = fp->frame_w, H = fp->frame_h;
-    dispatch_apply((size_t)H * (nref + 1), DISPATCH_APPLY_AUTO, ^(size_t g) {
-      int r = (int)g / H, y = (int)g % H;
-      for (int x = 0; x < W; x++) {
-        int dec = (fp->turbo & T_ME_DEC) && y < dec_h(fp) && x < dec_w(fp);
-        if (r == nref) {
-          if (dec) dec_build(fp, e->src.base, srcDec, y, x);
-          continue;
-        }
-        uint8_t *ent = qp + r * qp_entry_bytes(fp);
-        qpel_build(fp, r ? e->gold.base : e->ref.base, ent, y, x);
-        if (dec) dec_build(fp, r ? e->gold.base : e->ref.base, ent + 16L * W * H, y, x);
-      }
-    });
+#define DEFINE_STAGES \
+  static void KNAME(cpu_motion_search)(Backend *b, struct Mav1Encoder *e) { \
+    (void)b; \
+    const FrameParams *fp = ENC_PARAMS(e); \
+    int nref = fp->golden ? 2 : 1; \
+    /* plane buffer entries 0 (LAST) and 1 (second reference), rebuilt every frame */ \
+    KPIX *qp = (KPIX *)e->hpel.base, *srcDec = qp + ME_QP_ENTRIES * KNAME(qp_plane_samples)(fp); \
+    if (fp->turbo & T_ME_HPEL) { \
+      int W = fp->frame_w, H = fp->frame_h; \
+      dispatch_apply((size_t)H * (nref + 1), DISPATCH_APPLY_AUTO, ^(size_t g) { \
+        int r = (int)g / H, y = (int)g % H; \
+        for (int x = 0; x < W; x++) { \
+          int dec = (fp->turbo & T_ME_DEC) && y < KNAME(dec_h)(fp) && x < KNAME(dec_w)(fp); \
+          if (r == nref) { \
+            if (dec) KNAME(dec_build)(fp, (const KPIX *)e->src.base, srcDec, y, x); \
+            continue; \
+          } \
+          KPIX *ent = qp + r * KNAME(qp_plane_samples)(fp); \
+          KNAME(qpel_build)(fp, r ? (const KPIX *)e->gold.base : (const KPIX *)e->ref.base, ent, y, x); \
+          if (dec) KNAME(dec_build)(fp, r ? (const KPIX *)e->gold.base : (const KPIX *)e->ref.base, ent + 16L * W * H, y, x); \
+        } \
+      }); \
+    } \
+    for (int level = 0; level < 4; level++) { \
+      int nn = 1 << (2 * level), nodes = e->num_sbs * nn; \
+      /* LAST then GOLDEN nodes; each reference uses its half of the SB scratch */ \
+      dispatch_apply((size_t)nodes * nref, DISPATCH_APPLY_AUTO, ^(size_t g) { \
+        int r = (int)g / nodes, sb = ((int)g % nodes) / nn, i = (int)g % nn; \
+        KNAME(me_node_serial)(fp, sb, level, i, (const KPIX *)e->src.base, \
+                              r ? (const KPIX *)e->gold.base : (const KPIX *)e->ref.base, \
+                              qp + r * KNAME(qp_plane_samples)(fp), srcDec, \
+                              KNAME(qp_dec)(fp, qp + r * KNAME(qp_plane_samples)(fp)), \
+                              (int32_t *)(r ? e->mvgold.base : e->mvfield.base), \
+                              (int32_t *)e->scratch.base + (size_t)sb * SCRATCH_INTS + r * (SCRATCH_INTS / 2), r); \
+      }); \
+    } \
+  } \
+ \
+  static void KNAME(cpu_backend_analyze)(Backend *b, struct Mav1Encoder *e) { \
+    (void)b; \
+    const FrameParams *fp = ENC_PARAMS(e); \
+    long *costs = (long *)e->acosts.base; \
+    BlockInfo *infos = (BlockInfo *)e->ainfos.base; \
+    dispatch_apply((size_t)e->num_sbs, DISPATCH_APPLY_AUTO, ^(size_t i) { \
+      for (int level = 0; level < 4; level++) { \
+        int ns = KNAME(level_slots)(fp, level); \
+        for (int node = 0; node < (1 << (2 * level)); node++) \
+          for (int slot = 0; slot < ns; slot++) \
+            KNAME(analyze_item)(fp, (int)i, level, node, slot, (const KPIX *)e->src.base, \
+                                (const KPIX *)e->ref.base, (const KPIX *)e->gold.base, \
+                                (const int32_t *)e->mvfield.base, (const int32_t *)e->mvgold.base, \
+                                costs, infos, (int32_t *)e->scratch.base + i * SCRATCH_INTS); \
+      } \
+      KNAME(analyze_sb_table)(fp, (int)i, costs, infos, ENC_BLOCKS(e), ENC_SBS(e)); \
+    }); \
+  } \
+ \
+  static void KNAME(cpu_filter)(Backend *b, struct Mav1Encoder *e) { \
+    (void)b; \
+    const FrameParams *fp = ENC_PARAMS(e); \
+    const uint8_t *info = e->lfmask.base; \
+    for (int pass = 0; pass < 2; pass++) { \
+      int lines = pass == 0 ? e->mi_rows : e->mi_cols; \
+      /* work item = (plane, line); chroma lines step by 2 mi */ \
+      dispatch_apply((size_t)(3 * lines), DISPATCH_APPLY_AUTO, ^(size_t i) { \
+        int plane = (int)i / lines, line = (int)i % lines; \
+        if (plane > 0 && (line & 1)) return; \
+        KNAME(lf_line)(fp, (KPIX *)e->rec.base, info, plane, pass, line); \
+      }); \
+    } \
+    int bc = (e->mi_cols + 1) >> 1, br = (e->mi_rows + 1) >> 1; \
+    if (e->num_cdef_presets) \
+      dispatch_apply((size_t)(bc * br), DISPATCH_APPLY_AUTO, ^(size_t i) { \
+        KNAME(cdef_block_all)(fp, (KPIX *)e->rec.base, (KPIX *)e->cdefbuf.base, (long)e->frame_bytes * e->pxsize, info, \
+                              (int)(i / bc) * 2, (int)(i % bc) * 2, e->num_cdef_presets); \
+      }); \
+  } \
+ \
+  static void KNAME(cpu_restore)(Backend *b, struct Mav1Encoder *e) { \
+    (void)b; \
+    const FrameParams *fp = ENC_PARAMS(e); \
+    int rows4 = (e->h + 3) >> 2, cols4 = (e->w + 3) >> 2, n = rows4 * cols4; \
+    dispatch_apply((size_t)(3 * n), DISPATCH_APPLY_AUTO, ^(size_t g) { \
+      int plane = (int)g / n, i = (int)g % n; \
+      KNAME(lr_block)(fp, plane, i / cols4, i % cols4, (KPIX *)e->rec.base, (KPIX *)e->dbk.base, \
+                      (KPIX *)e->lrout.base, (const LrUnit *)e->lrunits.base); \
+    }); \
   }
-  for (int level = 0; level < 4; level++) {
-    int nn = 1 << (2 * level), nodes = e->num_sbs * nn;
-    /* LAST then GOLDEN nodes; each reference uses its half of the SB scratch */
-    dispatch_apply((size_t)nodes * nref, DISPATCH_APPLY_AUTO, ^(size_t g) {
-      int r = (int)g / nodes, sb = ((int)g % nodes) / nn, i = (int)g % nn;
-      me_node_serial(fp, sb, level, i, e->src.base, r ? e->gold.base : e->ref.base,
-                     qp + r * qp_entry_bytes(fp), srcDec, qp_dec(fp, qp + r * qp_entry_bytes(fp)),
-                     (int32_t *)(r ? e->mvgold.base : e->mvfield.base),
-                     (int32_t *)e->scratch.base + (size_t)sb * SCRATCH_INTS + r * (SCRATCH_INTS / 2), r);
-    });
-  }
-}
 
-void cpu_backend_analyze(Backend *b, struct Mav1Encoder *e) {
-  (void)b;
-  const FrameParams *fp = ENC_PARAMS(e);
-  long *costs = (long *)e->acosts.base;
-  BlockInfo *infos = (BlockInfo *)e->ainfos.base;
-  dispatch_apply((size_t)e->num_sbs, DISPATCH_APPLY_AUTO, ^(size_t i) {
-    for (int level = 0; level < 4; level++) {
-      int ns = level_slots(fp, level);
-      for (int node = 0; node < (1 << (2 * level)); node++)
-        for (int slot = 0; slot < ns; slot++)
-          analyze_item(fp, (int)i, level, node, slot, e->src.base, e->ref.base, e->gold.base,
-                       (const int32_t *)e->mvfield.base, (const int32_t *)e->mvgold.base,
-                       costs, infos, (int32_t *)e->scratch.base + i * SCRATCH_INTS);
-    }
-    analyze_sb_table(fp, (int)i, costs, infos, ENC_BLOCKS(e), ENC_SBS(e));
-  });
-}
+/* 10-bit instantiation (KNAME: *_10) */
+#undef MAV1_BD
+#define MAV1_BD 10
+#include "kernels/kernel_set.h"
+DEFINE_STAGES
+
+/* 8-bit instantiation (KNAME: *_8) */
+#undef MAV1_BD
+#define MAV1_BD 8
+#include "kernels/kernel_set.h"
+DEFINE_STAGES
 
 /* Superblock (r, c) needs its left and above-right neighbours inside its
  * tile column (above when it is the tile's last column): intra edges never
@@ -108,14 +149,23 @@ void *recon_sched_begin(struct Mav1Encoder *e, int extra) {
   rs->q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
   rs->g = dispatch_group_create();
   const FrameParams *fp = ENC_PARAMS(e);
+  int bd = fp->bitdepth;
   _Atomic int *deps = rs->deps;
   int (*next)[3] = rs->next;
   dispatch_queue_t q = rs->q;
   dispatch_group_t g = rs->g;
   __block void (^run)(int);
   run = Block_copy(^(int idx) {
-    recon_sb(fp, ENC_SBS(e)[idx], ENC_BLOCKS(e), e->src.base, e->rec.base, e->ref.base, e->gold.base, ENC_COEFS(e),
-             (const int32_t *)e->mats.base, (int32_t *)e->scratch.base + (size_t)idx * SCRATCH_INTS);
+    /* both instantiations index the same scratch (SCRATCH_INTS is the same
+     * for 8 and 10 bit) */
+    if (bd > 8)
+      recon_sb_10(fp, ENC_SBS(e)[idx], ENC_BLOCKS(e), (const uint16_t *)e->src.base, (uint16_t *)e->rec.base,
+                  (const uint16_t *)e->ref.base, (const uint16_t *)e->gold.base, ENC_COEFS(e),
+                  (const int32_t *)e->mats.base, (int32_t *)e->scratch.base + (size_t)idx * SCRATCH_INTS);
+    else
+      recon_sb_8(fp, ENC_SBS(e)[idx], ENC_BLOCKS(e), (const uint8_t *)e->src.base, (uint8_t *)e->rec.base,
+                 (const uint8_t *)e->ref.base, (const uint8_t *)e->gold.base, ENC_COEFS(e),
+                 (const int32_t *)e->mats.base, (int32_t *)e->scratch.base + (size_t)idx * SCRATCH_INTS);
     for (int j = 0; j < next[idx][0]; j++) {
       int d = next[idx][1 + j];
       if (atomic_fetch_sub(&deps[d], 1) == 1) dispatch_group_async(g, q, ^{ run(d); });
@@ -155,37 +205,21 @@ void cpu_backend_recon(Backend *b, struct Mav1Encoder *e) {
   recon_sched_end(recon_sched_begin(e, 0));
 }
 
-static void cpu_filter(Backend *b, struct Mav1Encoder *e) {
-  (void)b;
-  const FrameParams *fp = ENC_PARAMS(e);
-  const uint8_t *info = e->lfmask.base;
-  for (int pass = 0; pass < 2; pass++) {
-    int lines = pass == 0 ? e->mi_rows : e->mi_cols;
-    /* work item = (plane, line); chroma lines step by 2 mi */
-    dispatch_apply((size_t)(3 * lines), DISPATCH_APPLY_AUTO, ^(size_t i) {
-      int plane = (int)i / lines, line = (int)i % lines;
-      if (plane > 0 && (line & 1)) return;
-      lf_line(fp, e->rec.base, info, plane, pass, line);
-    });
-  }
-  int bc = (e->mi_cols + 1) >> 1, br = (e->mi_rows + 1) >> 1;
-  if (e->num_cdef_presets)
-    dispatch_apply((size_t)(bc * br), DISPATCH_APPLY_AUTO, ^(size_t i) {
-      cdef_block_all(fp, e->rec.base, e->cdefbuf.base, (long)e->frame_bytes, info, (int)(i / bc) * 2, (int)(i % bc) * 2,
-                     e->num_cdef_presets);
-    });
-}
+typedef struct {
+  Backend base;
+} CpuBackend;
 
-static void cpu_restore(Backend *b, struct Mav1Encoder *e) {
-  (void)b;
-  const FrameParams *fp = ENC_PARAMS(e);
-  int rows4 = (e->h + 3) >> 2, cols4 = (e->w + 3) >> 2, n = rows4 * cols4;
-  dispatch_apply((size_t)(3 * n), DISPATCH_APPLY_AUTO, ^(size_t g) {
-    int plane = (int)g / n, i = (int)g % n;
-    lr_block(fp, plane, i / cols4, i % cols4, e->rec.base, e->dbk.base, e->lrout.base,
-             (const LrUnit *)e->lrunits.base);
-  });
-}
+/* run-time dispatch by the coded bitdepth */
+#define BD_DISPATCH(fn, b, e)                                     \
+  do {                                                            \
+    if (ENC_PARAMS(e)->bitdepth > 8) fn##_10(b, e);               \
+    else fn##_8(b, e);                                            \
+  } while (0)
+
+static void cpu_motion_search(Backend *b, struct Mav1Encoder *e) { BD_DISPATCH(cpu_motion_search, b, e); }
+void cpu_backend_analyze(Backend *b, struct Mav1Encoder *e) { BD_DISPATCH(cpu_backend_analyze, b, e); }
+static void cpu_filter(Backend *b, struct Mav1Encoder *e) { BD_DISPATCH(cpu_filter, b, e); }
+static void cpu_restore(Backend *b, struct Mav1Encoder *e) { BD_DISPATCH(cpu_restore, b, e); }
 
 static void cpu_destroy(Backend *b) { free(b); }
 

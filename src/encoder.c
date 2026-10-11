@@ -12,12 +12,8 @@
 
 #include "backend.h"
 #include "enc_internal.h"
-#include "kernels/k_lr.h"
 #include "fwd_matrices.h"
-#include "kernels/k_analysis.h"
-#include "kernels/k_me.h"
-#include "kernels/k_fwd.h"
-#include "kernels/k_recon.h"
+#include "kernels/kernel_set.h"
 
 #define PAGE 16384
 
@@ -47,12 +43,21 @@ static int wctx_init(Mav1Encoder *e);
 static int env_or(const char *n, int d);
 static Mav1Encoder *create_enc(const Mav1Config *cfg, int isEngine, char *err, size_t errlen);
 static void wctx_free(Mav1Encoder *e);
+static void rc_init(Mav1Encoder *e);
+static void rc_update(Mav1Encoder *e, long bits);
 
 void mav1_default_config(Mav1Config *cfg, int width, int height) {
   memset(cfg, 0, sizeof(*cfg));
   cfg->width = width;
   cfg->height = height;
+  cfg->bitdepth = 8;
   cfg->qindex = 100;
+  /* color description off by default (the sequence header keeps the
+   * unspecified CICP of the 8-bit streams) */
+  cfg->color_primaries = cfg->transfer_characteristics = cfg->matrix_coefficients = -1;
+  cfg->color_range = 0;
+  cfg->max_cll = cfg->max_fall = -1;
+  cfg->rc = MAV1_RC_CQP;
   cfg->use_metal = 1;
   cfg->keyint = 0;
   cfg->tx_search = 1;
@@ -88,6 +93,13 @@ static Mav1Encoder *create_enc(const Mav1Config *cfg, int isEngine, char *err, s
   e->leafopt_cfg = getenv("MAV1_LEAFOPT") ? (int)strtol(getenv("MAV1_LEAFOPT"), NULL, 0) : 0x3F;
   if (e->cfg.qindex < 0) e->cfg.qindex = 0;
   if (e->cfg.qindex > 255) e->cfg.qindex = 255;
+  if (e->cfg.bitdepth != 8 && e->cfg.bitdepth != 10) {
+    snprintf(err, errlen, "unsupported bitdepth %d (8 or 10)", e->cfg.bitdepth);
+    free(e);
+    return NULL;
+  }
+  e->bd = e->cfg.bitdepth;
+  e->pxsize = e->bd > 8 ? 2 : 1;
   e->w = cfg->width;
   e->h = cfg->height;
   e->mi_cols = 2 * ((e->w + 7) >> 3);
@@ -123,18 +135,20 @@ static Mav1Encoder *create_enc(const Mav1Config *cfg, int isEngine, char *err, s
    * only the reference slots (and no backend) */
   int drv = !isEngine && e->cfg.turbo && e->cfg.altref && !getenv("MAV1_NOASYNC") && !getenv("MAV1_NOPAR");
 #define SZ(x) (drv ? 0 : (x))
+#define SZPX(x) (drv ? 0 : (x) * (size_t)e->pxsize) /* pixel buffers */
   int ok = 0;
-  ok |= buf_alloc(&e->src, SZ(e->frame_bytes));
-  ok |= buf_alloc(&e->rec, SZ(e->frame_bytes));
-  ok |= buf_alloc(&e->ref, SZ(e->frame_bytes));
+  ok |= buf_alloc(&e->src, SZPX(e->frame_bytes));
+  ok |= buf_alloc(&e->rec, SZPX(e->frame_bytes));
+  ok |= buf_alloc(&e->ref, SZPX(e->frame_bytes));
   int ref2 = e->cfg.multi_ref || e->cfg.altref;
-  if (ref2) ok |= buf_alloc(&e->gold, SZ(e->frame_bytes));
+  if (ref2) ok |= buf_alloc(&e->gold, SZPX(e->frame_bytes));
   if (e->cfg.altref && !isEngine) {
-    ok |= buf_alloc(&e->slot[0], e->frame_bytes);
-    ok |= buf_alloc(&e->slot[2], e->frame_bytes);
-    ok |= buf_alloc(&e->slot[3], e->frame_bytes);
+    size_t ssz = e->frame_bytes * (size_t)e->pxsize;
+    ok |= buf_alloc(&e->slot[0], ssz);
+    ok |= buf_alloc(&e->slot[2], ssz);
+    ok |= buf_alloc(&e->slot[3], ssz);
     if (e->cfg.leaf)
-      for (int i = 4; i < 8; i++) ok |= buf_alloc(&e->slot[i], e->frame_bytes);
+      for (int i = 4; i < 8; i++) ok |= buf_alloc(&e->slot[i], ssz);
     e->inq = calloc((size_t)e->cfg.altref + 1, sizeof *e->inq);
   }
   ok |= buf_alloc(&e->params, sizeof(FrameParams));
@@ -150,21 +164,22 @@ static Mav1Encoder *create_enc(const Mav1Config *cfg, int isEngine, char *err, s
     /* pass-1 GPU scratch: the largest level dispatch (threads x slot size) */
     size_t mx = 0;
     for (int l = 0; l < 4; l++) {
-      size_t t = (size_t)e->num_sbs * (1u << (2 * l)) * (l == 3 ? 1 : l == 2 ? 5 : A_SLOTS) * analysis_slot_ints(l);
+      size_t t = (size_t)e->num_sbs * (1u << (2 * l)) * (l == 3 ? 1 : l == 2 ? 5 : A_SLOTS) * KNAME(analysis_slot_ints_max)(l);
       if (t > mx) mx = t;
     }
     ok |= buf_alloc(&e->ascratch, SZ(sizeof(int32_t) * mx));
   }
-  ok |= buf_alloc(&e->hpel, SZ(e->cfg.turbo ? (size_t)(ME_QP_ENTRIES * 16 + 1) * e->w * e->h + (size_t)(ME_QP_ENTRIES + 1) * ((e->w + 3) >> 2) * ((e->h + 3) >> 2) : 0));
+  ok |= buf_alloc(&e->hpel, SZ(e->cfg.turbo ? (size_t)(ME_QP_ENTRIES * 16 + 1) * e->w * e->h * e->pxsize + (size_t)(ME_QP_ENTRIES + 1) * ((e->w + 3) >> 2) * ((e->h + 3) >> 2) * e->pxsize : 0));
   ok |= buf_alloc(&e->mescratch, SZ(sizeof(int32_t) * ME_SB_INTS * (size_t)e->num_sbs));
   ok |= buf_alloc(&e->scratch, SZ(sizeof(int32_t) * SCRATCH_INTS * (size_t)e->num_sbs));
   ok |= buf_alloc(&e->lfmask, SZ((size_t)e->mi_rows * e->mi_cols));
-  ok |= buf_alloc(&e->dbk, SZ(e->frame_bytes));
-  ok |= buf_alloc(&e->lrout, SZ(e->frame_bytes));
+  ok |= buf_alloc(&e->dbk, SZPX(e->frame_bytes));
+  ok |= buf_alloc(&e->lrout, SZPX(e->frame_bytes));
   ok |= buf_alloc(&e->lrunits, SZ(sizeof(LrUnit) * 3 * (size_t)(e->sb_rows + 1) * (e->sb_cols + 1)));
   e->num_cdef_presets = e->cfg.cdef ? 4 : 0;
-  ok |= buf_alloc(&e->cdefbuf, SZ(e->frame_bytes * (e->num_cdef_presets ? e->num_cdef_presets : 1)));
+  ok |= buf_alloc(&e->cdefbuf, SZPX(e->frame_bytes * (e->num_cdef_presets ? e->num_cdef_presets : 1)));
 #undef SZ
+#undef SZPX
   if (ok) {
     snprintf(err, errlen, "out of memory");
     mav1_destroy(e);
@@ -177,6 +192,7 @@ static Mav1Encoder *create_enc(const Mav1Config *cfg, int isEngine, char *err, s
     return NULL;
   }
   fwd_build_matrices((int32_t *)e->mats.base);
+  rc_init(e);
   e->mi = calloc((size_t)e->mi_rows * e->mi_cols, sizeof(MiInfo));
   e->cdef_idx = calloc((size_t)e->num_sbs, 1);
   e->cdef_choice = calloc((size_t)e->num_sbs, 1);
@@ -207,13 +223,14 @@ static Mav1Encoder *create_enc(const Mav1Config *cfg, int isEngine, char *err, s
       e->eng_busy[i] = (void *)dispatch_group_create();
     }
     e->inflight = (void *)dispatch_semaphore_create(6);
+    rc_init(e);
     if (cfg->use_metal && !getenv("MAV1_NOQPC")) {
       QpCache *c = calloc(1, sizeof *c);
       c->mu = malloc(sizeof(pthread_mutex_t));
       c->cv = malloc(sizeof(pthread_cond_t));
       pthread_mutex_init((pthread_mutex_t *)c->mu, NULL);
       pthread_cond_init((pthread_cond_t *)c->cv, NULL);
-      if (buf_alloc(&c->buf, (size_t)QPC_N * (16L * e->w * e->h + (long)((e->w + 3) >> 2) * ((e->h + 3) >> 2)) + 4096)) {
+      if (buf_alloc(&c->buf, (size_t)QPC_N * ((16L * e->w * e->h + (long)((e->w + 3) >> 2) * ((e->h + 3) >> 2)) * e->pxsize) + 4096)) {
         snprintf(err, errlen, "out of memory");
         mav1_destroy(e);
         return NULL;
@@ -295,16 +312,25 @@ size_t mav1_sequence_header(const Mav1Encoder *e, uint8_t *out) { return write_s
 /* Copies the input into the padded source buffer, replicating the right
  * and bottom edges up to the superblock-aligned size. */
 static void load_source(Mav1Encoder *e, const uint8_t *const planes[3], const int strides[3]) {
+  int px = e->pxsize;
   for (int p = 0; p < 3; p++) {
     int pw = p ? (e->w + 1) >> 1 : e->w;
     int ph = p ? (e->h + 1) >> 1 : e->h;
     int aw = e->stride[p], ah = e->plane_h[p];
-    uint8_t *dst = e->src.base + e->offset[p];
+    uint8_t *dst = e->src.base + (size_t)e->offset[p] * px;
     for (int y = 0; y < ah; y++) {
       const uint8_t *s = planes[p] + (size_t)(y < ph ? y : ph - 1) * strides[p];
-      uint8_t *d = dst + (size_t)y * aw;
-      memcpy(d, s, pw);
-      memset(d + pw, s[pw - 1], aw - pw);
+      uint8_t *d = dst + (size_t)y * aw * px;
+      memcpy(d, s, (size_t)pw * px);
+      /* replicate the last sample into the right padding */
+      if (px == 2) {
+        uint16_t last;
+        memcpy(&last, s + (size_t)(pw - 1) * 2, 2);
+        uint16_t *d16 = (uint16_t *)d + pw;
+        for (int x = 0; x < aw - pw; x++) d16[x] = last;
+      } else {
+        memset(d + pw, s[pw - 1], aw - pw);
+      }
     }
   }
 }
@@ -419,9 +445,16 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   }
   int q = e->hdr.base_q_idx;
   fp->base_q_idx = q;
+  int bd = e->bd;
+  fp->bitdepth = bd;
+  fp->px_max = (1 << bd) - 1;
+  fp->bd_mid = 0x80 << (bd - 8);
+  fp->bd_half = 1 << (bd - 1);
+  fp->coeff_shift = bd - 8;
+  int qrow = (bd - 8) >> 1; /* Dc_Qlookup / Ac_Qlookup row of the bitdepth */
   for (int p = 0; p < 3; p++) {
-    fp->dc_q[p] = Dc_Qlookup[0][q];
-    fp->ac_q[p] = Ac_Qlookup[0][q];
+    fp->dc_q[p] = Dc_Qlookup[qrow][q];
+    fp->ac_q[p] = Ac_Qlookup[qrow][q];
   }
   fp->frame_is_intra = isKey;
   fp->reduced_tx_set = 0;
@@ -455,21 +488,27 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   {
     int dt = getenv("MAV1_DT") ? atoi(getenv("MAV1_DT")) : e->sb_rows >= 16 ? 320 : 352;
     int bias = getenv("MAV1_DTB") ? atoi(getenv("MAV1_DTB")) : 0;
-    fp->depth_thr = e->cfg.turbo ? dt * (q + bias) / (128 + bias) : 0;
+    /* the threshold compares SATD costs, which scale with the pixel range */
+    fp->depth_thr = e->cfg.turbo ? dt * (q + bias) / (128 + bias) << (2 * (bd - 8)) : 0;
   }
   fp->tile_w_sb = e->tile_w_sb;
   long acq = fp->ac_q[0];
-  fp->lambda = (int32_t)(acq * acq * 256 / 430);
+  /* SSE-domain lambda: at 10 bits both the SSE and (per libaom's rd.c) the
+   * multiplier scale by 4 per bitdepth doubling over the 8-bit tables */
+  fp->lambda = (int32_t)(acq * acq * 256 / 430 << (2 * fp->coeff_shift));
+  fp->satd_lam = (int32_t)(acq >> (4 - fp->coeff_shift)); /* SATD/SAD-domain lambda */
   fp->frame_w = e->w;
   fp->frame_h = e->h;
   fp->me_range = e->cfg.me_range;
   if ((e->leafopt & 32) && fp->me_range > 16) fp->me_range = 16;
 
-  /* Loop filter level from q (libaom's LPF_PICK_FROM_Q rule for 8-bit). */
+  /* Loop filter level from q (libaom's LPF_PICK_FROM_Q rule, derived from
+   * the 8-bit quantizer so the level does not saturate at 10 bits). */
   FrameHdr *h = &e->hdr;
   int lvl = 0;
+  long acq8 = Ac_Qlookup[0][q];
   if (e->cfg.loop_filter && q > 0 && !(e->cfg.leaf ? (e->leafopt & 2) : e->nonref && !getenv("MAV1_LEAFLF"))) {
-    lvl = (int)((acq * 20723 + 1015158 + (1 << 17)) >> 18);
+    lvl = (int)((acq8 * 20723 + 1015158 + (1 << 17)) >> 18);
     if (!isKey) lvl -= 4;
     lvl = lvl < 0 ? 0 : (lvl > MAX_LOOP_FILTER ? MAX_LOOP_FILTER : lvl);
   }
@@ -477,7 +516,12 @@ static void setup_params(Mav1Encoder *e, int isKey) {
   h->lf_sharpness = fp->lf_sharpness = 0;
   /* CDEF parameter sets, selected per superblock by SSE. */
   static const int presets[4][4] = {{0, 0, 0, 0}, {2, 1, 1, 0}, {4, 2, 2, 1}, {8, 4, 4, 2}};
-  h->cdef_damping = fp->cdef_damping = 3 + (q >> 6);
+  {
+    int dm = (q >> 6) - (bd - 8); /* the decoder adds (BitDepth - 8) */
+    if (dm < 0) dm = 0;
+    if (dm > 3) dm = 3;
+    h->cdef_damping = fp->cdef_damping = 3 + dm;
+  }
   h->cdef_bits = fp->cdef_bits = 2;
   if (e->leafopt & 4) { /* CDEF off for this frame: one all-zero strength */
     h->cdef_damping = fp->cdef_damping = 3;
@@ -528,13 +572,14 @@ static void build_filter_info(Mav1Encoder *e) {
 /* Chooses the CDEF parameter set of every superblock by SSE against the
  * source and assembles the final frame into `rec`. */
 static void cdef_select(Mav1Encoder *e) {
+  int px = e->pxsize;
   dispatch_apply((size_t)e->num_sbs, DISPATCH_APPLY_AUTO, ^(size_t sbi) {
     int sb = (int)sbi;
     int sr = sb / e->sb_cols, sc = sb % e->sb_cols;
     long best = -1;
     int bestK = 0;
     for (int k = 0; k < e->num_cdef_presets; k++) {
-      const uint8_t *out = e->cdefbuf.base + (size_t)k * e->frame_bytes;
+      const uint8_t *out = e->cdefbuf.base + (size_t)k * e->frame_bytes * e->pxsize;
       long sse = 0;
       for (int p = 0; p < 3; p++) {
         int sub = p > 0, n = 64 >> sub;
@@ -542,21 +587,22 @@ static void cdef_select(Mav1Encoder *e) {
         for (int y = sr * n; y < (sr + 1) * n && y < ph; y++)
           for (int x = sc * n; x < (sc + 1) * n && x < pw; x++) {
             size_t o = e->offset[p] + (size_t)y * e->stride[p] + x;
-            int d = (int)out[o] - (int)e->src.base[o];
+            int d = px == 2 ? (int)*(const uint16_t *)(out + o * 2) - (int)*(const uint16_t *)(e->src.base + o * 2)
+                            : (int)out[o] - (int)e->src.base[o];
             sse += d * d;
           }
       }
       if (best < 0 || sse < best) { best = sse; bestK = k; }
     }
     e->cdef_choice[sb] = (int8_t)bestK;
-    const uint8_t *out = e->cdefbuf.base + (size_t)bestK * e->frame_bytes;
+    const uint8_t *out = e->cdefbuf.base + (size_t)bestK * e->frame_bytes * e->pxsize;
     for (int p = 0; p < 3; p++) {
       int sub = p > 0, n = 64 >> sub;
       int mw = (e->mi_cols * 4) >> sub, mh = (e->mi_rows * 4) >> sub;
       for (int y = sr * n; y < (sr + 1) * n && y < mh; y++) {
         int x0 = sc * n, x1 = (sc + 1) * n < mw ? (sc + 1) * n : mw;
         size_t o = e->offset[p] + (size_t)y * e->stride[p];
-        memcpy(e->rec.base + o + x0, out + o + x0, x1 - x0);
+        memcpy(e->rec.base + (o + x0) * px, out + (o + x0) * px, (size_t)(x1 - x0) * px);
       }
     }
   });
@@ -578,11 +624,61 @@ static void count_tools(Mav1FrameStats *st, const BlockInfo *b) {
   st->tool_use[12] += b->is_inter && b->ref_frame == ALTREF_FRAME;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Single-pass rate control. The frame qindex is adjusted around the CQP      */
+/* cascade by a proportional controller on the smoothed coded size (VBR)      */
+/* plus a buffer constraint (CBR / VBV): coding a frame drains the buffer,    */
+/* every frame refills it with the target share.                              */
+
+static void rc_init(Mav1Encoder *e) {
+  if (e->cfg.rc == MAV1_RC_CQP || e->cfg.bitrate <= 0) return;
+  int num = e->cfg.fps_num > 0 ? e->cfg.fps_num : 30, den = e->cfg.fps_den > 0 ? e->cfg.fps_den : 1;
+  e->rc_target_bpf = (long)e->cfg.bitrate * 1000 * den / num;
+  if (e->rc_target_bpf < 1) e->rc_target_bpf = 1;
+  e->rc_bits_avg = e->rc_target_bpf;
+  e->rc_buffer_size = e->cfg.vbv_size > 0 ? (long)e->cfg.vbv_size * 1000 : e->rc_target_bpf;
+  if (e->rc_buffer_size < e->rc_target_bpf / 4) e->rc_buffer_size = e->rc_target_bpf / 4;
+  e->rc_buffer = e->rc_buffer_size; /* start full */
+}
+
+/* Bits spent on one coded frame (the temporal-unit bytes of the frame OBU). */
+static void rc_update(Mav1Encoder *e, long bits) {
+  if (!e->rc_target_bpf) return;
+  e->rc_total += bits;
+  e->rc_frames++;
+  /* exponential smoothing of the coded size (1 frame time constant of 4) */
+  e->rc_bits_avg += (bits - e->rc_bits_avg) / 4;
+  if (e->rc_bits_avg < 1) e->rc_bits_avg = 1;
+  e->rc_buffer += e->rc_target_bpf - bits;
+  if (e->rc_buffer > e->rc_buffer_size) e->rc_buffer = e->rc_buffer_size;
+  if (e->rc_buffer < 0) e->rc_buffer = 0;
+}
+
+/* qindex adjustment for the next frame (applied on top of the CQP cascade). */
+static int rc_adjust_q(Mav1Encoder *e) {
+  if (!e->rc_target_bpf) return 0;
+  /* rate term: 12 qindex steps per factor 2 of rate error */
+  double ratio = (double)e->rc_bits_avg / e->rc_target_bpf;
+  int qrate = (int)(12.0 * (ratio > 1e-9 ? log2(ratio) : -20.0));
+  int qbuf = 0;
+  if (e->cfg.rc == MAV1_RC_CBR) {
+    long q = e->rc_buffer_size / 4;
+    if (e->rc_buffer < q) qbuf = (int)k_min(24, 1 + 24 * (q - e->rc_buffer) / k_max(q, 1));
+    else if (e->rc_buffer > 3 * q) qbuf = -(int)k_min(24, 1 + 24 * (e->rc_buffer - 3 * q) / k_max(q, 1));
+  }
+  int adj = qrate + qbuf;
+  if (adj > 48) adj = 48;
+  if (adj < -48) adj = -48;
+  /* smooth so single oversized frames do not overshoot */
+  e->rc_q_adj = (e->rc_q_adj * 3 + adj) / 4;
+  return e->rc_q_adj;
+}
+
 /* Frame-level quantizer cascade (low delay): the key frame and every 4th
  * frame are coded finer, as they are the references most of the GOP
  * predicts from. MAV1_QK / MAV1_Q4 / MAV1_QP override the offsets. */
 static int env_or(const char *n, int d) { const char *v = getenv(n); return v ? atoi(v) : d; }
-static int frame_qindex(const Mav1Encoder *e, int isKey) {
+static int frame_qindex(Mav1Encoder *e, int isKey) {
   int q = e->cfg.qindex;
   if (q == 0) return 0;
   int off = isKey ? env_or("MAV1_QK", -24) : (e->order_hint % 4 == 0 ? env_or("MAV1_Q4", -8) : env_or("MAV1_QP", 4));
@@ -591,6 +687,7 @@ static int frame_qindex(const Mav1Encoder *e, int isKey) {
   if (!isKey && e->cfg.leaf && e->frame_kind == 3) off = env_or("MAV1_QM", 0); /* pyramid middle frame */
   if (!isKey && e->cfg.leaf && e->nonref) off = env_or("MAV1_QL", 8);
   q += off;
+  q += rc_adjust_q(e); /* rate control rides on top of the cascade */
   return q < 1 ? 1 : q > 255 ? 255 : q;
 }
 
@@ -630,12 +727,12 @@ static void run_frame_core(Mav1Encoder *e, int isKey) {
   double tf2 = now();
   e->num_cdef_presets = nPresets;
   int useLr = e->cfg.restoration && e->cfg.qindex > 0 && !(e->leafopt & 8); /* AllLossless disables it */
-  if (useLr) memcpy(e->dbk.base, e->rec.base, e->frame_bytes); /* UpscaledCurrFrame */
+  if (useLr) memcpy(e->dbk.base, e->rec.base, e->frame_bytes * e->pxsize); /* UpscaledCurrFrame */
   if (e->cfg.cdef && e->cfg.qindex > 0 && !cdefOff) cdef_select(e);
   double tf3 = now();
   if (useLr) {
     lr_select(e);
-    memcpy(e->lrout.base, e->rec.base, e->frame_bytes);
+    memcpy(e->lrout.base, e->rec.base, e->frame_bytes * e->pxsize);
     e->be->restore(e->be, e);
     Buf t = e->rec;
     e->rec = e->lrout;
@@ -846,14 +943,18 @@ int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int stride
   uint8_t *tile = NULL;
   size_t tileSize = run_frame(e, isKey, &tile);
   double t3 = now();
-  size_t cap = tileSize + 1024;
+  size_t cap = tileSize + 2048;
   uint8_t *buf = malloc(cap);
   size_t pos = write_temporal_delimiter(buf);
-  if (isKey) pos += write_sequence_header(e, buf + pos);
+  if (isKey) {
+    pos += write_sequence_header(e, buf + pos);
+    if (e->cfg.hdr) pos += write_hdr_metadata(e, buf + pos);
+  }
   pos += write_frame_obu(e, tile, tileSize, buf + pos);
   free(tile);
   e->last.t_entropy += now() - t3;
   e->last.bytes = pos;
+  rc_update(e, (long)pos);
 
   /* The reconstruction becomes the reference of the next frame. */
   if (!e->nonref) {
@@ -862,7 +963,7 @@ int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int stride
     e->rec = tmp;
     e->last_id = e->frame_num;
     if (e->cfg.multi_ref && (isKey || e->golden_refresh)) {
-      memcpy(e->gold.base, e->ref.base, e->frame_bytes);
+      memcpy(e->gold.base, e->ref.base, e->frame_bytes * e->pxsize);
       e->gold_id = e->frame_num;
     }
   }
@@ -875,25 +976,29 @@ int mav1_encode(Mav1Encoder *e, const uint8_t *const planes[3], const int stride
 }
 
 static void copy_out(const Mav1Encoder *e, const uint8_t *frame, uint8_t *const planes[3], const int strides[3]) {
+  int px = e->pxsize;
   for (int p = 0; p < 3; p++) {
     int pw = p ? (e->w + 1) >> 1 : e->w;
     int ph = p ? (e->h + 1) >> 1 : e->h;
     for (int y = 0; y < ph; y++)
-      memcpy(planes[p] + (size_t)y * strides[p], frame + e->offset[p] + (size_t)y * e->stride[p], pw);
+      memcpy(planes[p] + (size_t)y * strides[p],
+             frame + (size_t)(e->offset[p] + (size_t)y * e->stride[p]) * px, (size_t)pw * px);
   }
 }
 
+/* Packed I420 (10 bit: 2 bytes per sample) size of one frame. */
 static size_t packed_size(const Mav1Encoder *e) {
   size_t cw = (size_t)(e->w + 1) >> 1, ch = (size_t)(e->h + 1) >> 1;
-  return (size_t)e->w * e->h + 2 * cw * ch;
+  return ((size_t)e->w * e->h + 2 * cw * ch) * e->pxsize;
 }
 
 /* Packed I420 copy of a padded frame buffer. */
 static uint8_t *pack_frame(const Mav1Encoder *e, const uint8_t *frame) {
   uint8_t *o = malloc(packed_size(e));
   int cw = (e->w + 1) >> 1, ch = (e->h + 1) >> 1;
-  uint8_t *pl[3] = {o, o + (size_t)e->w * e->h, o + (size_t)e->w * e->h + (size_t)cw * ch};
-  int st[3] = {e->w, cw, cw};
+  int px = e->pxsize;
+  uint8_t *pl[3] = {o, o + (size_t)e->w * e->h * px, o + ((size_t)e->w * e->h + (size_t)cw * ch) * px};
+  int st[3] = {e->w * px, cw * px, cw * px};
   copy_out(e, frame, pl, st);
   return o;
 }
@@ -901,12 +1006,14 @@ static uint8_t *pack_frame(const Mav1Encoder *e, const uint8_t *frame) {
 void mav1_get_recon(const Mav1Encoder *e, uint8_t *const planes[3], const int strides[3]) {
   if (e->cfg.altref > 0) {
     int cw = (e->w + 1) >> 1, ch = (e->h + 1) >> 1;
+    int px = e->pxsize;
     const uint8_t *s = e->shown_recon;
     if (!s) return;
-    const uint8_t *src[3] = {s, s + (size_t)e->w * e->h, s + (size_t)e->w * e->h + (size_t)cw * ch};
+    const uint8_t *src[3] = {s, s + (size_t)e->w * e->h * px, s + ((size_t)e->w * e->h + (size_t)cw * ch) * px};
     for (int p = 0; p < 3; p++) {
       int pw = p ? cw : e->w, ph = p ? ch : e->h;
-      for (int y = 0; y < ph; y++) memcpy(planes[p] + (size_t)y * strides[p], src[p] + (size_t)y * pw, pw);
+      for (int y = 0; y < ph; y++)
+        memcpy(planes[p] + (size_t)y * strides[p], src[p] + (size_t)y * pw * px, (size_t)pw * px);
     }
     return;
   }
@@ -1100,13 +1207,15 @@ static uint8_t *alt_code(Mav1Encoder *e, uint8_t **framep, int disp, int isKey, 
     E->order_hint = orderHint;
     E->dump_last_hint = lastHint;
     E->dump_arf_hint = arfHint;
-    const uint8_t *pl[3] = {frame, frame + (size_t)e->w * e->h, frame + (size_t)e->w * e->h + (size_t)cw * ch};
-    int st[3] = {e->w, cw, cw};
+    int px = E->pxsize;
+    const uint8_t *pl[3] = {frame, frame + (size_t)e->w * e->h * px,
+                            frame + ((size_t)e->w * e->h + (size_t)cw * ch) * px};
+    int st[3] = {e->w * px, cw * px, cw * px};
     load_source(E, pl, st);
     free(frame);
     if (!isKey) {
-      memcpy(E->ref.base, e->slot[lastSlot].base, e->frame_bytes);
-      if (arfSlot >= 0) memcpy(E->gold.base, e->slot[arfSlot].base, e->frame_bytes);
+      memcpy(E->ref.base, e->slot[lastSlot].base, e->frame_bytes * e->pxsize);
+      if (arfSlot >= 0) memcpy(E->gold.base, e->slot[arfSlot].base, e->frame_bytes * e->pxsize);
       E->ref_gen = refGen;
       E->gold_gen = goldGen;
     }
@@ -1136,15 +1245,22 @@ static uint8_t *alt_code(Mav1Encoder *e, uint8_t **framep, int disp, int isKey, 
           dispatch_group_wait((dispatch_group_t)dep.prd[k], DISPATCH_TIME_FOREVER);
           dispatch_release((dispatch_group_t)dep.prd[k]);
         }
-        if (e->slot[k].base) memcpy(e->slot[k].base, E->rec.base, e->frame_bytes);
+        if (e->slot[k].base) {
+          if (e->slot[k].size < e->frame_bytes * e->pxsize || E->rec.size < e->frame_bytes * e->pxsize)
+            fprintf(stderr, "SLOTSZ k=%d slot=%zu rec=%zu need=%zu\n", k, e->slot[k].size, E->rec.size,
+                    e->frame_bytes * e->pxsize);
+          memcpy(e->slot[k].base, E->rec.base, e->frame_bytes * e->pxsize);
+        }
       }
     for (int k = 0; k < 8; k++)
       if (dep.nver[k]) {
         dispatch_group_leave((dispatch_group_t)dep.nver[k]);
         dispatch_release((dispatch_group_t)dep.nver[k]);
       }
-    uint8_t *rp[3] = {recon, recon + (size_t)e->w * e->h, recon + (size_t)e->w * e->h + (size_t)cw * ch};
-    int rs[3] = {e->w, cw, cw};
+    int px = E->pxsize;
+    uint8_t *rp[3] = {recon, recon + (size_t)e->w * e->h * px,
+                      recon + ((size_t)e->w * e->h + (size_t)cw * ch) * px};
+    int rs[3] = {e->w * px, cw * px, cw * px};
     copy_out(E, E->rec.base, rp, rs);
   };
   if (e->eng[0]) {
@@ -1207,14 +1323,21 @@ static uint8_t *alt_code(Mav1Encoder *e, uint8_t **framep, int disp, int isKey, 
     uint8_t *tile = job->tile;
     size_t tileSize = job->tileSize;
     double t3 = now();
-    tu_reserve(t, tileSize + 1024);
+    tu_reserve(t, tileSize + 2048);
+    long frameBytes = 0;
     if (isKey) {
       t->pos += write_temporal_delimiter(t->buf + t->pos);
-      t->pos += write_sequence_header(s, t->buf + t->pos);
+      size_t seq = write_sequence_header(s, t->buf + t->pos);
+      if (s->cfg.hdr) seq += write_hdr_metadata(s, t->buf + t->pos + seq);
+      t->pos += seq;
+      frameBytes += seq + 2;
     }
-    t->pos += write_frame_obu(s, tile, tileSize, t->buf + t->pos);
+    size_t obu = write_frame_obu(s, tile, tileSize, t->buf + t->pos);
+    t->pos += obu;
+    frameBytes += obu;
     free(tile);
     st2.t_entropy += now() - t3;
+    rc_update(e, frameBytes); /* the coded size drives the rate controller */
     stats_add(&t->st, &st2);
     if (job->c) dispatch_semaphore_signal((dispatch_semaphore_t)job->c->free);
     free(job);
@@ -1301,11 +1424,12 @@ int mav1_send_frame(Mav1Encoder *e, const uint8_t *const planes[3], const int st
   }
   if (planes) {
     uint8_t *f = malloc(packed_size(e));
-    int cw = (e->w + 1) >> 1, ch = (e->h + 1) >> 1;
+    int cw = (e->w + 1) >> 1, ch = (e->h + 1) >> 1, px = e->pxsize;
     for (int p = 0; p < 3; p++) {
       int pw = p ? cw : e->w, ph = p ? ch : e->h;
-      uint8_t *d = f + (p ? (size_t)e->w * e->h + (p - 1) * (size_t)cw * ch : 0);
-      for (int y = 0; y < ph; y++) memcpy(d + (size_t)y * pw, planes[p] + (size_t)y * strides[p], pw);
+      uint8_t *d = f + (p ? ((size_t)e->w * e->h + (p - 1) * (size_t)cw * ch) * px : 0);
+      for (int y = 0; y < ph; y++)
+        memcpy(d + (size_t)y * pw * px, planes[p] + (size_t)y * strides[p], (size_t)pw * px);
     }
     e->inq[e->inq_n++] = f;
     e->in_disp++;

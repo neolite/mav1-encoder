@@ -7,11 +7,8 @@
  * the CPU (fwd_matrices.c) and stored as Q20 integer matrices so that the CPU
  * and GPU backends produce bit-identical coefficients.
  */
-#ifndef K_FWD_H
-#define K_FWD_H
 
 #include "k_common.h"
-#include "k_itx.h"
 
 #define FWD_BITS 20
 #define FWD_SLOT_SIZE 4096
@@ -20,7 +17,7 @@
 #define FWD_SLOT(kind, log2n) (((kind) * 5 + (log2n) - 2) * FWD_SLOT_SIZE)
 #define FWD_NUM_SLOTS 15
 
-INLINE int dq_denom(int txSz) {
+INLINE int KNAME(dq_denom)(int txSz) {
   if (txSz == TX_32X32 || txSz == TX_16X32 || txSz == TX_32X16 || txSz == TX_16X64 || txSz == TX_64X16) return 2;
   if (txSz == TX_64X64 || txSz == TX_32X64 || txSz == TX_64X32) return 4;
   return 1;
@@ -32,7 +29,7 @@ INLINE int dq_denom(int txSz) {
  * Q4 (4 fractional bits) to `out` (row stride 64), in the same domain as the
  * decoder's Dequant array.
  */
-INLINE void fwd_2d_ref(DEV const int32_t *resid, DEV int32_t *out, int txSz, int txType,
+INLINE void KNAME(fwd_2d_ref)(DEV const int32_t *resid, DEV int32_t *out, int txSz, int txType,
                        DEV const int32_t *mats, DEV int32_t *tmp) {
   int log2W = Tx_Width_Log2[txSz], log2H = Tx_Height_Log2[txSz];
   int w = 1 << log2W, h = 1 << log2H;
@@ -63,10 +60,10 @@ INLINE void fwd_2d_ref(DEV const int32_t *resid, DEV int32_t *out, int txSz, int
  * the quantised levels are written to `quant` in the decoder's layout
  * (row stride tw). Returns the number of non-zero levels.
  */
-INLINE int quantize_block(DEV const int32_t *coef, DEV int32_t *quant, int txSz, int dcQ, int acQ,
+INLINE int KNAME(quantize_block)(DEV const int32_t *coef, DEV int32_t *quant, int txSz, int dcQ, int acQ,
                           int dcRound, int acRound) {
   int tw = k_min(32, Tx_Width[txSz]), th = k_min(32, Tx_Height[txSz]);
-  int denom = dq_denom(txSz);
+  int denom = KNAME(dq_denom)(txSz);
   int nz = 0;
   /* level = (a + bias) / (16 q): (a + bias) >> 4 is exact for /16, and the
    * remaining /q uses a reciprocal exact for every t < 2^19 (larger values
@@ -91,10 +88,12 @@ INLINE int quantize_block(DEV const int32_t *coef, DEV int32_t *quant, int txSz,
 
 /* Dequantisation, spec 7.12.3 step 1 (no quantizer matrices). Output row
  * stride 64, as consumed by itx_2d (which reads only the Min(32, h) x
- * Min(32, w) region written here). */
-INLINE void dequant_block(DEV const int32_t *quant, DEV int32_t *dq, int txSz, int dcQ, int acQ) {
+ * Min(32, w) region written here). Clamped to the Dequant range of the
+ * bitdepth. */
+INLINE void KNAME(dequant_block)(DEV const int32_t *quant, DEV int32_t *dq, int txSz, int dcQ, int acQ, int bitdepth) {
   int tw = k_min(32, Tx_Width[txSz]), th = k_min(32, Tx_Height[txSz]);
-  int denom = dq_denom(txSz);
+  int denom = KNAME(dq_denom)(txSz);
+  int lim = 1 << (7 + bitdepth);
   for (int i = 0; i < th; i++)
     for (int j = 0; j < tw; j++) {
       int q = (i == 0 && j == 0) ? dcQ : acQ;
@@ -102,14 +101,14 @@ INLINE void dequant_block(DEV const int32_t *quant, DEV int32_t *dq, int txSz, i
       long ad = d < 0 ? -d : d;
       long d2 = (ad & 0xFFFFFF) >> (denom >> 1);
       if (d < 0) d2 = -d2;
-      dq[i * 64 + j] = Clip3(-(1 << 15), (1 << 15) - 1, (int)d2);
+      dq[i * 64 + j] = Clip3(-lim, lim - 1, (int)d2);
     }
 }
 
 /* Forward Walsh-Hadamard transform for lossless blocks: the exact inverse
  * of the spec's inverse WHT (7.13.2.10) with shift 2. resid stride 64,
  * out[i * 4 + j] holds Dequant[i][j] / 4, i.e. the coefficient level. */
-INLINE void fwht4x4(DEV const int32_t *resid, DEV int32_t *out) {
+INLINE void KNAME(fwht4x4)(DEV const int32_t *resid, DEV int32_t *out) {
   int t[16];
   for (int j = 0; j < 4; j++) { /* columns */
     int a1 = resid[0 * 64 + j], b1 = resid[1 * 64 + j], c1 = resid[2 * 64 + j], d1 = resid[3 * 64 + j];
@@ -137,14 +136,14 @@ INLINE void fwht4x4(DEV const int32_t *resid, DEV int32_t *out) {
 
 #if !defined(__METAL_VERSION__) && defined(__aarch64__)
 /*
- * NEON forward transform: identical integer arithmetic to fwd_2d_ref (each
+ * NEON forward transform: identical integer arithmetic to KNAME(fwd_2d_ref) (each
  * product is a widening 32->64 multiply, so the summation order change keeps
  * every result bit-exact). Pass 1 takes four output columns at a time with
  * a dot product over j; pass 2 takes four output columns per accumulator.
  */
 #include <arm_neon.h>
 
-static inline void fwd_2d_neon(DEV const int32_t *resid, DEV int32_t *out, int txSz, int txType,
+static inline void KNAME(fwd_2d_neon)(DEV const int32_t *resid, DEV int32_t *out, int txSz, int txType,
                                DEV const int32_t *mats, DEV int32_t *tmp) {
   int log2W = Tx_Width_Log2[txSz], log2H = Tx_Height_Log2[txSz];
   int w = 1 << log2W, h = 1 << log2H;
@@ -219,13 +218,11 @@ static inline void fwd_2d_neon(DEV const int32_t *resid, DEV int32_t *out, int t
 }
 #endif
 
-INLINE void fwd_2d(DEV const int32_t *resid, DEV int32_t *out, int txSz, int txType,
+INLINE void KNAME(fwd_2d)(DEV const int32_t *resid, DEV int32_t *out, int txSz, int txType,
                    DEV const int32_t *mats, DEV int32_t *tmp) {
 #if !defined(__METAL_VERSION__) && defined(__aarch64__)
-  fwd_2d_neon(resid, out, txSz, txType, mats, tmp);
+  KNAME(fwd_2d_neon)(resid, out, txSz, txType, mats, tmp);
 #else
-  fwd_2d_ref(resid, out, txSz, txType, mats, tmp);
+  KNAME(fwd_2d_ref)(resid, out, txSz, txType, mats, tmp);
 #endif
 }
-
-#endif

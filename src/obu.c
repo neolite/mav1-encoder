@@ -59,11 +59,18 @@ static void seq_header_payload(const struct Mav1Encoder *e, BitWriter *w) {
   bw_f(w, 1, 0);   /* enable_superres */
   bw_f(w, 1, e->cfg.cdef ? 1 : 0);
   bw_f(w, 1, e->cfg.restoration ? 1 : 0); /* enable_restoration */
-  /* color_config */
-  bw_f(w, 1, 0);   /* high_bitdepth */
+  /* color_config (profile 0: 4:2:0, 8 or 10 bit) */
+  bw_f(w, 1, e->bd > 8); /* high_bitdepth */
   bw_f(w, 1, 0);   /* mono_chrome */
-  bw_f(w, 1, 0);   /* color_description_present_flag */
-  bw_f(w, 1, 0);   /* color_range */
+  int cd = e->cfg.color_primaries >= 0 || e->cfg.transfer_characteristics >= 0 ||
+           e->cfg.matrix_coefficients >= 0;
+  bw_f(w, 1, cd);  /* color_description_present_flag */
+  if (cd) {
+    bw_f(w, 8, e->cfg.color_primaries < 0 ? 2 : e->cfg.color_primaries);
+    bw_f(w, 8, e->cfg.transfer_characteristics < 0 ? 2 : e->cfg.transfer_characteristics);
+    bw_f(w, 8, e->cfg.matrix_coefficients < 0 ? 2 : e->cfg.matrix_coefficients);
+  }
+  bw_f(w, 1, e->cfg.color_range); /* color_range */
   bw_f(w, 2, 0);   /* chroma_sample_position = CSP_UNKNOWN */
   bw_f(w, 1, 0);   /* separate_uv_delta_q */
   bw_f(w, 1, 0);   /* film_grain_params_present */
@@ -83,6 +90,56 @@ size_t write_temporal_delimiter(uint8_t *out) {
   out[0] = (2 << 3) | 2;
   out[1] = 0;
   return 2;
+}
+
+/* HDR10 metadata OBUs (spec 5.8.2 / 5.8.3): mastering display color volume
+ * (metadata_type 2) and content light level (metadata_type 1), written once
+ * after every sequence header when cfg.hdr is set. */
+static size_t leb128_write_buf(uint8_t *out, size_t v) {
+  int n = 0;
+  for (;;) {
+    uint8_t b = v & 0x7F;
+    v >>= 7;
+    out[n++] = v ? b | 0x80 : b;
+    if (!v) break;
+  }
+  return (size_t)n;
+}
+
+static size_t wrap_metadata(int type, const uint8_t *payload, size_t n, uint8_t *out) {
+  size_t pos = 0;
+  out[pos++] = (5 << 3) | 2; /* OBU_METADATA with obu_has_size_field = 1 */
+  pos += leb128_write_buf(out + pos, 1 + n); /* metadata_type + payload */
+  out[pos++] = (uint8_t)type;
+  memcpy(out + pos, payload, n);
+  return pos + n;
+}
+
+size_t write_hdr_metadata(const struct Mav1Encoder *e, uint8_t *out) {
+  size_t pos = 0;
+  if (e->cfg.mastering_display[0] || e->cfg.mastering_display[1]) {
+    BitWriter w;
+    bw_init(&w);
+    for (int i = 0; i < 4; i++) { /* r, g, b, white */
+      bw_f(&w, 16, e->cfg.mastering_display[2 * i]);
+      bw_f(&w, 16, e->cfg.mastering_display[2 * i + 1]);
+    }
+    bw_f(&w, 32, e->cfg.max_luma > 0 ? e->cfg.max_luma : 1000 * 256); /* luminance_max, 24.8 */
+    bw_f(&w, 32, e->cfg.min_luma > 0 ? e->cfg.min_luma : 1);          /* luminance_min, 18.14 */
+    bw_trailing_bits(&w); /* spec 5.3: all non-tile OBUs end with trailing_bits() */
+    pos += wrap_metadata(2 /* METADATA_TYPE_HDR_MDCV */, w.buf, bw_bytes(&w), out + pos);
+    bw_free(&w);
+  }
+  if (e->cfg.max_cll >= 0) {
+    BitWriter w;
+    bw_init(&w);
+    bw_f(&w, 16, e->cfg.max_cll);
+    bw_f(&w, 16, e->cfg.max_fall < 0 ? e->cfg.max_cll : e->cfg.max_fall);
+    bw_trailing_bits(&w); /* spec 5.3 trailing_bits() */
+    pos += wrap_metadata(1 /* METADATA_TYPE_HDR_CLL */, w.buf, bw_bytes(&w), out + pos);
+    bw_free(&w);
+  }
+  return pos;
 }
 
 /* Frame header OBU with show_existing_frame = 1 (a non-key frame). */

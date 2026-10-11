@@ -56,6 +56,7 @@ typedef struct {
   int32_t stride[3], offset[3];       /* layout of a frame buffer */
   int32_t base_q_idx;
   int32_t dc_q[3], ac_q[3];
+  int32_t satd_lam;                   /* SATD/SAD-domain rate multiplier (ac_q scaled by bitdepth) */
   int32_t frame_is_intra;
   int32_t reduced_tx_set;
   int32_t enable_intra_edge_filter;
@@ -82,7 +83,27 @@ typedef struct {
   /* loop restoration: FrameRestorationType and the unit grid of each plane */
   int32_t lr_type[3], lr_unit_size[3], lr_unit_rows[3], lr_unit_cols[3], lr_unit_off[3];
   int32_t turbo;                      /* speed mode (cfg.turbo): reduced ME and analysis */
+  int32_t bitdepth;                   /* 8 or 10 */
+  int32_t px_max;                     /* (1 << bitdepth) - 1 */
+  int32_t bd_mid;                     /* 0x80 << (bitdepth - 8): filter midpoint */
+  int32_t bd_half;                    /* 1 << (bitdepth - 1): filter clamp range */
+  int32_t coeff_shift;                /* bitdepth - 8 (CDEF strengths, SGR sums) */
 } FrameParams;
+
+typedef struct {
+  int32_t type;         /* LrType: RESTORE_NONE / RESTORE_WIENER / RESTORE_SGRPROJ */
+  int32_t set;          /* LrSgrSet */
+  int32_t xqd[2];       /* LrSgrXqd */
+  int32_t wiener[2][3]; /* LrWiener[pass][j]: pass 0 vertical, pass 1 horizontal */
+  int32_t pad[2];
+} LrUnit;
+
+typedef struct {
+  int x, y, w, h;          /* block in plane samples */
+  int stripeStart, stripeEnd;
+  int planeEndX, planeEndY;
+  int unitRow, unitCol;
+} LrBlock;
 
 /* Tile columns (uniform spacing, one tile row): MiColStart / MiColEnd of
  * the tile containing miCol. */
@@ -128,4 +149,35 @@ INLINE int depth_tx_size(int bs, int depth) {
   return t;
 }
 
+#endif /* K_COMMON_H */
+
+/*
+ * Bitdepth instantiation, outside the include guard so that every inclusion
+ * of this header re-derives it from MAV1_BD (both kernel instantiations can
+ * live in one translation unit). Every kernel that touches frame pixels is
+ * compiled per bitdepth (8: uint8_t pixels, 10: uint16_t pixels); set MAV1_BD
+ * before including a kernel header. The pixel functions are named KNAME(fn)
+ * (fn_8 / fn_10). The integer arithmetic is identical for both depths; only
+ * the pixel element size and the pixel-range clamps differ (all of them
+ * derived from FrameParams.bitdepth).
+ */
+#undef KSB
+#undef KPIX
+#undef KNAME
+#if !defined(MAV1_BD)
+#define MAV1_BD 8
 #endif
+#if MAV1_BD == 10
+#define KPIX uint16_t
+#define KSB _10
+#else
+#define KPIX uint8_t
+#define KSB _8
+#endif
+#ifndef K_MCAT_
+#define K_MCAT_(a, b) a##b
+#define K_MCAT(a, b) K_MCAT_(a, b)
+#endif
+#define KNAME(n) K_MCAT(n, KSB)
+/* selects one of two instantiations at run time: KSEL(bd, fn)(args) */
+#define KSEL(bd, n) ((bd) > 8 ? K_MCAT(n, _10) : K_MCAT(n, _8))

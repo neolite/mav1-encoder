@@ -4,8 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "../src/kernels/k_itx.h"
-#include "../src/kernels/k_fwd.h"
+#include "../src/kernels/kernel_set.h"
 #include "../src/fwd_matrices.h"
 
 static unsigned seed = 12345;
@@ -30,8 +29,8 @@ int main(void) {
         for (int i = 0; i < h; i++)
           for (int j = 0; j < w; j++)
             resid[i * 64 + j] = sparse ? ((rnd() & 7) == 0 ? (rnd() % 1021) - 510 : 0) : (rnd() % 511) - 255;
-        fwd_2d_ref(resid, c1, txSz, t, mats, tmp);
-        fwd_2d_neon(resid, c2, txSz, t, mats, tmp);
+        KNAME(fwd_2d_ref)(resid, c1, txSz, t, mats, tmp);
+        KNAME(fwd_2d_neon)(resid, c2, txSz, t, mats, tmp);
         if (memcmp(c1, c2, tw * th * sizeof(int32_t))) { bad++; printf("fwd %dx%d t%d tr%d\n", w, h, t, trial); }
         cases++;
 
@@ -70,9 +69,9 @@ int main(void) {
         for (int i = 0; i < th; i++)
           for (int j = 0; j < tw; j++) c1[i * 64 + j] = (rnd() % 4000000) - 2000000;
         memset(q1, 9, sizeof q1); memset(q2, 7, sizeof q2);
-        int n1 = quantize_block(c1, q1, txSz, dc, ac, 26, 22);
+        int n1 = KNAME(quantize_block)(c1, q1, txSz, dc, ac, 26, 22);
         /* scalar reference implementation of quantize */
-        int denom = dq_denom(txSz), nz2 = 0;
+        int denom = KNAME(dq_denom)(txSz), nz2 = 0;
         for (int i = 0; i < th; i++)
           for (int j = 0; j < tw; j++) {
             int q = (i == 0 && j == 0) ? dc : ac, rnd2 = (i == 0 && j == 0) ? 26 : 22;
@@ -85,7 +84,7 @@ int main(void) {
             nz2 += level != 0;
           }
         if (n1 != nz2 || memcmp(q1, q2, tw * th * sizeof(int32_t))) { bad++; printf("quant dc%d ac%d sz%d\n", dc, ac, txSz); }
-        dequant_block(q1, d1, txSz, dc, ac);
+        KNAME(dequant_block)(q1, d1, txSz, dc, ac, 8);
         for (int i = 0; i < th; i++)
           for (int j = 0; j < tw; j++) {
             int q = (i == 0 && j == 0) ? dc : ac;

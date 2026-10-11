@@ -4,28 +4,13 @@
  * `cdef` is UpscaledCdefFrame, `dbk` is UpscaledCurrFrame (deblocked, before
  * CDEF), the result goes to `out` (LrFrame).
  */
-#ifndef K_LR_H
-#define K_LR_H
 
 #include "k_common.h"
 
-typedef struct {
-  int32_t type;         /* LrType: RESTORE_NONE / RESTORE_WIENER / RESTORE_SGRPROJ */
-  int32_t set;          /* LrSgrSet */
-  int32_t xqd[2];       /* LrSgrXqd */
-  int32_t wiener[2][3]; /* LrWiener[pass][j]: pass 0 vertical, pass 1 horizontal */
-  int32_t pad[2];
-} LrUnit;
 
-typedef struct {
-  int x, y, w, h;          /* block in plane samples */
-  int stripeStart, stripeEnd;
-  int planeEndX, planeEndY;
-  int unitRow, unitCol;
-} LrBlock;
 
 /* Geometry of loop_restore_block( plane, row, col ); returns 0 when empty. */
-INLINE int lr_block_setup(DEV const FrameParams *fp, int plane, int row, int col, THR LrBlock *lb) {
+INLINE int KNAME(lr_block_setup)(DEV const FrameParams *fp, int plane, int row, int col, THR LrBlock *lb) {
   int sub = plane > 0;
   int lumaY = row * MI_SIZE;
   int stripeNum = (lumaY + 8) / 64;
@@ -43,13 +28,13 @@ INLINE int lr_block_setup(DEV const FrameParams *fp, int plane, int row, int col
   return lb->w > 0 && lb->h > 0;
 }
 
-INLINE int lr_unit_index(DEV const FrameParams *fp, int plane, THR const LrBlock *lb) {
+INLINE int KNAME(lr_unit_index)(DEV const FrameParams *fp, int plane, THR const LrBlock *lb) {
   return fp->lr_unit_off[plane] + lb->unitRow * fp->lr_unit_cols[plane] + lb->unitCol;
 }
 
 /* get_source_sample( ) (7.17.6) */
-INLINE int lr_src(DEV const FrameParams *fp, int plane, THR const LrBlock *lb, DEV const uint8_t *cdef,
-                  DEV const uint8_t *dbk, int x, int y) {
+INLINE int KNAME(lr_src)(DEV const FrameParams *fp, int plane, THR const LrBlock *lb, DEV const KPIX *cdef,
+                         DEV const KPIX *dbk, int x, int y) {
   x = k_max(0, k_min(lb->planeEndX, x));
   y = k_max(0, k_min(lb->planeEndY, y));
   int stride = fp->stride[plane];
@@ -63,9 +48,10 @@ INLINE int lr_src(DEV const FrameParams *fp, int plane, THR const LrBlock *lb, D
   return cdef[fp->offset[plane] + y * stride + x];
 }
 
-/* Wiener filter process (7.17.4) for 8-bit: InterRound0 = 3, InterRound1 = 11. */
-INLINE void lr_wiener(DEV const FrameParams *fp, int plane, THR const LrBlock *lb, DEV const uint8_t *cdef,
-                      DEV const uint8_t *dbk, DEV uint8_t *out, THR const LrUnit *u) {
+/* Wiener filter process (7.17.4): InterRound0 = 3, InterRound1 = 11; the
+ * intermediate clamp scales with the bitdepth. */
+INLINE void KNAME(lr_wiener)(DEV const FrameParams *fp, int plane, THR const LrBlock *lb, DEV const KPIX *cdef,
+                             DEV const KPIX *dbk, DEV KPIX *out, THR const LrUnit *u) {
   int vf[7], hf[7];
   vf[3] = 128;
   hf[3] = 128;
@@ -76,13 +62,14 @@ INLINE void lr_wiener(DEV const FrameParams *fp, int plane, THR const LrBlock *l
     hf[3] -= 2 * u->wiener[1][i];
   }
   const int round0 = 3, round1 = 11;
-  int offset = 1 << (8 + FILTER_BITS - round0 - 1);
-  int limit = (1 << (8 + 1 + FILTER_BITS - round0)) - 1;
+  int bd = fp->bitdepth;
+  int offset = 1 << (bd + FILTER_BITS - round0 - 1);
+  int limit = (1 << (bd + 1 + FILTER_BITS - round0)) - 1;
   int inter[10][4];
   for (int r = 0; r < lb->h + 6; r++)
     for (int c = 0; c < lb->w; c++) {
       int s = 0;
-      for (int t = 0; t < 7; t++) s += hf[t] * lr_src(fp, plane, lb, cdef, dbk, lb->x + c + t - 3, lb->y + r - 3);
+      for (int t = 0; t < 7; t++) s += hf[t] * KNAME(lr_src)(fp, plane, lb, cdef, dbk, lb->x + c + t - 3, lb->y + r - 3);
       int v = Round2(s, round0);
       inter[r][c] = Clip3(-offset, limit - offset, v);
     }
@@ -92,13 +79,13 @@ INLINE void lr_wiener(DEV const FrameParams *fp, int plane, THR const LrBlock *l
       int s = 0;
       for (int t = 0; t < 7; t++) s += vf[t] * inter[r + t][c];
       int v = Round2(s, round1);
-      out[fp->offset[plane] + (lb->y + r) * stride + lb->x + c] = (uint8_t)Clip3(0, 255, v);
+      out[fp->offset[plane] + (lb->y + r) * stride + lb->x + c] = (KPIX)Clip3(0, fp->px_max, v);
     }
 }
 
 /* Box filter process (7.17.3); F gets w x h values (row stride 4). */
-INLINE void lr_box(DEV const FrameParams *fp, int plane, THR const LrBlock *lb, DEV const uint8_t *cdef,
-                   DEV const uint8_t *dbk, int set, int pass, THR int *F) {
+INLINE void KNAME(lr_box)(DEV const FrameParams *fp, int plane, THR const LrBlock *lb, DEV const KPIX *cdef,
+                          DEV const KPIX *dbk, int set, int pass, THR int *F) {
   int r = Sgr_Params[set][pass * 2 + 0];
   if (r == 0) return;
   int eps = Sgr_Params[set][pass * 2 + 1];
@@ -112,12 +99,13 @@ INLINE void lr_box(DEV const FrameParams *fp, int plane, THR const LrBlock *lb, 
       long a = 0, b = 0;
       for (int dy = -r; dy <= r; dy++)
         for (int dx = -r; dx <= r; dx++) {
-          long c = lr_src(fp, plane, lb, cdef, dbk, lb->x + j + dx, lb->y + i + dy);
+          long c = KNAME(lr_src)(fp, plane, lb, cdef, dbk, lb->x + j + dx, lb->y + i + dy);
           a += c * c;
           b += c;
         }
-      /* BitDepth 8: the Round2 by 0 are no-ops */
-      long d = b;
+      /* normalise the sums to an 8-bit scale (no-ops at 8 bits) */
+      a = Round2L(a, 2 * fp->coeff_shift);
+      long d = Round2L(b, fp->coeff_shift);
       long p = a * n - d * d;
       if (p < 0) p = 0;
       long z = (p * s + (1L << (SGRPROJ_MTABLE_BITS - 1))) >> SGRPROJ_MTABLE_BITS;
@@ -151,11 +139,11 @@ INLINE void lr_box(DEV const FrameParams *fp, int plane, THR const LrBlock *lb, 
 }
 
 /* Self guided filter process (7.17.2) */
-INLINE void lr_sgr(DEV const FrameParams *fp, int plane, THR const LrBlock *lb, DEV const uint8_t *cdef,
-                   DEV const uint8_t *dbk, DEV uint8_t *out, THR const LrUnit *u) {
+INLINE void KNAME(lr_sgr)(DEV const FrameParams *fp, int plane, THR const LrBlock *lb, DEV const KPIX *cdef,
+                          DEV const KPIX *dbk, DEV KPIX *out, THR const LrUnit *u) {
   int flt0[16], flt1[16];
-  lr_box(fp, plane, lb, cdef, dbk, u->set, 0, flt0);
-  lr_box(fp, plane, lb, cdef, dbk, u->set, 1, flt1);
+  KNAME(lr_box)(fp, plane, lb, cdef, dbk, u->set, 0, flt0);
+  KNAME(lr_box)(fp, plane, lb, cdef, dbk, u->set, 1, flt1);
   int w0 = u->xqd[0], w1 = u->xqd[1];
   int w2 = (1 << SGRPROJ_PRJ_BITS) - w0 - w1;
   int r0 = Sgr_Params[u->set][0], r1 = Sgr_Params[u->set][2];
@@ -168,18 +156,18 @@ INLINE void lr_sgr(DEV const FrameParams *fp, int plane, THR const LrBlock *lb, 
       v += r0 ? w0 * flt0[i * 4 + j] : w0 * uu;
       v += r1 ? w2 * flt1[i * 4 + j] : w2 * uu;
       int s = Round2(v, SGRPROJ_RST_BITS + SGRPROJ_PRJ_BITS);
-      out[o] = (uint8_t)Clip3(0, 255, s);
+      out[o] = (KPIX)Clip3(0, fp->px_max, s);
     }
 }
 
 /* loop_restore_block( ) with an explicit unit (used by the parameter search
  * as well); RESTORE_NONE copies the CDEF output. */
-INLINE void lr_apply(DEV const FrameParams *fp, int plane, THR const LrBlock *lb, DEV const uint8_t *cdef,
-                     DEV const uint8_t *dbk, DEV uint8_t *out, THR const LrUnit *u) {
+INLINE void KNAME(lr_apply)(DEV const FrameParams *fp, int plane, THR const LrBlock *lb, DEV const KPIX *cdef,
+                            DEV const KPIX *dbk, DEV KPIX *out, THR const LrUnit *u) {
   if (u->type == RESTORE_WIENER) {
-    lr_wiener(fp, plane, lb, cdef, dbk, out, u);
+    KNAME(lr_wiener)(fp, plane, lb, cdef, dbk, out, u);
   } else if (u->type == RESTORE_SGRPROJ) {
-    lr_sgr(fp, plane, lb, cdef, dbk, out, u);
+    KNAME(lr_sgr)(fp, plane, lb, cdef, dbk, out, u);
   } else {
     int stride = fp->stride[plane];
     for (int i = 0; i < lb->h; i++)
@@ -191,14 +179,12 @@ INLINE void lr_apply(DEV const FrameParams *fp, int plane, THR const LrBlock *lb
 }
 
 /* One work item: plane and 4x4 luma block (row, col) of the frame. */
-INLINE void lr_block(DEV const FrameParams *fp, int plane, int row, int col, DEV const uint8_t *cdef,
-                     DEV const uint8_t *dbk, DEV uint8_t *out, DEV const LrUnit *units) {
+INLINE void KNAME(lr_block)(DEV const FrameParams *fp, int plane, int row, int col, DEV const KPIX *cdef,
+                            DEV const KPIX *dbk, DEV KPIX *out, DEV const LrUnit *units) {
   LrBlock lb;
-  if (!lr_block_setup(fp, plane, row, col, &lb)) return;
+  if (!KNAME(lr_block_setup)(fp, plane, row, col, &lb)) return;
   LrUnit u;
   if (fp->lr_type[plane] == RESTORE_NONE) u.type = RESTORE_NONE;
-  else u = units[lr_unit_index(fp, plane, &lb)];
-  lr_apply(fp, plane, &lb, cdef, dbk, out, &u);
+  else u = units[KNAME(lr_unit_index)(fp, plane, &lb)];
+  KNAME(lr_apply)(fp, plane, &lb, cdef, dbk, out, &u);
 }
-
-#endif

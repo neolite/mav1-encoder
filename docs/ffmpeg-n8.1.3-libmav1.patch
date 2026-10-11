@@ -60,10 +60,10 @@ index 695214f..003819e 100644
  extern const FFCodec ff_libspeex_encoder;
 diff --git a/libavcodec/libmav1.c b/libavcodec/libmav1.c
 new file mode 100644
-index 0000000..95902f8
+index 0000000..1111111
 --- /dev/null
 +++ b/libavcodec/libmav1.c
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,265 @@
 +/*
 + * AV1 encoding through mav1 (Metal GPU / CPU kernels)
 + *
@@ -78,6 +78,7 @@ index 0000000..95902f8
 +#include <mav1.h>
 +
 +#include "libavutil/fifo.h"
++#include "libavutil/mastering_display_metadata.h"
 +#include "libavutil/mem.h"
 +#include "libavutil/opt.h"
 +#include "libavutil/pixdesc.h"
@@ -101,6 +102,7 @@ index 0000000..95902f8
 +    int switchable_interp;
 +    int me_range;
 +    int turbo;
++    int hdr;
 +} LibMav1Context;
 +
 +static av_cold int libmav1_init(AVCodecContext *avctx)
@@ -110,6 +112,7 @@ index 0000000..95902f8
 +    char err[256];
 +
 +    mav1_default_config(&cfg, avctx->width, avctx->height);
++    cfg.bitdepth    = avctx->pix_fmt == AV_PIX_FMT_YUV420P10LE ? 10 : 8;
 +    cfg.use_metal   = ctx->metal;
 +    cfg.qindex      = ctx->qindex;
 +    cfg.loop_filter = ctx->loop_filter;
@@ -120,6 +123,48 @@ index 0000000..95902f8
 +    cfg.switchable_interp = ctx->switchable_interp;
 +    cfg.me_range    = ctx->me_range;
 +    cfg.turbo       = ctx->turbo;
++
++    /* color description from lavc context */
++    if (avctx->color_primaries != AVCOL_PRI_UNSPECIFIED)
++        cfg.color_primaries = avctx->color_primaries;
++    if (avctx->color_trc != AVCOL_TRC_UNSPECIFIED)
++        cfg.transfer_characteristics = avctx->color_trc;
++    if (avctx->colorspace != AVCOL_SPC_UNSPECIFIED)
++        cfg.matrix_coefficients = avctx->colorspace;
++    cfg.color_range = avctx->color_range == AVCOL_RANGE_JPEG ? 1 : 0;
++
++    /* HDR metadata (auto-enabled with BT.2020 + SMPTE 2084 or explicit opt) */
++    if (ctx->hdr || (avctx->color_primaries == AVCOL_PRI_BT2020 &&
++                     avctx->color_trc == AVCOL_TRC_SMPTE2084)) {
++        cfg.hdr = 1;
++        if (cfg.color_primaries < 0) cfg.color_primaries = 9;
++        if (cfg.transfer_characteristics < 0) cfg.transfer_characteristics = 16;
++        if (cfg.matrix_coefficients < 0) cfg.matrix_coefficients = 9;
++        /* default BT.2020 mastering display */
++        cfg.mastering_display[0] = 46423; cfg.mastering_display[1] = 19137;
++        cfg.mastering_display[2] = 11140; cfg.mastering_display[3] = 52225;
++        cfg.mastering_display[4] = 8586;  cfg.mastering_display[5] = 3015;
++        cfg.mastering_display[6] = 20493; cfg.mastering_display[7] = 21568;
++        cfg.max_luma = 1000 * 256;
++        cfg.min_luma = 1;
++    }
++
++    /* rate control */
++    if (avctx->bit_rate > 0) {
++        cfg.bitrate = (int)(avctx->bit_rate / 1000);
++        cfg.rc = avctx->rc_max_rate > 0 && avctx->rc_max_rate <= avctx->bit_rate
++                     ? MAV1_RC_CBR : MAV1_RC_VBR;
++        if (avctx->rc_buffer_size > 0)
++            cfg.vbv_size = (int)(avctx->rc_buffer_size / 1000);
++        if (avctx->framerate.num > 0 && avctx->framerate.den > 0) {
++            cfg.fps_num = avctx->framerate.num;
++            cfg.fps_den = avctx->framerate.den;
++        } else if (avctx->time_base.num > 0 && avctx->time_base.den > 0) {
++            cfg.fps_num = avctx->time_base.den;
++            cfg.fps_den = avctx->time_base.num;
++        }
++    }
++
 +    /* match mav1enc --turbo: turbo implies fast mode, which disables the
 +     * expensive search stages (restoration, tx search/depth, dual interp)
 +     * and runs two tile columns */
@@ -135,7 +180,8 @@ index 0000000..95902f8
 +        av_log(avctx, AV_LOG_ERROR, "mav1_create failed: %s\n", err);
 +        return AVERROR_EXTERNAL;
 +    }
-+    av_log(avctx, AV_LOG_VERBOSE, "mav1 backend: %s\n", mav1_backend_name(ctx->enc));
++    av_log(avctx, AV_LOG_VERBOSE, "mav1 backend: %s (%d-bit)\n",
++           mav1_backend_name(ctx->enc), cfg.bitdepth);
 +
 +    if (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) {
 +        uint8_t hdr[64];
@@ -163,7 +209,6 @@ index 0000000..95902f8
 +    if (!ctx->flushing) {
 +        const uint8_t *planes[3] = { NULL, NULL, NULL };
 +        int strides[3] = { 0, 0, 0 };
-+
 +
 +        if (!ctx->frame) {
 +            ctx->frame = av_frame_alloc();
@@ -250,6 +295,7 @@ index 0000000..95902f8
 +    { "txsearch",  "Transform type search",                       OFFSET(tx_search),   AV_OPT_TYPE_BOOL, { .i64 = 1 },   0, 1,   VE },
 +    { "me_range",  "Full-pel motion search range",                OFFSET(me_range),    AV_OPT_TYPE_INT,  { .i64 = 32 },  0, 256, VE },
 +    { "turbo",     "Speed mode (implies fast, altref 2, leaf)",   OFFSET(turbo),       AV_OPT_TYPE_BOOL, { .i64 = 0 },   0, 1,   VE },
++    { "hdr",       "Emit HDR10 metadata OBUs (implies BT.2020 + PQ)", OFFSET(hdr),     AV_OPT_TYPE_BOOL, { .i64 = 0 },   0, 1,   VE },
 +    { NULL },
 +};
 +
@@ -262,6 +308,7 @@ index 0000000..95902f8
 +
 +static const FFCodecDefault libmav1_defaults[] = {
 +    { "g", "0" },
++    { "b", "0" },
 +    { NULL },
 +};
 +
@@ -276,8 +323,9 @@ index 0000000..95902f8
 +    .priv_data_size = sizeof(LibMav1Context),
 +    .p.priv_class   = &libmav1_class,
 +    .defaults       = libmav1_defaults,
-+    CODEC_PIXFMTS(AV_PIX_FMT_YUV420P),
-+    .p.capabilities = AV_CODEC_CAP_DR1,
++    CODEC_PIXFMTS(AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV420P10LE),
++    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
 +    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 +    .p.wrapper_name = "libmav1",
 +};
++

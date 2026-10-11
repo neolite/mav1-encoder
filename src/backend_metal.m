@@ -10,8 +10,7 @@
 #include "backend.h"
 #include "enc_internal.h"
 #include "kernels_src.h"
-#include "kernels/k_analysis.h"
-#include "kernels/k_me.h"
+#include "kernels/kernel_set.h"
 #include <dispatch/dispatch.h>
 
 @interface Mav1MetalState : NSObject
@@ -101,7 +100,7 @@ static void enc_qpel(Backend *b, id<MTLComputeCommandEncoder> enc, struct Mav1En
   MetalBackend *m = (MetalBackend *)b;
   Mav1MetalState *s = ST(b);
   const FrameParams *fp = ENC_PARAMS(e);
-  long eb = qp_entry_bytes(fp);
+  long eb = KNAME(qp_entry_bytes)(fp);
   int buildLast, buildGold = 0;
   NSUInteger n = (NSUInteger)fp->frame_w * fp->frame_h;
   if (e->qpc) {
@@ -169,7 +168,7 @@ static void enc_me(Backend *b, id<MTLComputeCommandEncoder> enc, struct Mav1Enco
                    int nsb, int prune) {
   MetalBackend *mb = (MetalBackend *)b;
   Mav1MetalState *s = ST(b);
-  long eb = qp_entry_bytes(ENC_PARAMS(e));
+  long eb = KNAME(qp_entry_bytes)(ENC_PARAMS(e));
   [enc setComputePipelineState:s.me];
   [enc setBuffer:wrap(s, &e->params) offset:0 atIndex:0];
   [enc setBuffer:wrap(s, &e->src) offset:0 atIndex:1];
@@ -222,13 +221,13 @@ static void enc_ana(Backend *b, Mav1MetalState *s, id<MTLComputeCommandEncoder> 
   {
     MetalBackend *mb = (MetalBackend *)b;
     int useHp = !fp->frame_is_intra && (fp->turbo & T_ME_HPEL) && !getenv("MAV1_NOAHP");
-    long eb = qp_entry_bytes(fp);
+    long eb = KNAME(qp_entry_bytes)(fp);
     const Buf *qb = e->qpc ? &e->qpc->buf : &e->hpel;
     [enc setBuffer:wrap(s, qb) offset:(NSUInteger)(useHp ? mb->qpLast * eb : 0) atIndex:11];
     [enc setBuffer:wrap(s, qb) offset:(NSUInteger)(useHp ? mb->qpGold * eb : 0) atIndex:12];
     [enc setBytes:&useHp length:sizeof useHp atIndex:13];
   }
-  NSUInteger n = (NSUInteger)nsb * (1u << (2 * level)) * level_slots(fp, level);
+  NSUInteger n = (NSUInteger)nsb * (1u << (2 * level)) * KNAME(level_slots)(fp, level);
   if (level == 3 && (fp->turbo & T_INTRA) && fp->fast && !fp->frame_is_intra && !getenv("MAV1_NOL3O")) {
     /* 8x8: one SIMD group per 16x16 node, 8 lanes per block */
     [enc setComputePipelineState:s.analyzeL3];
@@ -281,7 +280,7 @@ static void mtl_analyze(Backend *b, struct Mav1Encoder *e) {
     free(gc);
   }
   dispatch_apply((size_t)e->num_sbs, DISPATCH_APPLY_AUTO, ^(size_t i) {
-    analyze_sb_table(fp, (int)i, (const long *)e->acosts.base, (const BlockInfo *)e->ainfos.base, ENC_BLOCKS(e),
+    KNAME(analyze_sb_table)(fp, (int)i, (const long *)e->acosts.base, (const BlockInfo *)e->ainfos.base, ENC_BLOCKS(e),
                      ENC_SBS(e));
   });
 }
@@ -337,7 +336,7 @@ static void mtl_frame_core(Backend *b, struct Mav1Encoder *e) {
     kprof_n[r]++;
     if (e->qpc) qpc_drop((MetalBackend *)b, e);
     dispatch_apply((size_t)e->num_sbs, DISPATCH_APPLY_AUTO, ^(size_t i) {
-      analyze_sb_table(fp, (int)i, (const long *)e->acosts.base, (const BlockInfo *)e->ainfos.base, ENC_BLOCKS(e), ENC_SBS(e));
+      KNAME(analyze_sb_table)(fp, (int)i, (const long *)e->acosts.base, (const BlockInfo *)e->ainfos.base, ENC_BLOCKS(e), ENC_SBS(e));
     });
     if (e->cfg.intra_edge_filter) {
       uint8_t *ys = calloc((size_t)e->mi_rows * e->mi_cols, 1), *uvs = calloc((size_t)e->mi_rows * e->mi_cols, 1);
@@ -402,7 +401,7 @@ static void mtl_frame_core(Backend *b, struct Mav1Encoder *e) {
     if (ct) fprintf(stderr, " b%d %.1f", k, (CFAbsoluteTimeGetCurrent() - c0) * 1e3);
     int sb0 = k * rowsPer * e->sb_cols, nsb = k_min(e->num_sbs - sb0, rowsPer * e->sb_cols);
     dispatch_apply((size_t)nsb, DISPATCH_APPLY_AUTO, ^(size_t i) {
-      analyze_sb_table(fp, sb0 + (int)i, (const long *)e->acosts.base, (const BlockInfo *)e->ainfos.base,
+      KNAME(analyze_sb_table)(fp, sb0 + (int)i, (const long *)e->acosts.base, (const BlockInfo *)e->ainfos.base,
                        ENC_BLOCKS(e), ENC_SBS(e));
     });
     if (ys) edge_types_rows(e, ys, uvs, k * rowsPer, k_min(e->sb_rows, (k + 1) * rowsPer));
@@ -472,7 +471,7 @@ static void mtl_filter(Backend *b, struct Mav1Encoder *e) {
       [enc setBuffer:wrap(s, &e->lfmask) offset:0 atIndex:3];
       NSUInteger tc = MIN((NSUInteger)64, s.cdef.maxTotalThreadsPerThreadgroup);
       int np = e->num_cdef_presets;
-      long fb = (long)e->frame_bytes;
+      long fb = (long)e->frame_bytes * e->pxsize;
       [enc setBuffer:wrap(s, &e->cdefbuf) offset:0 atIndex:2];
       [enc setBytes:&np length:sizeof np atIndex:4];
       [enc setBytes:&fb length:sizeof fb atIndex:5];
@@ -509,9 +508,10 @@ static int turbo_mask(const Mav1Encoder *e) {
   return e->cfg.turbo ? (getenv("MAV1_TURBO") ? (int)strtol(getenv("MAV1_TURBO"), NULL, 0) : 0x47CBF1) : 0;
 }
 
-static Mav1MetalState *proto_for_mask(int mask, char *err, size_t errlen) {
-  /* the library and pipelines are built once per process per turbo mask;
-   * every backend (frame engine) has its own command queue and buffers */
+static Mav1MetalState *proto_for_mask_bd(int mask, int bd, char *err, size_t errlen) {
+  /* the library and pipelines are built once per process per (turbo mask,
+   * bitdepth) pair; every backend (frame engine) has its own command queue
+   * and buffers */
   static NSMutableDictionary *protos;
   static dispatch_queue_t pq;
   static dispatch_once_t once;
@@ -521,8 +521,9 @@ static Mav1MetalState *proto_for_mask(int mask, char *err, size_t errlen) {
   });
   __block Mav1MetalState *proto;
   __block NSString *perr;
+  int key = mask | (bd << 24);
   dispatch_sync(pq, ^{
-    proto = protos[@(mask)];
+    proto = protos[@(key)];
     if (proto) return;
     Mav1MetalState *s = [Mav1MetalState new];
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
@@ -534,7 +535,8 @@ static Mav1MetalState *proto_for_mask(int mask, char *err, size_t errlen) {
     MTLCompileOptions *opt = [MTLCompileOptions new];
     opt.mathMode = MTLMathModeSafe;
     NSError *nerr = nil;
-    NSString *src = [NSString stringWithFormat:@"#define MAV1_TURBO_MASK 0x%X\n%s", mask, kMav1KernelSource];
+    NSString *src = [NSString stringWithFormat:@"#define MAV1_BD %d\n#define MAV1_TURBO_MASK 0x%X\n%s", bd, mask,
+                                                     kMav1KernelSource];
     id<MTLLibrary> lib = [dev newLibraryWithSource:src options:opt error:&nerr];
     if (!lib) {
       perr = [@"Metal kernel compilation failed: " stringByAppendingString:nerr.localizedDescription];
@@ -556,7 +558,7 @@ static Mav1MetalState *proto_for_mask(int mask, char *err, size_t errlen) {
         perr = [@"pipeline creation failed: " stringByAppendingString:nerr.localizedDescription];
         return;
       }
-      protos[@(mask)] = s;
+      protos[@(key)] = s;
       proto = s;
       if (getenv("MAV1_TL")) fprintf(stderr, "init: pipelines %.1f ms\n", (CFAbsoluteTimeGetCurrent() - t0i) * 1e3);
       if (getenv("MAV1_PSO"))
@@ -575,7 +577,7 @@ static Mav1MetalState *proto_for_mask(int mask, char *err, size_t errlen) {
 
 Backend *backend_metal_create(struct Mav1Encoder *e, char *err, size_t errlen) {
   @autoreleasepool {
-    Mav1MetalState *proto = proto_for_mask(turbo_mask(e), err, errlen);
+    Mav1MetalState *proto = proto_for_mask_bd(turbo_mask(e), e->bd, err, errlen);
     if (!proto) return NULL;
     Mav1MetalState *s = [Mav1MetalState new];
     s.device = proto.device;

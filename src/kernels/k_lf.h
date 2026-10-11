@@ -4,18 +4,15 @@
  * on plane and pass. One work item filters all edges of one 4-sample row
  * (pass 0, vertical edges) or column (pass 1, horizontal edges); the spec
  * guarantees order independence within a pass. */
-#ifndef K_LF_H
-#define K_LF_H
 
-#include "k_scan.h"
 
 /* info = MiSize | skip << 5 | tx_depth << 6 (LoopfilterTxSizes of the block). */
-INLINE int lf_tx_size(int info, int plane) {
+INLINE int KNAME(lf_tx_size)(int info, int plane) {
   return plane == 0 ? depth_tx_size(info & 31, (info >> 6) & 3) : uv_tx_size(info & 31, 1, 1);
 }
 
-INLINE void lf_sample(DEV uint8_t *px, int pitch /* step across the edge */, int plane, int lvl, int sharp,
-                      int filterSize) {
+INLINE void KNAME(lf_sample)(DEV KPIX *px, int pitch /* step across the edge */, int plane, int lvl, int sharp,
+                             int filterSize, int bdMid, int bdHalf) {
   int shift = sharp > 4 ? 2 : (sharp > 0 ? 1 : 0);
   int limit = sharp > 0 ? Clip3(1, 9 - sharp, lvl >> shift) : k_max(1, lvl >> shift);
   int blimit = 2 * (lvl + 2) + limit;
@@ -63,18 +60,19 @@ INLINE void lf_sample(DEV uint8_t *px, int pitch /* step across the edge */, int
     flatMask2 = m == 0;
   }
   if (filterSize == 4 || !flatMask) {
-    /* narrow filter */
-    int ps1 = p1 - 128, ps0 = p0 - 128, qs0 = q0 - 128, qs1 = q1 - 128;
-    int filter = hevMask ? Clip3(-128, 127, ps1 - qs1) : 0;
-    filter = Clip3(-128, 127, filter + 3 * (qs0 - ps0));
-    int filter1 = Clip3(-128, 127, filter + 4) >> 3;
-    int filter2 = Clip3(-128, 127, filter + 3) >> 3;
-    px[0] = (uint8_t)(Clip3(-128, 127, qs0 - filter1) + 128);
-    px[-pitch] = (uint8_t)(Clip3(-128, 127, ps0 + filter2) + 128);
+    /* narrow filter (7.14.1): the values are shifted by bdMid = 0x80 << (bd-8)
+     * and clamped to +-bdHalf = 1 << (bd-1) */
+    int ps1 = p1 - bdMid, ps0 = p0 - bdMid, qs0 = q0 - bdMid, qs1 = q1 - bdMid;
+    int filter = hevMask ? Clip3(-bdHalf, bdHalf - 1, ps1 - qs1) : 0;
+    filter = Clip3(-bdHalf, bdHalf - 1, filter + 3 * (qs0 - ps0));
+    int filter1 = Clip3(-bdHalf, bdHalf - 1, filter + 4) >> 3;
+    int filter2 = Clip3(-bdHalf, bdHalf - 1, filter + 3) >> 3;
+    px[0] = (KPIX)(Clip3(-bdHalf, bdHalf - 1, qs0 - filter1) + bdMid);
+    px[-pitch] = (KPIX)(Clip3(-bdHalf, bdHalf - 1, ps0 + filter2) + bdMid);
     if (!hevMask) {
       filter = Round2(filter1, 1);
-      px[pitch] = (uint8_t)(Clip3(-128, 127, qs1 - filter) + 128);
-      px[-2 * pitch] = (uint8_t)(Clip3(-128, 127, ps1 + filter) + 128);
+      px[pitch] = (KPIX)(Clip3(-bdHalf, bdHalf - 1, qs1 - filter) + bdMid);
+      px[-2 * pitch] = (KPIX)(Clip3(-bdHalf, bdHalf - 1, ps1 + filter) + bdMid);
     }
   } else {
     int log2Size = (filterSize == 8 || !flatMask2) ? 3 : 4;
@@ -90,7 +88,7 @@ INLINE void lf_sample(DEV uint8_t *px, int pitch /* step across the edge */, int
       }
       F[i + n] = Round2(t, log2Size);
     }
-    for (int i = -n; i < n; i++) px[i * pitch] = (uint8_t)F[i + n];
+    for (int i = -n; i < n; i++) px[i * pitch] = (KPIX)F[i + n];
   }
 #undef S
 }
@@ -101,13 +99,13 @@ INLINE void lf_sample(DEV uint8_t *px, int pitch /* step across the edge */, int
  * independent (a filter is no longer than the transforms on either side,
  * so neighbouring edges never touch the same samples), so lines may be
  * split into segments. */
-INLINE void lf_line_seg(DEV const FrameParams *fp, DEV uint8_t *rec, DEV const uint8_t *miSizes, int plane, int pass,
-                        int line, int k0, int k1) {
+INLINE void KNAME(lf_line_seg)(DEV const FrameParams *fp, DEV KPIX *rec, DEV const uint8_t *miSizes, int plane, int pass,
+                               int line, int k0, int k1) {
   int sub = plane > 0;
   int lvl = Clip3(0, MAX_LOOP_FILTER, fp->lf_level[plane == 0 ? pass : plane + 1]);
   if (lvl == 0) return;
   int stride = fp->stride[plane];
-  DEV uint8_t *base = rec + fp->offset[plane];
+  DEV KPIX *base = rec + fp->offset[plane];
   int dx = pass == 0, dy = pass == 1;
   int n = k_min(k1, pass == 0 ? fp->mi_cols : fp->mi_rows);
   int step = 1 << sub;
@@ -120,8 +118,8 @@ INLINE void lf_line_seg(DEV const FrameParams *fp, DEV uint8_t *rec, DEV const u
     if (pass == 1 && y == 0) continue;
     int xP = x >> sub, yP = y >> sub;
     int prevRow = row - (dy << sub), prevCol = col - (dx << sub);
-    int txSz = lf_tx_size(miSizes[row * fp->mi_cols + col], plane);
-    int prevTxSz = lf_tx_size(miSizes[prevRow * fp->mi_cols + prevCol], plane);
+    int txSz = KNAME(lf_tx_size)(miSizes[row * fp->mi_cols + col], plane);
+    int prevTxSz = KNAME(lf_tx_size)(miSizes[prevRow * fp->mi_cols + prevCol], plane);
     /* Inner transform edges only occur in intra blocks, which are always
      * filtered, so applyFilter = isTxEdge. */
     int isTxEdge = pass == 0 ? (xP % Tx_Width[txSz]) == 0 : (yP % Tx_Height[txSz]) == 0;
@@ -130,14 +128,13 @@ INLINE void lf_line_seg(DEV const FrameParams *fp, DEV uint8_t *rec, DEV const u
     int filterSize = plane == 0 ? k_min(16, baseSize) : k_min(8, baseSize);
     for (int i = 0; i < MI_SIZE; i++) {
       int sx = xP + dy * i, sy = yP + dx * i;
-      lf_sample(base + sy * stride + sx, pass == 0 ? 1 : stride, plane, lvl, fp->lf_sharpness, filterSize);
+      KNAME(lf_sample)(base + sy * stride + sx, pass == 0 ? 1 : stride, plane, lvl, fp->lf_sharpness, filterSize,
+                       fp->bd_mid, fp->bd_half);
     }
   }
 }
 
-INLINE void lf_line(DEV const FrameParams *fp, DEV uint8_t *rec, DEV const uint8_t *miSizes, int plane, int pass,
-                    int line) {
-  lf_line_seg(fp, rec, miSizes, plane, pass, line, 0, 1 << 30);
+INLINE void KNAME(lf_line)(DEV const FrameParams *fp, DEV KPIX *rec, DEV const uint8_t *miSizes, int plane, int pass,
+                           int line) {
+  KNAME(lf_line_seg)(fp, rec, miSizes, plane, pass, line, 0, 1 << 30);
 }
-
-#endif

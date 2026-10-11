@@ -3,8 +3,6 @@
  * sections 7.11.3.2 (rounding), 7.11.3.3 (motion vector scaling, unscaled
  * reference) and 7.11.3.4 (block inter prediction).
  */
-#ifndef K_INTER_H
-#define K_INTER_H
 
 #include "k_common.h"
 
@@ -16,13 +14,15 @@
 /* CPU fast path of both predictors (unscaled references: the filter phases
  * are constant over the block). Same arithmetic as the spec loops: rows
  * that only meet zero vertical taps are skipped, interior rows read
- * without clamping. Writes Clip1( Round2( ., round1 ) ) bytes to dst8, or
- * Round2( ., round1 ) ints to dst32. */
-static inline void inter_fast(const uint8_t *ref, int refStride, int lastX, int lastY, int startX, int startY, int w,
-                              int h, int fh, int fv, int round1, uint8_t *dst8, int32_t *dst32, int dstStride,
-                              int32_t *tmp) {
+ * without clamping. Writes Clip1( Round2( ., round1 ) ) pixels to dst8, or
+ * Round2( ., round1 ) ints to dst32. The NEON loads are 8-bit only; 10-bit
+ * runs the identical scalar loops. */
+static inline void KNAME(inter_fast)(const KPIX *ref, int refStride, int lastX, int lastY, int startX, int startY, int w,
+                                     int h, int fh, int fv, int round1, int pxMax, KPIX *dst8, int32_t *dst32, int dstStride,
+                                     int32_t *tmp) {
   int x0 = (startX >> 10) - 3, y0 = (startY >> 10) - 3;
   int px = (startX >> 6) & SUBPEL_MASK, py = (startY >> 6) & SUBPEL_MASK;
+  (void)pxMax;
   int fH[8], fV[8];
   for (int t = 0; t < 8; t++) { fH[t] = Subpel_Filters[fh][px][t]; fV[t] = Subpel_Filters[fv][py][t]; }
   int rlo = py ? 0 : 3, rhi = py ? h + 7 : h + 3;
@@ -31,11 +31,11 @@ static inline void inter_fast(const uint8_t *ref, int refStride, int lastX, int 
   if (!interior)
     for (int c = 0; c < w + 7; c++) clipX[c] = Clip3(0, lastX, x0 + c);
   for (int r = rlo; r < rhi; r++) {
-    const uint8_t *row = ref + Clip3(0, lastY, y0 + r) * refStride;
+    const KPIX *row = ref + Clip3(0, lastY, y0 + r) * refStride;
     int32_t *t = tmp + r * w;
     if (!px) {
       int c = 0;
-#if defined(__aarch64__)
+#if defined(__aarch64__) && MAV1_BD == 8
       if (interior)
         for (; c + 8 <= w; c += 8) {
           uint16x8_t u = vshll_n_u8(vld1_u8(row + x0 + 3 + c), 4);
@@ -45,9 +45,9 @@ static inline void inter_fast(const uint8_t *ref, int refStride, int lastX, int 
 #endif
       for (; c < w; c++) t[c] = (int32_t)(interior ? row[x0 + 3 + c] : row[clipX[c + 3]]) << 4;
     } else if (interior) {
-      const uint8_t *q = row + x0;
+      const KPIX *q = row + x0;
       int c = 0;
-#if defined(__aarch64__)
+#if defined(__aarch64__) && MAV1_BD == 8
       /* eight taps of eight outputs; each tap's window is one u8x8 load */
       for (; c + 8 <= w; c += 8) {
         int32x4_t alo = vdupq_n_s32(0), ahi = alo;
@@ -79,7 +79,7 @@ static inline void inter_fast(const uint8_t *ref, int refStride, int lastX, int 
   for (int r = 0; r < h; r++) {
     const int32_t *t = tmp + r * w;
     int c = 0;
-#if defined(__aarch64__)
+#if defined(__aarch64__) && MAV1_BD == 8
     for (; c + 4 <= w; c += 4) {
       int64x2_t lo, hi;
       if (!py) {
@@ -99,8 +99,8 @@ static inline void inter_fast(const uint8_t *ref, int refStride, int lastX, int 
       lo = vshlq_s64(vaddq_s64(lo, rrv), sh);
       hi = vshlq_s64(vaddq_s64(hi, rrv), sh);
       int32x4_t v = vuzp1q_s32(vreinterpretq_s32_s64(lo), vreinterpretq_s32_s64(hi));
-      if (dst8) {
-        /* Clip1: saturate s32 -> s16 -> u8 */
+      if (dst8 && MAV1_BD == 8) {
+        /* Clip1: saturate s32 -> s16 -> u8 (8-bit pixels only) */
         uint8x8_t b = vqmovun_s16(vcombine_s16(vqmovn_s32(v), vdup_n_s16(0)));
         vst1_lane_u32((uint32_t *)(dst8 + r * dstStride + c), vreinterpret_u32_u8(b), 0);
       } else {
@@ -111,7 +111,7 @@ static inline void inter_fast(const uint8_t *ref, int refStride, int lastX, int 
     if (!py) {
       for (; c < w; c++) {
         int v = (t[3 * w + c] * 128 + rr) >> round1;
-        if (dst8) dst8[r * dstStride + c] = (uint8_t)Clip1(v);
+        if (dst8) dst8[r * dstStride + c] = (KPIX)Clip3(0, pxMax, v);
         else dst32[r * dstStride + c] = v;
       }
     } else {
@@ -119,7 +119,7 @@ static inline void inter_fast(const uint8_t *ref, int refStride, int lastX, int 
         int a = 0;
         for (int k = 0; k < 8; k++) a += fV[k] * t[k * w + c];
         int v = (a + rr) >> round1;
-        if (dst8) dst8[r * dstStride + c] = (uint8_t)Clip1(v);
+        if (dst8) dst8[r * dstStride + c] = (KPIX)Clip3(0, pxMax, v);
         else dst32[r * dstStride + c] = v;
       }
     }
@@ -133,11 +133,11 @@ static inline void inter_fast(const uint8_t *ref, int refStride, int lastX, int 
  * RefUpscaledWidth / RefFrameHeight (the real frame size, not the 8-aligned
  * allocation). `tmp` must hold (h + 7) * w ints.
  */
-INLINE void predict_inter_block(DEV const uint8_t *ref, int refStride, int refW, int refH,
-                                DEV uint8_t *dst, int dstStride, int x, int y, int w, int h,
-                                int mvRow, int mvCol, int subX, int subY,
-                                int filter, /* InterpFilters: [0] (vertical) | [1] (horizontal) << 2 */
-                                DEV int32_t *tmp) {
+INLINE void KNAME(predict_inter_block)(DEV const KPIX *ref, int refStride, int refW, int refH,
+                                       DEV KPIX *dst, int dstStride, int x, int y, int w, int h,
+                                       int mvRow, int mvCol, int subX, int subY,
+                                       int filter, /* InterpFilters: [0] (vertical) | [1] (horizontal) << 2 */
+                                       DEV int32_t *tmp, int pxMax) {
   const int InterRound0 = 3, InterRound1 = 11;
   /* Motion vector scaling with xScale == yScale == 1 << REF_SCALE_SHIFT. */
   int halfSample = 1 << (SUBPEL_BITS - 1);
@@ -162,7 +162,8 @@ INLINE void predict_inter_block(DEV const uint8_t *ref, int refStride, int refW,
 #ifndef __METAL_VERSION__
   if (w <= 64) {
     (void)intermediateHeight;
-    inter_fast(ref, refStride, lastX, lastY, startX, startY, w, h, fh, fv, InterRound1, dst, NULL, dstStride, tmp);
+    KNAME(inter_fast)(ref, refStride, lastX, lastY, startX, startY, w, h, fh, fv, InterRound1, pxMax, dst, NULL,
+                      dstStride, tmp);
     return;
   }
 #endif
@@ -183,7 +184,7 @@ INLINE void predict_inter_block(DEV const uint8_t *ref, int refStride, int refW,
       int p = (startY & 1023) + yStep * r;
       for (int t = 0; t < 8; t++)
         s += Subpel_Filters[fv][(p >> 6) & SUBPEL_MASK][t] * tmp[((p >> 10) + t) * w + c];
-      dst[r * dstStride + c] = (uint8_t)Clip1(Round2(s, InterRound1));
+      dst[r * dstStride + c] = (KPIX)Clip3(0, pxMax, Round2(s, InterRound1));
     }
   }
 }
@@ -192,11 +193,11 @@ INLINE void predict_inter_block(DEV const uint8_t *ref, int refStride, int refW,
  * vertical filter output rounded by InterRound1 = 7, not clipped.
  * The final sample is Clip1( Round2( p0 + p1, 1 + InterPostRound ) ) with
  * InterPostRound = 4. */
-INLINE void predict_inter_raw(DEV const uint8_t *ref, int refStride, int refW, int refH,
-                              DEV int32_t *dst, int dstStride, int x, int y, int w, int h,
-                                int mvRow, int mvCol, int subX, int subY,
-                                int filter, /* InterpFilters: [0] (vertical) | [1] (horizontal) << 2 */
-                                DEV int32_t *tmp) {
+INLINE void KNAME(predict_inter_raw)(DEV const KPIX *ref, int refStride, int refW, int refH,
+                                     DEV int32_t *dst, int dstStride, int x, int y, int w, int h,
+                                     int mvRow, int mvCol, int subX, int subY,
+                                     int filter, /* InterpFilters: [0] (vertical) | [1] (horizontal) << 2 */
+                                     DEV int32_t *tmp) {
   const int InterRound0 = 3, InterRound1 = 7; /* isCompound */
   /* Motion vector scaling with xScale == yScale == 1 << REF_SCALE_SHIFT. */
   int halfSample = 1 << (SUBPEL_BITS - 1);
@@ -221,7 +222,8 @@ INLINE void predict_inter_raw(DEV const uint8_t *ref, int refStride, int refW, i
 #ifndef __METAL_VERSION__
   if (w <= 64) {
     (void)intermediateHeight;
-    inter_fast(ref, refStride, lastX, lastY, startX, startY, w, h, fh, fv, InterRound1, NULL, dst, dstStride, tmp);
+    KNAME(inter_fast)(ref, refStride, lastX, lastY, startX, startY, w, h, fh, fv, InterRound1, 0, NULL, dst,
+                      dstStride, tmp);
     return;
   }
 #endif
@@ -246,5 +248,3 @@ INLINE void predict_inter_raw(DEV const uint8_t *ref, int refStride, int refW, i
     }
   }
 }
-
-#endif

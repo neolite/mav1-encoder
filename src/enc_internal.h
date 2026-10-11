@@ -81,10 +81,11 @@ typedef struct WCtx {
 struct Mav1Encoder {
   Mav1Config cfg;
   int w, h;
+  int bd, pxsize; /* coded bitdepth and bytes per pixel sample (1 or 2) */
   int mi_cols, mi_rows, sb_cols, sb_rows, num_sbs;
   int tile_cols_log2, tile_cols, tile_w_sb, min_log2_tile_cols, max_log2_tile_cols;
   int stride[3], offset[3], plane_h[3];
-  size_t frame_bytes;
+  size_t frame_bytes;   /* bytes of one (padded) frame: sample count * pxsize */
 
   /* Shared (CPU/GPU) buffers. */
   Buf src, rec, ref, gold, mvgold, params, blocks, sbs, coefs, mats, mvfield, scratch, lfmask, cdefbuf, mescratch, acosts, ainfos, ascratch;
@@ -148,6 +149,16 @@ struct Mav1Encoder {
 
   /* statistics of the last frame */
   Mav1FrameStats last;
+
+  /* rate control (cfg.rc != MAV1_RC_CQP) */
+  long rc_target_bpf;   /* target bits per frame */
+  long rc_bits_avg;     /* smoothed bits of the recent frames */
+  long rc_buffer;       /* current buffer fullness in bits */
+  long rc_buffer_size;  /* buffer size in bits */
+  long rc_drift;        /* signed accumulation of (target - actual) bits */
+  int rc_q_adj;         /* current qindex adjustment */
+  long rc_total;        /* total bits so far */
+  int rc_frames;        /* frames coded so far (of the current adaptation) */
 };
 
 #define ENC_PARAMS(e) ((FrameParams *)(e)->params.base)
@@ -170,5 +181,7 @@ size_t write_sequence_header(const struct Mav1Encoder *e, uint8_t *out);
 size_t write_frame_obu(const struct Mav1Encoder *e, const uint8_t *tile, size_t tileSize, uint8_t *out);
 size_t write_temporal_delimiter(uint8_t *out);
 size_t write_show_existing(int slot, uint8_t *out);
+/* HDR10 metadata OBUs (mastering display + content light level); 0 when off */
+size_t write_hdr_metadata(const struct Mav1Encoder *e, uint8_t *out);
 
 #endif

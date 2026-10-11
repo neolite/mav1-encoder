@@ -7,13 +7,28 @@
  * least squares (alternating vertical / horizontal solves, then a +-1 tap
  * refinement) and every self-guided parameter set with least-squares
  * projection weights. The choice minimises 16 * SSE + lambda * bits.
+ *
+ * The kernels are instantiated per bitdepth (MAV1_BD 10 then 8) and this
+ * search dispatches on fp->bitdepth; its own pixel reads go through
+ * px_get( ), which handles both sample sizes.
  */
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "enc_internal.h"
-#include "kernels/k_lr.h"
+
+#undef MAV1_BD
+#define MAV1_BD 10
+#include "kernels/kernel_set.h"
+#undef MAV1_BD
+#define MAV1_BD 8
+#include "kernels/kernel_set.h"
+
+/* reads the sample at element offset o of a frame buffer of either depth */
+static int px_get(const Mav1Encoder *e, const uint8_t *base, size_t o) {
+  return e->pxsize == 2 ? *(const uint16_t *)(base + o * 2) : base[o];
+}
 
 /* ---- subexp coding (decode_signed_subexp_with_ref_bool inverse) -------- */
 
@@ -91,16 +106,22 @@ typedef struct {
 
 static long unit_sse(UnitCtx *c, const LrUnit *u) {
   Mav1Encoder *e = c->e;
+  int bd = c->fp->bitdepth;
   long sse = 0;
   int stride = e->stride[c->plane];
   for (int b = 0; b < c->nblk; b++) {
     LrBlock lb;
-    lr_block_setup(c->fp, c->plane, c->blk[2 * b], c->blk[2 * b + 1], &lb);
-    lr_apply(c->fp, c->plane, &lb, e->rec.base, e->dbk.base, e->lrout.base, u);
+    KNAME(lr_block_setup)(c->fp, c->plane, c->blk[2 * b], c->blk[2 * b + 1], &lb);
+    if (bd > 8)
+      lr_apply_10(c->fp, c->plane, &lb, (const uint16_t *)e->rec.base, (const uint16_t *)e->dbk.base,
+                  (uint16_t *)e->lrout.base, u);
+    else
+      lr_apply_8(c->fp, c->plane, &lb, (const uint8_t *)e->rec.base, (const uint8_t *)e->dbk.base,
+                 (uint8_t *)e->lrout.base, u);
     for (int i = 0; i < lb.h; i++)
       for (int j = 0; j < lb.w; j++) {
         size_t o = e->offset[c->plane] + (size_t)(lb.y + i) * stride + lb.x + j;
-        int d = (int)e->lrout.base[o] - (int)e->src.base[o];
+        int d = px_get(e, e->lrout.base, o) - px_get(e, e->src.base, o);
         sse += d * d;
       }
   }
@@ -127,7 +148,7 @@ static int solve(int n, double M[3][3], double v[3], double *x) {
     for (int r = i + 1; r < n; r++) {
       double f = M[r][i] / M[i][i];
       for (int k = i; k < n; k++) M[r][k] -= f * M[i][k];
-      v[r] -= f * v[i];
+      v[r] -= v[i] * f;
     }
   }
   for (int i = n - 1; i >= 0; i--) {
@@ -141,6 +162,7 @@ static int solve(int n, double M[3][3], double v[3], double *x) {
 /* Separable least-squares Wiener fit; out[pass][j] in coded units. */
 static void wiener_fit(UnitCtx *c, int out[2][3]) {
   Mav1Encoder *e = c->e;
+  int bd = c->fp->bitdepth;
   int first = c->plane ? 1 : 0, nc = 3 - first;
   double f[7] = {0, 0, 0, 1, 0, 0, 0}, g[7] = {0, 0, 0, 1, 0, 0, 0}; /* vertical, horizontal */
   int stride = e->stride[c->plane];
@@ -149,13 +171,16 @@ static void wiener_fit(UnitCtx *c, int out[2][3]) {
     double M[3][3] = {{0}}, V[3] = {0};
     for (int b = 0; b < c->nblk; b++) {
       LrBlock lb;
-      lr_block_setup(c->fp, c->plane, c->blk[2 * b], c->blk[2 * b + 1], &lb);
+      KNAME(lr_block_setup)(c->fp, c->plane, c->blk[2 * b], c->blk[2 * b + 1], &lb);
       for (int i = 0; i < lb.h; i++)
         for (int j = 0; j < lb.w; j++) {
           double S[7][7];
           for (int v = 0; v < 7; v++)
             for (int h = 0; h < 7; h++)
-              S[v][h] = lr_src(c->fp, c->plane, &lb, e->rec.base, e->dbk.base, lb.x + j + h - 3, lb.y + i + v - 3);
+              S[v][h] = bd > 8 ? lr_src_10(c->fp, c->plane, &lb, (const uint16_t *)e->rec.base,
+                                           (const uint16_t *)e->dbk.base, lb.x + j + h - 3, lb.y + i + v - 3)
+                               : lr_src_8(c->fp, c->plane, &lb, (const uint8_t *)e->rec.base,
+                                          (const uint8_t *)e->dbk.base, lb.x + j + h - 3, lb.y + i + v - 3);
           double Z[7];
           for (int k = 0; k < 7; k++) {
             double s = 0;
@@ -164,7 +189,7 @@ static void wiener_fit(UnitCtx *c, int out[2][3]) {
           }
           double phi[3];
           for (int k = first; k < 3; k++) phi[k - first] = Z[k] + Z[6 - k] - 2 * Z[3];
-          double tgt = e->src.base[e->offset[c->plane] + (size_t)(lb.y + i) * stride + lb.x + j] - Z[3];
+          double tgt = px_get(e, e->src.base, e->offset[c->plane] + (size_t)(lb.y + i) * stride + lb.x + j) - Z[3];
           for (int a = 0; a < nc; a++) {
             V[a] += phi[a] * tgt;
             for (int bb = 0; bb < nc; bb++) M[a][bb] += phi[a] * phi[bb];
@@ -195,20 +220,26 @@ static void wiener_fit(UnitCtx *c, int out[2][3]) {
 /* Least-squares projection weights for self-guided set `set`. */
 static void sgr_fit(UnitCtx *c, int set, int xqd[2]) {
   Mav1Encoder *e = c->e;
+  int bd = c->fp->bitdepth;
   int r0 = Sgr_Params[set][0], r1 = Sgr_Params[set][2];
   int stride = e->stride[c->plane];
   double H00 = 0, H01 = 0, H11 = 0, C0 = 0, C1 = 0;
   for (int b = 0; b < c->nblk; b++) {
     LrBlock lb;
-    lr_block_setup(c->fp, c->plane, c->blk[2 * b], c->blk[2 * b + 1], &lb);
+    KNAME(lr_block_setup)(c->fp, c->plane, c->blk[2 * b], c->blk[2 * b + 1], &lb);
     int flt0[16], flt1[16];
-    lr_box(c->fp, c->plane, &lb, e->rec.base, e->dbk.base, set, 0, flt0);
-    lr_box(c->fp, c->plane, &lb, e->rec.base, e->dbk.base, set, 1, flt1);
+    if (bd > 8) {
+      lr_box_10(c->fp, c->plane, &lb, (const uint16_t *)e->rec.base, (const uint16_t *)e->dbk.base, set, 0, flt0);
+      lr_box_10(c->fp, c->plane, &lb, (const uint16_t *)e->rec.base, (const uint16_t *)e->dbk.base, set, 1, flt1);
+    } else {
+      lr_box_8(c->fp, c->plane, &lb, (const uint8_t *)e->rec.base, (const uint8_t *)e->dbk.base, set, 0, flt0);
+      lr_box_8(c->fp, c->plane, &lb, (const uint8_t *)e->rec.base, (const uint8_t *)e->dbk.base, set, 1, flt1);
+    }
     for (int i = 0; i < lb.h; i++)
       for (int j = 0; j < lb.w; j++) {
         size_t o = e->offset[c->plane] + (size_t)(lb.y + i) * stride + lb.x + j;
-        double u = e->rec.base[o] << SGRPROJ_RST_BITS;
-        double s = (e->src.base[o] << SGRPROJ_RST_BITS) - u;
+        double u = px_get(e, e->rec.base, o) << SGRPROJ_RST_BITS;
+        double s = (px_get(e, e->src.base, o) << SGRPROJ_RST_BITS) - u;
         double f0 = r0 ? flt0[i * 4 + j] - u : 0, f1 = r1 ? flt1[i * 4 + j] - u : 0;
         H00 += f0 * f0;
         H01 += f0 * f1;
@@ -256,7 +287,7 @@ void lr_select(Mav1Encoder *e) {
     for (int r = 0; r < rows4; r++)
       for (int c = 0; c < cols4; c++) {
         LrBlock lb;
-        if (!lr_block_setup(fp, plane, r, c, &lb)) continue;
+        if (!KNAME(lr_block_setup)(fp, plane, r, c, &lb)) continue;
         start[lb.unitRow * fp->lr_unit_cols[plane] + lb.unitCol + 1]++;
       }
     for (int u = 0; u < nUnits; u++) start[u + 1] += start[u];
@@ -264,7 +295,7 @@ void lr_select(Mav1Encoder *e) {
     for (int r = 0; r < rows4; r++)
       for (int c = 0; c < cols4; c++) {
         LrBlock lb;
-        if (!lr_block_setup(fp, plane, r, c, &lb)) continue;
+        if (!KNAME(lr_block_setup)(fp, plane, r, c, &lb)) continue;
         int u = lb.unitRow * fp->lr_unit_cols[plane] + lb.unitCol;
         int k = start[u] + fill[u]++;
         blk[2 * k] = r;
