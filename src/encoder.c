@@ -633,10 +633,11 @@ static void count_tools(Mav1FrameStats *st, const BlockInfo *b) {
 static void rc_init(Mav1Encoder *e) {
   if (e->cfg.rc == MAV1_RC_CQP || e->cfg.bitrate <= 0) return;
   int num = e->cfg.fps_num > 0 ? e->cfg.fps_num : 30, den = e->cfg.fps_den > 0 ? e->cfg.fps_den : 1;
-  e->rc_target_bpf = (long)e->cfg.bitrate * 1000 * den / num;
+  /* everything in bytes: rc_update() counts coded-frame bytes */
+  e->rc_target_bpf = (long)e->cfg.bitrate * 1000 * den / (num * 8);
   if (e->rc_target_bpf < 1) e->rc_target_bpf = 1;
   e->rc_bits_avg = e->rc_target_bpf;
-  e->rc_buffer_size = e->cfg.vbv_size > 0 ? (long)e->cfg.vbv_size * 1000 : e->rc_target_bpf;
+  e->rc_buffer_size = e->cfg.vbv_size > 0 ? (long)e->cfg.vbv_size * 1000 / 8 : e->rc_target_bpf;
   if (e->rc_buffer_size < e->rc_target_bpf / 4) e->rc_buffer_size = e->rc_target_bpf / 4;
   e->rc_buffer = e->rc_buffer_size; /* start full */
 }
@@ -654,24 +655,32 @@ static void rc_update(Mav1Encoder *e, long bits) {
   if (e->rc_buffer < 0) e->rc_buffer = 0;
 }
 
-/* qindex adjustment for the next frame (applied on top of the CQP cascade). */
+/* qindex adjustment for the next frame (applied on top of the CQP
+ * cascade). Integral control on the CUMULATIVE rate error: the cumulative
+ * statistic is smooth by construction, so the integrator walks qindex to
+ * the operating point (+-8 steps/frame, anti-windup at +-160) without
+ * oscillating under the engine pipeline's multi-frame feedback delay.
+ * The VBV buffer term stays proportional. */
 static int rc_adjust_q(Mav1Encoder *e) {
   if (!e->rc_target_bpf) return 0;
-  /* rate term: 12 qindex steps per factor 2 of rate error */
-  double ratio = (double)e->rc_bits_avg / e->rc_target_bpf;
-  int qrate = (int)(12.0 * (ratio > 1e-9 ? log2(ratio) : -20.0));
-  int qbuf = 0;
+  double ratio = e->rc_frames ? (double)e->rc_total / ((double)e->rc_frames * e->rc_target_bpf) : 1.0;
+  int step = (int)(12.0 * (ratio > 1e-9 ? log2(ratio) : -20.0));
+  if (step > 8) step = 8;
+  if (step < -8) step = -8;
+  e->rc_q_adj += step;
+  if (e->rc_q_adj > 160) e->rc_q_adj = 160;
+  if (e->rc_q_adj < -160) e->rc_q_adj = -160;
+  int adj = e->rc_q_adj;
   if (e->cfg.rc == MAV1_RC_CBR) {
     long q = e->rc_buffer_size / 4;
-    if (e->rc_buffer < q) qbuf = (int)k_min(24, 1 + 24 * (q - e->rc_buffer) / k_max(q, 1));
-    else if (e->rc_buffer > 3 * q) qbuf = -(int)k_min(24, 1 + 24 * (e->rc_buffer - 3 * q) / k_max(q, 1));
+    if (e->rc_buffer < q) adj += (int)k_min(24, 1 + 24 * (q - e->rc_buffer) / k_max(q, 1));
+    else if (e->rc_buffer > 3 * q) adj -= (int)k_min(24, 1 + 24 * (e->rc_buffer - 3 * q) / k_max(q, 1));
+    if (adj > 160) adj = 160;
+    if (adj < -160) adj = -160;
   }
-  int adj = qrate + qbuf;
-  if (adj > 48) adj = 48;
-  if (adj < -48) adj = -48;
-  /* smooth so single oversized frames do not overshoot */
-  e->rc_q_adj = (e->rc_q_adj * 3 + adj) / 4;
-  return e->rc_q_adj;
+  if (getenv("MAV1_RCDBG")) fprintf(stderr, "RC frames=%ld total=%ld tgt=%ld ratio=%.1f adj=%d\n",
+                                   e->rc_frames, e->rc_total, e->rc_target_bpf, ratio, adj);
+  return adj;
 }
 
 /* Frame-level quantizer cascade (low delay): the key frame and every 4th
