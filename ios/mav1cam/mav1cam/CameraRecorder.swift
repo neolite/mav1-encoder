@@ -24,6 +24,7 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
 
     private var framesSent = 0
     private var packets = 0
+    private var bytesWritten = 0
     private var startTime = 0.0
     private var lastPacketTime = 0.0
 
@@ -166,7 +167,7 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         appendLE(&hdr, UInt32(0)); appendLE(&hdr, UInt32(0))
         fh.write(hdr)
 
-        framesSent = 0; packets = 0
+        framesSent = 0; packets = 0; bytesWritten = 0
         startTime = CACurrentMediaTime()
         DispatchQueue.main.async {
             self.recording = true
@@ -329,11 +330,24 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         while mav1_receive_packet(enc, &out, &size) == 0 {
             writePacket(out, size: size)
         }
-        if framesSent % 30 == 0 {
+        if framesSent % 15 == 0 {
             let el = CACurrentMediaTime() - startTime
+            let inFps = Double(framesSent) / el
+            let outFps = Double(packets) / el
+            let mbps = Double(bytesWritten) * 8 / el / 1e6
+            let backend = String(cString: mav1_backend_name(enc))
+            let pend = mav1_pending_packets(enc)
+            var stage = ""
+            if let st = mav1_last_stats(enc) {
+                stage = String(format: "a%.0f r%.0f f%.0f e%.0fms",
+                               st.pointee.t_analysis * 1000, st.pointee.t_recon * 1000,
+                               st.pointee.t_filter * 1000, st.pointee.t_entropy * 1000)
+            }
             DispatchQueue.main.async {
-                self.status = String(format: "%df sent, %dpkts, %.1fs @ %.0ffps",
-                                     self.framesSent, self.packets, el, Double(self.framesSent) / el)
+                self.status = String(format:
+                    "%@ | in %df/out %d | %.1fs | %.0f→%.1ffps | %.2fMB %.1fMbps | q%d\n%@",
+                    backend, self.framesSent, self.packets, el, inFps, outFps,
+                    Double(self.bytesWritten) / 1e6, mbps, pend, stage)
             }
         }
     }
@@ -349,6 +363,7 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         file.write(Data(bytes: data, count: size))
         free(data)
         packets += 1
+        bytesWritten += size + 12
     }
 
     private func patchFrameCount() {
