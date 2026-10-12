@@ -27,6 +27,8 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
     /// 10-bit HDR capture (P010 -> I420-10bit) requested for the next
     /// recording. iPhone 12+ delivers 10-bit when the output format allows it.
     @Published var hdrRequested = false
+    /// camera frame rate target: 30 or 60
+    @Published var fpsTarget = 30
     private(set) var hdrActive = false
 
     private var framesSent = 0
@@ -94,11 +96,12 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         // HDR: pick a 10-bit-capable HDR format so the output can deliver
         // P010. dev.formats also lists tiny preview/HDR entries — pick one
         // matching the preset's resolution, else the largest available.
+        let fps = fpsTarget
         if hdrRequested {
             let target = CMVideoFormatDescriptionGetDimensions(dev.activeFormat.formatDescription)
             let hdrFmts = dev.formats.filter {
                 $0.isVideoHDRSupported
-                    && $0.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 })
+                    && $0.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= Double(fps) && $0.maxFrameRate >= Double(fps) })
             }
             func size(_ f: AVCaptureDevice.Format) -> Int {
                 let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
@@ -108,9 +111,23 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
                      ?? hdrFmts.max(by: { size($0) < size($1) }) {
                 dev.activeFormat = f
             }
+        } else if fps > 30 {
+            // 60fps: need a format that supports it (preset's choice may cap at 30)
+            let target = CMVideoFormatDescriptionGetDimensions(dev.activeFormat.formatDescription)
+            let cands = dev.formats.filter {
+                $0.videoSupportedFrameRateRanges.contains(where: { $0.maxFrameRate >= Double(fps) })
+            }
+            func size(_ f: AVCaptureDevice.Format) -> Int {
+                let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+                return Int(d.width) * Int(d.height)
+            }
+            if let f = cands.first(where: { size($0) == Int(target.width) * Int(target.height) })
+                     ?? cands.max(by: { size($0) < size($1) }) {
+                dev.activeFormat = f
+            }
         }
-        let t = CMTime(value: 1, timescale: 30)
-        if dev.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 }) {
+        let t = CMTime(value: 1, timescale: CMTimeScale(fps))
+        if dev.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= Double(fps) && $0.maxFrameRate >= Double(fps) }) {
             dev.activeVideoMinFrameDuration = t
             dev.activeVideoMaxFrameDuration = t
         }
@@ -205,13 +222,15 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         cfg.tx_depth = 0
         cfg.switchable_interp = 0
         cfg.qindex = 100
-        cfg.fps_num = 30
+        cfg.fps_num = Int32(fpsTarget)
         cfg.fps_den = 1
         cfg.keyint = 0
         cfg.rc = MAV1_RC_CQP
         // phone memory: per-engine ME scratch ~197MB + qpel ~100MB at 1080p
         // (~4x at 4K) — 2 engines fit for <=1080p, single engine for 4K
-        cfg.threads = w * h >= 3840 * 2160 ? 2 : 2 // try 2 engines at 4K; jetsam decides
+        // phone memory: per-engine ~400MB at 1080p — 3 engines ~=1.2GB; the
+        // extra engine lands on the 4 idle efficiency cores
+        cfg.threads = w * h >= 3840 * 2160 ? 2 : 4 // 4th engine lands on E-cores too
         if is10bit {
             cfg.bitdepth = 10
             // iPhone captures HDR in HLG (Dolby Vision is a mux-level side
@@ -253,7 +272,7 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         appendLE(&hdr, UInt16(0)); appendLE(&hdr, UInt16(32))
         hdr.append(contentsOf: [0x41, 0x56, 0x30, 0x31]) // AV01
         appendLE(&hdr, UInt16(w)); appendLE(&hdr, UInt16(h))
-        appendLE(&hdr, UInt32(30)); appendLE(&hdr, UInt32(1))
+        appendLE(&hdr, UInt32(fpsTarget)); appendLE(&hdr, UInt32(1))
         appendLE(&hdr, UInt32(0)); appendLE(&hdr, UInt32(0))
         fh.write(hdr)
 
@@ -505,8 +524,8 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
                                              customBlockSource: nil, offsetToData: 0, dataLength: size, flags: 0) == noErr,
               CMBlockBufferReplaceDataBytes(with: data, blockBuffer: bb, offsetIntoDestination: 0, dataLength: size) == noErr else { return }
         var timing = CMSampleTimingInfo(
-            duration: CMTime(value: 1, timescale: 30),
-            presentationTimeStamp: CMTime(value: sampleIdx, timescale: 30),
+            duration: CMTime(value: 1, timescale: CMTimeScale(fpsTarget)),
+            presentationTimeStamp: CMTime(value: sampleIdx, timescale: CMTimeScale(fpsTarget)),
             decodeTimeStamp: .invalid)
         var sz = size
         var sb: CMSampleBuffer?

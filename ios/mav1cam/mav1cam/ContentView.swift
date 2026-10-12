@@ -56,6 +56,14 @@ struct ContentView: View {
                     .padding(.top, 4)
                     .disabled(rec.recording)
 
+                Picker("FPS", selection: $rec.fpsTarget) {
+                    Text("30fps").tag(30)
+                    Text("60fps").tag(60)
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal)
+                .disabled(rec.recording)
+
                 Spacer()
 
                 HStack {
