@@ -130,7 +130,7 @@ struct Mav1Encoder {
   void *outmu, *outcv;   /* outq lock + packet-arrival signal */
   /* turbo: frame engines (complete encoders without driver) coding frames
    * concurrently; frames wait for the slots they reference */
-#define NUM_ENG 4 /* engine 0 codes the reference frames, 1..3 the others */
+#define NUM_ENG 8 /* engine 0 codes the reference frames, 1..3 the others */
   struct Mav1Encoder *eng[NUM_ENG];
   int eng_next, is_engine;
   int num_eng; /* engines created (2..NUM_ENG; cfg.threads / MAV1_ENG) */
