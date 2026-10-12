@@ -67,11 +67,29 @@ struct ContentView: View {
                 Spacer()
 
                 HStack {
-                    Text(rec.status)
-                        .font(.system(.caption, design: .monospaced))
-                        .padding(8)
-                        .background(.black.opacity(0.55))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(rec.status)
+                            .font(.system(.caption, design: .monospaced))
+                        if rec.recording && rec.fpsHist.count > 1 {
+                            Canvas { ctx, size in
+                                let h = rec.fpsHist
+                                let n = max(h.count - 1, 1)
+                                let mx = max(h.max() ?? 60, 60)
+                                var p = Path()
+                                for (i, v) in h.enumerated() {
+                                    let x = size.width * CGFloat(i) / CGFloat(n)
+                                    let y = size.height * (1 - CGFloat(v / mx))
+                                    if i == 0 { p.move(to: CGPoint(x: x, y: y)) }
+                                    else { p.addLine(to: CGPoint(x: x, y: y)) }
+                                }
+                                ctx.stroke(p, with: .color(.green), lineWidth: 1.5)
+                            }
+                            .frame(height: 28)
+                        }
+                    }
+                    .padding(8)
+                    .background(.black.opacity(0.55))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
                     if let url = rec.lastShareURL {
                         Button(action: { share(url) }) {
                             Image(systemName: "square.and.arrow.up")

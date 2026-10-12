@@ -34,6 +34,10 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
     private var framesSent = 0
     private var packets = 0
     private var bytesWritten = 0
+    /// out-fps samples (one per ~0.5s) for the sparkline + min/avg/max
+    @Published var fpsHist: [Double] = []
+    private var lastSample = 0.0
+    private(set) var fpsMin = 0.0, fpsMax = 0.0, fpsAvg = 0.0
     private var startTime = 0.0
     private var lastPacketTime = 0.0
 
@@ -198,6 +202,7 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
 
         sampleIdx = 0
         framesSent = 0; packets = 0; bytesWritten = 0
+        fpsHist = []; fpsMin = 0; fpsMax = 0; fpsAvg = 0; lastSample = 0
         startTime = CACurrentMediaTime()
         DispatchQueue.main.async {
             self.recording = true
@@ -472,11 +477,21 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
                                st.pointee.t_analysis * 1000, st.pointee.t_recon * 1000,
                                st.pointee.t_filter * 1000, st.pointee.t_entropy * 1000)
             }
+            // fps history (~2Hz) for min/avg/max + sparkline
+            if el - lastSample >= 0.5 {
+                lastSample = el
+                fpsHist.append(outFps)
+                if fpsHist.count > 240 { fpsHist.removeFirst(fpsHist.count - 240) }
+                if let mn = fpsHist.min(), let mx = fpsHist.max() {
+                    fpsMin = mn; fpsMax = mx; fpsAvg = fpsHist.reduce(0, +) / Double(fpsHist.count)
+                }
+            }
             DispatchQueue.main.async {
                 self.status = String(format:
-                    "%@ | in %df/out %d | %.1fs | %.0f→%.1ffps | %.2fMB %.1fMbps | q%d\n%@",
+                    "%@ | in %df/out %d | %.1fs | %.0f→%.1ffps | %.2fMB %.1fMbps | q%d\n%@\nmin %.0f avg %.0f max %.0f fps",
                     backend, self.framesSent, self.packets, el, inFps, outFps,
-                    Double(self.bytesWritten) / 1e6, mbps, pend, stage)
+                    Double(self.bytesWritten) / 1e6, mbps, pend, stage,
+                    self.fpsMin, self.fpsAvg, self.fpsMax)
             }
         }
     }
