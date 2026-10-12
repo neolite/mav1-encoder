@@ -43,6 +43,11 @@ static inline void KNAME(inter_fast)(const KPIX *ref, int refStride, int lastX, 
           vst1q_s32(t + c + 4, vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(u))));
         }
 #endif
+#if defined(__aarch64__) && MAV1_BD == 10
+      if (interior)
+        for (; c + 4 <= w; c += 4)
+          vst1q_s32(t + c, vshlq_n_s32(vreinterpretq_s32_u32(vmovl_u16(vld1_u16(row + x0 + 3 + c))), 4));
+#endif
       for (; c < w; c++) t[c] = (int32_t)(interior ? row[x0 + 3 + c] : row[clipX[c + 3]]) << 4;
     } else if (interior) {
       const KPIX *q = row + x0;
@@ -62,6 +67,17 @@ static inline void KNAME(inter_fast)(const KPIX *ref, int refStride, int lastX, 
         vst1q_s32(t + c + 4, vshrq_n_s32(vaddq_s32(ahi, four), 3));
       }
 #endif
+#if defined(__aarch64__) && MAV1_BD == 10
+      /* same taps over u16 pixels: widen to s32 for the multiply */
+      for (; c + 4 <= w; c += 4) {
+        int32x4_t a = vdupq_n_s32(0);
+        for (int k = 0; k < 8; k++) {
+          int32x4_t win = vreinterpretq_s32_u32(vmovl_u16(vld1_u16(q + c + k)));
+          a = vmlaq_n_s32(a, win, fH[k]);
+        }
+        vst1q_s32(t + c, vshrq_n_s32(vaddq_s32(a, vdupq_n_s32(4)), 3));
+      }
+#endif
       for (; c < w; c++) {
         int a = 0;
         for (int k = 0; k < 8; k++) a += fH[k] * q[c + k];
@@ -79,7 +95,7 @@ static inline void KNAME(inter_fast)(const KPIX *ref, int refStride, int lastX, 
   for (int r = 0; r < h; r++) {
     const int32_t *t = tmp + r * w;
     int c = 0;
-#if defined(__aarch64__) && MAV1_BD == 8
+#if defined(__aarch64__) && (MAV1_BD == 8 || MAV1_BD == 10)
     for (; c + 4 <= w; c += 4) {
       int64x2_t lo, hi;
       if (!py) {
@@ -103,6 +119,10 @@ static inline void KNAME(inter_fast)(const KPIX *ref, int refStride, int lastX, 
         /* Clip1: saturate s32 -> s16 -> u8 (8-bit pixels only) */
         uint8x8_t b = vqmovun_s16(vcombine_s16(vqmovn_s32(v), vdup_n_s16(0)));
         vst1_lane_u32((uint32_t *)(dst8 + r * dstStride + c), vreinterpret_u32_u8(b), 0);
+      } else if (dst8 && MAV1_BD == 10) {
+        /* Clip1 to [0,1023] into u16 */
+        v = vminq_s32(vmaxq_s32(v, vdupq_n_s32(0)), vdupq_n_s32(1023));
+        vst1_u16((uint16_t *)(dst8 + r * dstStride + c), vmovn_u32(vreinterpretq_u32_s32(v)));
       } else {
         vst1q_s32(dst32 + r * dstStride + c, v);
       }
