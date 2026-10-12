@@ -14,6 +14,11 @@
 
 #include "k_common.h"
 
+#if !defined(__METAL_VERSION__) && defined(__aarch64__) && MAV1_BD == 8
+#include <arm_neon.h>
+#define KRECON_NEON 1
+#endif
+
 #define SCRATCH_INTS 26624
 #define S_RESID 0
 #define S_COEF 4096
@@ -94,12 +99,24 @@ INLINE int KNAME(code_tx_block)(DEV const FrameParams *fp, DEV const KPIX *src, 
   for (int ci = 0; ci < numCands; ci++) {
     int t = cands[ci];
     int fud = itx_flip_ud(t), flr = itx_flip_lr(t);
-    for (int i = 0; i < h; i++)
-      for (int j = 0; j < w; j++) {
-        int yy = fud ? (h - 1 - i) : i, xx = flr ? (w - 1 - j) : j;
-        int o = (y + yy) * stride + x + xx;
-        resid[i * 64 + j] = (int)src[o] - (int)rec[o];
+    for (int i = 0; i < h; i++) {
+      int yy = fud ? (h - 1 - i) : i;
+      int o = (y + yy) * stride + x;
+      int j = 0;
+#ifdef KRECON_NEON
+      if (!flr) {
+        for (; j + 8 <= w; j += 8) {
+          int16x8_t d = vreinterpretq_s16_u16(vsubl_u8(vld1_u8(src + o + j), vld1_u8(rec + o + j)));
+          vst1q_s32(resid + i * 64 + j, vmovl_s16(vget_low_s16(d)));
+          vst1q_s32(resid + i * 64 + j + 4, vmovl_s16(vget_high_s16(d)));
+        }
       }
+#endif
+      for (; j < w; j++) {
+        int oo = (y + yy) * stride + x + (flr ? (w - 1 - j) : j);
+        resid[i * 64 + j] = (int)src[oo] - (int)rec[oo];
+      }
+    }
     KNAME(fwd_2d)(resid, coef, txSz, t, mats, tmp);
     /* a single candidate quantises straight into the coefficient buffer */
     DEV int32_t *qout = (numCands == 1 && !fp->tx_mode_select) ? coefOut : qtry;
@@ -122,19 +139,50 @@ INLINE int KNAME(code_tx_block)(DEV const FrameParams *fp, DEV const KPIX *src, 
     if (eob > 0) {
       KNAME(dequant_block)(qtry, dq, txSz, dcQ, acQ, fp->bitdepth);
       itx_2d(dq, res, txSz, t, 0);
-      for (int i = 0; i < h; i++)
-        for (int j = 0; j < w; j++) {
-          int yy = fud ? (h - 1 - i) : i, xx = flr ? (w - 1 - j) : j;
-          int o = (y + yy) * stride + x + xx;
-          int d = (int)src[o] - Clip3(0, fp->px_max, (int)rec[o] + res[i * 64 + j]);
+      for (int i = 0; i < h; i++) {
+        int yy = fud ? (h - 1 - i) : i;
+        int o = (y + yy) * stride + x;
+        int j = 0;
+#ifdef KRECON_NEON
+        if (!flr) {
+          int64x2_t acc64 = vdupq_n_s64(0);
+          for (; j + 4 <= w; j += 4) {
+            uint8x8_t pv = vld1_u8(rec + o + j);
+            int32x4_t rp = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(vmovl_u8(pv))));
+            int32x4_t px = vaddq_s32(rp, vld1q_s32(res + i * 64 + j));
+            /* Clip3(0, pxMax): pxMax < 512 fits the s16 saturate */
+            uint8x8_t cl = vqmovun_s16(vcombine_s16(vqmovn_s32(px), vdup_n_s16(0)));
+            int32x4_t sv = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(vmovl_u8(vld1_u8(src + o + j)))));
+            int32x4_t dv = vsubq_s32(sv, vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(vmovl_u8(cl)))));
+            acc64 = vmlal_s32(acc64, vget_low_s32(dv), vget_low_s32(dv));
+            acc64 = vmlal_s32(acc64, vget_high_s32(dv), vget_high_s32(dv));
+          }
+          sse += vaddvq_s64(acc64);
+        }
+#endif
+        for (; j < w; j++) {
+          int oo = (y + yy) * stride + x + (flr ? (w - 1 - j) : j);
+          int d = (int)src[oo] - Clip3(0, fp->px_max, (int)rec[oo] + res[i * 64 + j]);
           sse += d * d;
         }
+      }
     } else {
-      for (int i = 0; i < h; i++)
-        for (int j = 0; j < w; j++) {
+      for (int i = 0; i < h; i++) {
+        int j = 0;
+#ifdef KRECON_NEON
+        int64x2_t acc64 = vdupq_n_s64(0);
+        for (; j + 4 <= w; j += 4) {
+          int32x4_t dv = vld1q_s32(resid + i * 64 + j);
+          acc64 = vmlal_s32(acc64, vget_low_s32(dv), vget_low_s32(dv));
+          acc64 = vmlal_s32(acc64, vget_high_s32(dv), vget_high_s32(dv));
+        }
+        sse += vaddvq_s64(acc64);
+#endif
+        for (; j < w; j++) {
           int d = resid[i * 64 + j];
           sse += d * d;
         }
+      }
     }
     long cost = sse * 16 + (long)fp->lambda * KNAME(est_coef_bits)(qtry, scan, eob) / 8;
     if (bestCost < 0 || cost < bestCost) {
@@ -153,12 +201,25 @@ INLINE int KNAME(code_tx_block)(DEV const FrameParams *fp, DEV const KPIX *src, 
       KNAME(dequant_block)(qbest, dq, txSz, dcQ, acQ, fp->bitdepth);
       itx_2d(dq, res, txSz, bestType, 0);
     }
-    for (int i = 0; i < h; i++)
-      for (int j = 0; j < w; j++) {
-        int yy = fud ? (h - 1 - i) : i, xx = flr ? (w - 1 - j) : j;
-        int o = (y + yy) * stride + x + xx;
-        rec[o] = (KPIX)Clip3(0, fp->px_max, (int)rec[o] + res[i * 64 + j]);
+    for (int i = 0; i < h; i++) {
+      int yy = fud ? (h - 1 - i) : i;
+      int o = (y + yy) * stride + x;
+      int j = 0;
+#ifdef KRECON_NEON
+      if (!flr) {
+        for (; j + 4 <= w; j += 4) {
+          int32x4_t rp = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(vmovl_u8(vld1_u8(rec + o + j)))));
+          int32x4_t px = vaddq_s32(rp, vld1q_s32(res + i * 64 + j));
+          uint8x8_t cl = vqmovun_s16(vcombine_s16(vqmovn_s32(px), vdup_n_s16(0)));
+          vst1_lane_u32((uint32_t *)(rec + o + j), vreinterpret_u32_u8(cl), 0);
+        }
       }
+#endif
+      for (; j < w; j++) {
+        int oo = (y + yy) * stride + x + (flr ? (w - 1 - j) : j);
+        rec[oo] = (KPIX)Clip3(0, fp->px_max, (int)rec[oo] + res[i * 64 + j]);
+      }
+    }
   }
   *outType = bestType;
   *outCost = bestCost;
