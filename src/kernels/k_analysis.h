@@ -122,8 +122,9 @@ INLINE int KNAME(intra_satd)(DEV const FrameParams *fp, DEV const KPIX *plane, i
                              int x, int y, int log2W, int log2H, int mode, int delta, DEV KPIX *pred, int ps) {
   int sub = planeIdx > 0;
   KNAME(IntraArgs) a;
-  a.haveLeft = x > 0;
-  a.haveAbove = y > 0;
+  /* tile edges: intra edges never cross tile boundaries (x,y are pixels) */
+  a.haveLeft = (x >> 2) > tile_col_start(fp, x >> 2);
+  a.haveAbove = (y >> 2) > tile_row_start(fp, y >> 2);
   a.haveAboveRight = 0;
   a.haveBelowLeft = 0;
   a.mode = mode;

@@ -246,7 +246,7 @@ INLINE long KNAME(code_plane)(DEV const FrameParams *fp, DEV BlockInfo *b, DEV c
                               int plane, int txSz, THR int *maxLumaW, THR int *maxLumaH) {
   int bs = b->bsize;
   int MiRow = b->mi_row, MiCol = b->mi_col;
-  int AvailU = MiRow > 0, AvailL = MiCol > tile_col_start(fp, MiCol);
+  int AvailU = MiRow > tile_row_start(fp, MiRow), AvailL = MiCol > tile_col_start(fp, MiCol);
   int subX = plane > 0, subY = plane > 0;
   int planeSz = Subsampled_Size[bs][subX][subY];
   int num4x4W = Num_4x4_Blocks_Wide[planeSz], num4x4H = Num_4x4_Blocks_High[planeSz];

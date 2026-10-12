@@ -208,10 +208,16 @@ static void frame_header(const struct Mav1Encoder *e, BitWriter *w) {
     tileColsLog2++;
   }
   int minLog2TileRows = minLog2Tiles - tileColsLog2 > 0 ? minLog2Tiles - tileColsLog2 : 0;
-  if (minLog2TileRows < maxLog2TileRows) bw_f(w, 1, 0);
-  if (tileColsLog2 + minLog2TileRows > 0) {
-    bw_f(w, tileColsLog2 + minLog2TileRows, 0); /* context_update_tile_id */
-    bw_f(w, 2, 3);                              /* tile_size_bytes_minus_1: 4 bytes */
+  int tileRowsLog2 = minLog2TileRows;
+  while (tileRowsLog2 < maxLog2TileRows) {
+    int inc = tileRowsLog2 < e->tile_rows_log2;
+    bw_f(w, 1, inc); /* tile_rows_log2_delta */
+    if (!inc) break;
+    tileRowsLog2++;
+  }
+  if (tileColsLog2 + tileRowsLog2 > 0) {
+    bw_f(w, tileColsLog2 + tileRowsLog2, 0); /* context_update_tile_id */
+    bw_f(w, 2, 3);                           /* tile_size_bytes_minus_1: 4 bytes */
   }
 
   /* quantization_params */

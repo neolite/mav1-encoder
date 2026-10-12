@@ -28,7 +28,7 @@ void mvpred_frame_start(struct Mav1Encoder *e) {
 static int is_inside(const MvStack *s, int r, int c) {
   const FrameParams *fp = ENC_PARAMS(s->e);
   int cs = tile_col_start(fp, s->miCol);
-  return c >= cs && c < tile_col_end(fp, s->miCol) && r >= 0 && r < s->e->mi_rows;
+  return c >= cs && c < tile_col_end(fp, s->miCol) && r >= tile_row_start(fp, s->miRow) && r < tile_row_end(fp, s->miRow);
 }
 
 static void lower_precision(int *mv) {
@@ -340,7 +340,7 @@ static int ref_count_ctx(int c0, int c1) { return c0 < c1 ? 0 : c0 == c1 ? 1 : 2
 /* count_refs( ) of the CDF selection process (9.3) */
 static int count_refs(struct Mav1Encoder *e, int r, int c, int ft) {
   int n = 0;
-  if (r > 0) n += (mi_at(e, r - 1, c)->ref0 == ft) + (mi_at(e, r - 1, c)->ref1 == ft);
+  if (r > tile_row_start(ENC_PARAMS(e), r)) n += (mi_at(e, r - 1, c)->ref0 == ft) + (mi_at(e, r - 1, c)->ref1 == ft);
   if (c > tile_col_start(ENC_PARAMS(e), c)) n += (mi_at(e, r, c - 1)->ref0 == ft) + (mi_at(e, r, c - 1)->ref1 == ft);
   return n;
 }
@@ -422,7 +422,7 @@ int write_inter_block(EntEnc *ec, CdfContext *cdf, struct Mav1Encoder *e, const 
 
   /* read_ref_frames( ) */
   if (e->hdr.reference_select) {
-    Nb a = {r > 0, 0, 0}, l = {c > tile_col_start(ENC_PARAMS(e), c), 0, 0};
+    Nb a = {r > tile_row_start(ENC_PARAMS(e), r), 0, 0}, l = {c > tile_col_start(ENC_PARAMS(e), c), 0, 0};
     if (a.avail) { a.ref0 = mi_at(e, r - 1, c)->ref0; a.ref1 = mi_at(e, r - 1, c)->ref1; }
     if (l.avail) { l.ref0 = mi_at(e, r, c - 1)->ref0; l.ref1 = mi_at(e, r, c - 1)->ref1; }
     ec_symbol(ec, s.isCompound, cdf->comp_mode[comp_mode_ctx(a, l)], 2);

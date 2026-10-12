@@ -107,7 +107,7 @@ static Mav1Encoder *create_enc(const Mav1Config *cfg, int isEngine, char *err, s
   e->sb_cols = (e->mi_cols + 15) >> 4;
   e->sb_rows = (e->mi_rows + 15) >> 4;
   e->num_sbs = e->sb_cols * e->sb_rows;
-  /* tile_info: uniform spacing, tile columns only (one tile row) */
+  /* tile_info: uniform spacing */
   {
     int k = 0;
     while (((MAX_TILE_WIDTH >> 6) << k) < e->sb_cols) k++;
@@ -121,6 +121,25 @@ static Mav1Encoder *create_enc(const Mav1Config *cfg, int isEngine, char *err, s
     e->tile_cols_log2 = l;
     e->tile_w_sb = (e->sb_cols + (1 << l) - 1) >> l;
     e->tile_cols = (e->sb_cols + e->tile_w_sb - 1) / e->tile_w_sb;
+
+    /* tile rows: minLog2TileRows = max(minLog2Tiles - tileColsLog2, 0),
+     * maxLog2TileRows = log2(min(sbRows, MAX_TILE_ROWS)) */
+    int maxTileAreaSb = MAX_TILE_AREA >> 12;
+    int minLog2Tiles = 0;
+    while ((maxTileAreaSb << minLog2Tiles) < e->sb_rows * e->sb_cols) minLog2Tiles++;
+    if (e->min_log2_tile_cols > minLog2Tiles) minLog2Tiles = e->min_log2_tile_cols;
+    int minLog2TileRows = minLog2Tiles - e->tile_cols_log2;
+    if (minLog2TileRows < 0) minLog2TileRows = 0;
+    e->min_log2_tile_rows = minLog2TileRows;
+    int maxRows = e->sb_rows < MAX_TILE_ROWS ? e->sb_rows : MAX_TILE_ROWS;
+    for (k = 0; (1 << k) < maxRows; k++) {}
+    e->max_log2_tile_rows = k;
+    l = e->cfg.tile_rows_log2;
+    if (l < e->min_log2_tile_rows) l = e->min_log2_tile_rows;
+    if (l > e->max_log2_tile_rows) l = e->max_log2_tile_rows;
+    e->tile_rows_log2 = l;
+    e->tile_h_sb = (e->sb_rows + (1 << l) - 1) >> l;
+    e->tile_rows = (e->sb_rows + e->tile_h_sb - 1) / e->tile_h_sb;
   }
   e->stride[0] = e->sb_cols * 64;
   e->stride[1] = e->stride[2] = e->sb_cols * 32;
@@ -370,7 +389,7 @@ void edge_types_rows(Mav1Encoder *e, uint8_t *ys, uint8_t *uvs, int row0, int ro
     for (int i = 0; i < sbs[s].num_blocks; i++) {
       BlockInfo *b = &blocks[sbs[s].first_block + i];
       int r = b->mi_row, c = b->mi_col;
-      int availU = r > 0, availL = c > tile_col_start(fp, c);
+      int availU = r > tile_row_start(fp, r), availL = c > tile_col_start(fp, c);
       int fy = (availU && ys[(r - 1) * cols + c]) || (availL && ys[r * cols + c - 1]);
       /* chroma: above (r - 1, c + 1) as MiCol is even; left (r + 1, c - 1) as MiRow is even */
       int fuv = (availU && uvs[(r - 1) * cols + k_min(c + 1, cols - 1)]) ||
@@ -500,6 +519,7 @@ static void setup_params(Mav1Encoder *e, int isKey) {
     fp->depth_thr = e->cfg.turbo ? dt * (q + bias) / (128 + bias) << (2 * (bd - 8)) : 0;
   }
   fp->tile_w_sb = e->tile_w_sb;
+  fp->tile_h_sb = e->tile_rows > 1 ? e->tile_h_sb : 0;
   long acq = fp->ac_q[0];
   /* SSE-domain lambda: at 10 bits both the SSE and (per libaom's rd.c) the
    * multiplier scale by 4 per bitdepth doubling over the 8-bit tables */

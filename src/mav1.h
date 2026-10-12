@@ -39,6 +39,7 @@ typedef struct {
   int cdef;            /* constrained directional enhancement filter */
   int restoration;     /* loop restoration (Wiener / self-guided) */
   int tile_cols_log2;    /* requested log2 of tile columns */
+  int tile_rows_log2;    /* requested log2 of tile rows (0 = single row) */
   int intra_edge_filter; /* enable_intra_edge_filter */
   int nonref_odd;       /* odd frames are non-reference leaf frames */
   int fast;              /* reduced mode/partition search */

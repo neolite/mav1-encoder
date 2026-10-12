@@ -52,7 +52,7 @@ static double psnr(const uint8_t *a, const uint8_t *b, size_t n, int px) {
 int main(int argc, char **argv) {
   const char *in = NULL, *outp = NULL, *recp = NULL;
   int leaf = 0, q = 100, nframes = 1 << 30, metal = 1, keyint = 0, lf = 1, cdef = 1, txs = 1, txd = 1, lr = 1,
-      lrt = 0, sw = 1, fast = 0, turbo = 0, gold = 0, altref = 0, edge = 1, tiles = -1, verbose = 0, mer = 32,
+      lrt = 0, sw = 1, fast = 0, turbo = 0, gold = 0, altref = 0, edge = 1, tiles = -1, trows = -1, verbose = 0, mer = 32,
       bitdepth = 0, hdr = 0, hdr_nits = 1000, cp = -1, tc = -1, mc = -1, range = 0, cll = -1, fall = -1;
   int rc = MAV1_RC_CQP, bitrate = 0, vbv = 0, fpsn = 30, fpsd = 1;
   for (int i = 1; i < argc; i++) {
@@ -79,6 +79,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--leaf")) leaf = 1;
     else if (!strcmp(argv[i], "--no-edge")) edge = 0;
     else if (!strcmp(argv[i], "--tiles") && i + 1 < argc) tiles = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--tile-rows") && i + 1 < argc) trows = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--bitdepth") && i + 1 < argc) bitdepth = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--hdr")) {
       hdr = 1;
@@ -175,6 +176,7 @@ int main(int argc, char **argv) {
   cfg.fps_den = fd;
   /* turbo: 2 tile columns (BD -2..-3% vs 8 at the same speed) */
   cfg.tile_cols_log2 = tiles >= 0 ? tiles : turbo ? 2 : fast ? 3 : 0;
+  cfg.tile_rows_log2 = trows >= 0 ? trows : turbo ? 1 : 0; /* 8 tiles: +20% for +0.3% BD */
   if (fast) cfg.tx_search = cfg.tx_depth = cfg.restoration = cfg.switchable_interp = 0;
   if (getenv("MAV1_TXS")) cfg.tx_search = atoi(getenv("MAV1_TXS"));
   if (getenv("MAV1_TXD")) cfg.tx_depth = atoi(getenv("MAV1_TXD"));

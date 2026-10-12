@@ -69,6 +69,7 @@ typedef struct {
   int32_t lossless;                   /* CodedLossless (base_q_idx == 0) */
   int32_t tx_mode_select;             /* TxMode == TX_MODE_SELECT */
   int32_t tile_w_sb;                  /* uniform tile column width in SBs */
+  int32_t tile_h_sb;                  /* uniform tile row height in SBs */
   int32_t fast;                       /* reduced analysis search */
   int32_t leaf;                       /* non-reference frame: inter only */
   int32_t depth_thr;                  /* depth early exit: SATD per sample x16 */
@@ -112,6 +113,12 @@ INLINE int tile_col_start(DEV const FrameParams *fp, int miCol) {
 }
 INLINE int tile_col_end(DEV const FrameParams *fp, int miCol) {
   return k_min(fp->mi_cols, tile_col_start(fp, miCol) + fp->tile_w_sb * 16);
+}
+INLINE int tile_row_start(DEV const FrameParams *fp, int miRow) {
+  return fp->tile_h_sb > 0 ? ((miRow >> 4) / fp->tile_h_sb) * fp->tile_h_sb * 16 : 0;
+}
+INLINE int tile_row_end(DEV const FrameParams *fp, int miRow) {
+  return fp->tile_h_sb > 0 ? k_min(fp->mi_rows, tile_row_start(fp, miRow) + fp->tile_h_sb * 16) : fp->mi_rows;
 }
 
 /* One coded block, in decode order. Filled by the CPU mode decision, then

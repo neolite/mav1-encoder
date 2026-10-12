@@ -227,6 +227,7 @@ final class CameraRecorder: NSObject, ObservableObject, AVCaptureVideoDataOutput
         cfg.tx_depth = 0
         cfg.switchable_interp = 0
         cfg.qindex = 100
+        cfg.tile_rows_log2 = 1 // 8 tiles: entropy spreads onto E-cores
         cfg.fps_num = Int32(fpsTarget)
         cfg.fps_den = 1
         cfg.keyint = 0

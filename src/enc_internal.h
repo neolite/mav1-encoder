@@ -84,6 +84,7 @@ struct Mav1Encoder {
   int bd, pxsize; /* coded bitdepth and bytes per pixel sample (1 or 2) */
   int mi_cols, mi_rows, sb_cols, sb_rows, num_sbs;
   int tile_cols_log2, tile_cols, tile_w_sb, min_log2_tile_cols, max_log2_tile_cols;
+  int tile_rows_log2, tile_rows, tile_h_sb, min_log2_tile_rows, max_log2_tile_rows;
   int stride[3], offset[3], plane_h[3];
   size_t frame_bytes;   /* bytes of one (padded) frame: sample count * pxsize */
 

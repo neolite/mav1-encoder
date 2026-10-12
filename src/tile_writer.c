@@ -297,7 +297,7 @@ static void write_block(Tile *t, const BlockInfo *b) {
   struct Mav1Encoder *e = t->e;
   int r = b->mi_row, c = b->mi_col, bs = b->bsize;
   int bw4 = Num_4x4_Blocks_Wide[bs], bh4 = Num_4x4_Blocks_High[bs];
-  int availU = r > 0, availL = c > tile_col_start(ENC_PARAMS(e), c);
+  int availU = r > tile_row_start(ENC_PARAMS(e), r), availL = c > tile_col_start(ENC_PARAMS(e), c);
   int isKey = e->hdr.frame_type == KEY_FRAME;
   int skip = b->eob[0] == 0 && b->eob[1] == 0 && b->eob[2] == 0;
 
@@ -504,7 +504,7 @@ static void write_partition(Tile *t, int r, int c, int bSize, const BlockInfo *b
   int node = NODE_BASE(level) + ((r & 15) / num4x4) * nl + (c & 15) / num4x4;
   int p = ENC_SBS(e)[(r >> 4) * e->sb_cols + (c >> 4)].part[node];
   int bsl = Mi_Width_Log2[bSize];
-  int availU = r > 0, availL = c > tile_col_start(ENC_PARAMS(e), c);
+  int availU = r > tile_row_start(ENC_PARAMS(e), r), availL = c > tile_col_start(ENC_PARAMS(e), c);
   int above = availU && Mi_Width_Log2[mi_at(e, r - 1, c)->bsize] < bsl;
   int left = availL && Mi_Height_Log2[mi_at(e, r, c - 1)->bsize] < bsl;
   int ctx = left * 2 + above;
@@ -546,8 +546,8 @@ static void write_partition(Tile *t, int r, int c, int bSize, const BlockInfo *b
   }
 }
 
-/* Codes tile column tc (decode_tile( ) for MiColStart..MiColEnd, all rows). */
-static size_t write_one_tile(struct Mav1Encoder *e, int tc, uint8_t **out) {
+/* Codes one tile (decode_tile( ) for MiColStart..MiColEnd x MiRowStart..MiRowEnd). */
+static size_t write_one_tile(struct Mav1Encoder *e, int tc, int tr, uint8_t **out) {
   Tile t;
   memset(&t, 0, sizeof(t));
   t.e = e;
@@ -569,7 +569,8 @@ static size_t write_one_tile(struct Mav1Encoder *e, int tc, uint8_t **out) {
   const BlockInfo *blocks = ENC_BLOCKS(e);
   const SbInfo *sbs = ENC_SBS(e);
   int sc0 = tc * e->tile_w_sb, sc1 = sc0 + e->tile_w_sb < e->sb_cols ? sc0 + e->tile_w_sb : e->sb_cols;
-  for (int sr = 0; sr < e->sb_rows; sr++) {
+  int sr0 = tr * e->tile_h_sb, sr1 = sr0 + e->tile_h_sb < e->sb_rows ? sr0 + e->tile_h_sb : e->sb_rows;
+  for (int sr = sr0; sr < sr1; sr++) {
     for (int p = 0; p < 3; p++) {
       memset(t.leftLevel[p], 0, lh);
       memset(t.leftDc[p], 0, lh);
@@ -600,10 +601,12 @@ size_t write_tile(struct Mav1Encoder *e, uint8_t **out) {
   memset(e->mi, 0, sizeof(MiInfo) * e->mi_rows * e->mi_cols);
   for (int i = 0; i < e->num_sbs; i++) e->cdef_idx[i] = -1;
   mvpred_frame_start(e);
-  int n = e->tile_cols;
+  int n = e->tile_cols * e->tile_rows;
   uint8_t **bufs = calloc((size_t)n, sizeof *bufs);
   size_t *sizes = calloc((size_t)n, sizeof *sizes);
-  dispatch_apply((size_t)n, DISPATCH_APPLY_AUTO, ^(size_t tc) { sizes[tc] = write_one_tile(e, (int)tc, &bufs[tc]); });
+  dispatch_apply((size_t)n, DISPATCH_APPLY_AUTO, ^(size_t i) {
+    sizes[i] = write_one_tile(e, (int)(i % e->tile_cols), (int)(i / e->tile_cols), &bufs[i]);
+  });
   size_t total = 0;
   for (int i = 0; i < n; i++) total += sizes[i] + (i < n - 1 ? 4 : 0);
   uint8_t *o = malloc(total), *q = o;
